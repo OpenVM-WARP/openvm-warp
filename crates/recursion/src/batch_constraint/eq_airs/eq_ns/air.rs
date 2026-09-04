@@ -19,8 +19,9 @@ use crate::{
         BatchConstraintInnerMessageType, EqNOuterBus, EqNOuterMessage, EqZeroNBus, EqZeroNMessage,
     },
     bus::{
-        EqNsNLogupMaxBus, EqNsNLogupMaxMessage, SelHypercubeBus, SelHypercubeBusMessage,
-        XiRandomnessBus, XiRandomnessMessage,
+        ConstraintSumcheckRandomness, ConstraintSumcheckRandomnessBus, EqNsNLogupMaxBus,
+        EqNsNLogupMaxMessage, SelHypercubeBus, SelHypercubeBusMessage, XiRandomnessBus,
+        XiRandomnessMessage,
     },
     subairs::nested_for_loop::{NestedForLoopIoCols, NestedForLoopSubAir},
     utils::{
@@ -68,8 +69,12 @@ pub struct EqNsAir {
     pub sel_hypercube_bus: SelHypercubeBus,
     pub eq_n_outer_bus: EqNOuterBus,
     pub eq_n_logup_n_max_bus: EqNsNLogupMaxBus,
+    pub constraint_randomness_bus: ConstraintSumcheckRandomnessBus,
 
     pub l_skip: usize,
+    pub includes_air: bool,
+    /// Consume multilinear constraint challenges here when no stacking AIR is present.
+    pub consume_constraint_randomness: bool,
 }
 
 impl<F> BaseAirWithPublicValues<F> for EqNsAir {}
@@ -318,16 +323,33 @@ where
             local.n_less_than_n_max,
         );
 
-        self.eq_n_outer_bus.add_key_with_lookups(
-            builder,
-            next.proof_idx,
-            EqNOuterMessage {
-                is_sharp: AB::Expr::ZERO,
-                n: next.n.into(),
-                value: ext_field_multiply(next.eq, next.r_product),
-            },
-            next.is_valid * next.num_traces,
-        );
+        // Without stacking, EqNs is the terminal consumer of the multilinear
+        // sumcheck challenges. Its existing conductor lookup binds the same
+        // r_n values into every selector/equality computation.
+        if self.consume_constraint_randomness {
+            self.constraint_randomness_bus.receive(
+                builder,
+                local.proof_idx,
+                ConstraintSumcheckRandomness {
+                    idx: local.n + AB::Expr::ONE,
+                    challenge: local.r_n.map(Into::into),
+                },
+                local.n_less_than_n_max,
+            );
+        }
+
+        if self.includes_air {
+            self.eq_n_outer_bus.add_key_with_lookups(
+                builder,
+                next.proof_idx,
+                EqNOuterMessage {
+                    is_sharp: AB::Expr::ZERO,
+                    n: next.n.into(),
+                    value: ext_field_multiply(next.eq, next.r_product),
+                },
+                next.is_valid * next.num_traces,
+            );
+        }
         self.eq_n_outer_bus.add_key_with_lookups(
             builder,
             next.proof_idx,

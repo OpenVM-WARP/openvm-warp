@@ -80,15 +80,15 @@ pub fn get_stacked_slice_data(
 }
 
 #[derive(Clone)]
-pub(in crate::stacking) struct ColumnOpeningPair {
-    pub sort_idx: usize,
-    pub part_idx: usize,
-    pub col_idx: usize,
-    pub col_claim: EF,
-    pub rot_claim: EF,
+pub(crate) struct ColumnOpeningPair {
+    pub(crate) sort_idx: usize,
+    pub(crate) part_idx: usize,
+    pub(crate) col_idx: usize,
+    pub(crate) col_claim: EF,
+    pub(crate) rot_claim: EF,
 }
 
-pub fn sorted_column_claims(
+pub(crate) fn sorted_column_claims(
     vk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
     proof: &Proof<BabyBearPoseidon2Config>,
     sorted_trace_vdata: &[(usize, TraceVData<BabyBearPoseidon2Config>)],

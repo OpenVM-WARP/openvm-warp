@@ -3,13 +3,8 @@ use std::sync::Arc;
 use eyre::Result;
 use itertools::Itertools;
 use openvm_circuit::arch::ContinuationVmProof;
-use openvm_continuations::{
-    circuit::inner::{ProofsType, VerifierCircuitType},
-    prover::ChildVkKind,
-};
-use openvm_recursion_circuit::{
-    prelude::Digest, system::check_param_compatibility, utils::poseidon2_hash_slice,
-};
+use openvm_continuations::{circuit::inner::ProofsType, prover::ChildVkKind};
+use openvm_recursion_circuit::{prelude::Digest, utils::poseidon2_hash_slice};
 use openvm_stark_backend::{
     codec::{Decode, Encode},
     keygen::types::MultiStarkVerifyingKey,
@@ -59,22 +54,16 @@ impl AggProver {
         agg_config: AggregationConfig,
         def_hook_cached_commit: Option<Digest>,
     ) -> AggPrefixProvingKey {
-        check_param_compatibility(
-            &app_or_def_vk.inner.params,
-            &agg_config.params.leaf,
-            &agg_config.params.internal,
-        );
-
         let leaf_prover = InnerAggregationProver::<MAX_NUM_CHILDREN_LEAF>::new::<E>(
             app_or_def_vk,
             agg_config.params.leaf.clone(),
-            VerifierCircuitType::Leaf,
+            false,
             def_hook_cached_commit,
         );
         let internal_for_leaf_prover = InnerAggregationProver::<MAX_NUM_CHILDREN_INTERNAL>::new::<E>(
             leaf_prover.get_vk(),
             agg_config.params.internal,
-            VerifierCircuitType::InternalForLeaf,
+            false,
             def_hook_cached_commit,
         );
         AggPrefixProvingKey {
@@ -92,28 +81,22 @@ impl AggProver {
     ) -> Self {
         assert!(agg_tree_config.num_children_leaf <= MAX_NUM_CHILDREN_LEAF);
         assert!(agg_tree_config.num_children_internal <= MAX_NUM_CHILDREN_INTERNAL);
-        check_param_compatibility(
-            &app_or_def_vk.inner.params,
-            &agg_config.params.leaf,
-            &agg_config.params.internal,
-        );
-
         let leaf_prover = InnerAggregationProver::new::<E>(
             app_or_def_vk,
             agg_config.params.leaf.clone(),
-            VerifierCircuitType::Leaf,
+            false,
             def_hook_cached_commit,
         );
         let internal_for_leaf_prover = InnerAggregationProver::new::<E>(
             leaf_prover.get_vk(),
             agg_config.params.internal.clone(),
-            VerifierCircuitType::InternalForLeaf,
+            false,
             def_hook_cached_commit,
         );
         let internal_recursive_prover = InnerAggregationProver::new::<E>(
             internal_for_leaf_prover.get_vk(),
             agg_config.params.internal.clone(),
-            VerifierCircuitType::InternalRecursive,
+            true,
             def_hook_cached_commit,
         );
         Self {
@@ -130,30 +113,22 @@ impl AggProver {
         agg_tree_config: AggregationTreeConfig,
         def_hook_cached_commit: Option<Digest>,
     ) -> Self {
-        assert!(agg_tree_config.num_children_leaf <= MAX_NUM_CHILDREN_LEAF);
-        assert!(agg_tree_config.num_children_internal <= MAX_NUM_CHILDREN_INTERNAL);
-        check_param_compatibility(
-            &app_or_def_vk.inner.params,
-            &agg_pk.prefix.leaf.params,
-            &agg_pk.prefix.internal_for_leaf.params,
-        );
-
         let leaf_prover = InnerAggregationProver::from_pk::<E>(
             app_or_def_vk,
             agg_pk.prefix.leaf,
-            VerifierCircuitType::Leaf,
+            false,
             def_hook_cached_commit,
         );
         let internal_for_leaf_prover = InnerAggregationProver::from_pk::<E>(
             leaf_prover.get_vk(),
             agg_pk.prefix.internal_for_leaf,
-            VerifierCircuitType::InternalForLeaf,
+            false,
             def_hook_cached_commit,
         );
         let internal_recursive_prover = InnerAggregationProver::from_pk::<E>(
             internal_for_leaf_prover.get_vk(),
             agg_pk.internal_recursive,
-            VerifierCircuitType::InternalRecursive,
+            true,
             def_hook_cached_commit,
         );
         Self {

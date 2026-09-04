@@ -4,10 +4,8 @@ description = "OpenVM elliptic curve macros for short Weierstrass curves"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 homepage.workspace = true
 repository.workspace = true
-license.workspace = true
 
 [dependencies]
 syn = { version = "2.0", features = ["full"] }
@@ -16,3 +14,6 @@ openvm-macros-common = { workspace = true, default-features = false }
 
 [lib]
 proc-macro = true
+
+[lints]
+workspace = true

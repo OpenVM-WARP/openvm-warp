@@ -1,6 +1,8 @@
 #![cfg_attr(feature = "tco", allow(incomplete_features))]
 #![cfg_attr(feature = "tco", feature(explicit_tail_calls))]
 
+#[cfg(feature = "rvr")]
+use std::path::PathBuf;
 use std::{
     fs::read,
     marker::PhantomData,
@@ -17,11 +19,16 @@ use openvm_build::{
 // Re-exports
 pub use openvm_build::{cargo_command, get_rustup_toolchain_name};
 pub use openvm_circuit;
+#[cfg(feature = "rvr")]
+use openvm_circuit::arch::{
+    instructions::program::DEFAULT_PC_STEP,
+    rvr::{default_addr2line_cmd, GuestDebugMap},
+};
 use openvm_circuit::{
     arch::{
         execution_mode::Segment, instructions::exe::VmExe, Executor, InitFileGenerator,
-        MeteredExecutor, PreflightExecutor, SystemConfig, VirtualMachineError, VmBuilder,
-        VmExecutionConfig, VmExecutor,
+        MeteredExecutor, PreflightExecutor, VirtualMachineError, VmBuilder, VmExecutionConfig,
+        VmExecutor, U16_CELL_SIZE,
     },
     system::memory::merkle::public_values::extract_public_values,
 };
@@ -36,13 +43,22 @@ use openvm_static_verifier::StaticVerifierShape;
 use openvm_transpiler::{
     elf::Elf, openvm_platform::memory::MEM_SIZE, transpiler::Transpiler, FromElf,
 };
-use openvm_verify_stark_host::{verify_vm_stark_proof_decoded, vk::VmStarkVerifyingKey};
+use openvm_verify_stark_host::{
+    verify_vm_stark_proof_decoded,
+    vk::{VerificationBaseline, VmStarkVerifyingKey},
+    VmStarkProof,
+};
+pub use types::{ExecutableFormat, ExecutableInput};
 
+#[cfg(feature = "rvr")]
+use crate::compiled::{
+    load_metered_artifact_metadata, metered_artifact_identity, validate_metered_artifact,
+};
 use crate::{
     config::{AggregationConfig, AggregationSystemParams, AggregationTreeConfig},
-    keygen::{AggPrefixProvingKey, AggProvingKey, SdkCachedProvingKey},
-    prover::{AggProver, AppProver, DeferralAggProver, DeferralHookCommits, StarkProver},
-    types::{AppExecutionCommit, ExecutableFormat, VmBaseline},
+    keygen::{AggPrefixProvingKey, AggProvingKey},
+    prover::{AggProver, AppProver, DeferralPathProver, StarkProver},
+    types::AppExecutionCommit,
 };
 #[cfg(feature = "evm-prove")]
 use crate::{halo2_params::CacheHalo2ParamsReader, keygen::Halo2ProvingKey, prover::Halo2Prover};
@@ -64,28 +80,166 @@ cfg_if::cfg_if! {
     }
 }
 
+/// CUDA application-prover constructors for the reduced-SWIRL boundary.
+///
+/// These are separate from `app_prover`: the exact initial RS matrices must
+/// remain owned by the GPU prover from key/program commitment onward. Toggling
+/// that policy after ordinary construction would require reconstructing and
+/// recommitting the source payload that WARP is meant to reuse.
+#[cfg(feature = "cuda")]
+impl<VB> GenericSdk<GpuBabyBearPoseidon2Engine, VB>
+where
+    VB: VmBuilder<GpuBabyBearPoseidon2Engine> + Clone,
+    <VB::VmConfig as VmExecutionConfig<F>>::Executor:
+        Executor<F> + MeteredExecutor<F> + PreflightExecutor<F, VB::RecordArena>,
+{
+    pub fn reduced_swirl_app_prover(
+        &self,
+        exe: impl Into<ExecutableFormat>,
+    ) -> Result<AppProver<GpuBabyBearPoseidon2Engine, VB>, SdkError> {
+        let exe = self.convert_to_exe(exe)?;
+        let app_pk = self.app_pk();
+        prover::reduced_swirl_execution_cuda::new_reduced_swirl_cuda_app_prover(
+            self.app_vm_builder.clone(),
+            &app_pk.app_vm_pk,
+            exe,
+        )
+        .map_err(SdkError::from)
+    }
+
+    #[cfg(feature = "rvr")]
+    pub fn reduced_swirl_app_prover_with_metered_cache(
+        &self,
+        cache_dir: &Path,
+        exe: impl Into<ExecutableFormat>,
+    ) -> Result<
+        (
+            AppProver<GpuBabyBearPoseidon2Engine, VB>,
+            MeteredArtifactCacheStatus,
+        ),
+        SdkError,
+    > {
+        let mut prover = self.reduced_swirl_app_prover(exe)?;
+        let (artifact_path, cache_status) =
+            self.prepare_metered_artifact_for_app_prover(cache_dir, &prover)?;
+        prover.set_metered_artifact_path(artifact_path);
+        Ok((prover, cache_status))
+    }
+
+    /// Prove directly from OpenVM's deferred-SWIRL boundary, accumulate the
+    /// original stacked RS codewords with WARP, and return one ordinary
+    /// recursively normalized standalone proof.
+    ///
+    /// This is the production replacement path: it does not construct full
+    /// per-segment WHIR proofs and it does not accumulate completed segment
+    /// proofs.  Setup parameters are inherited from the same aggregation keys
+    /// as the regular recursive lane so benchmark comparisons use identical
+    /// EF4/PCS profiles outside the new accumulation boundary.
+    pub fn prove_reduced_swirl_warp(
+        &self,
+        exe: impl Into<ExecutableFormat>,
+        inputs: StdIn,
+        input_arity: usize,
+        family_target_bits: usize,
+    ) -> Result<prover::reduced_swirl_production_cuda::ReducedSwirlProductionCudaOutput, SdkError>
+    where
+        VB::SystemChipInventory: openvm_circuit::system::SystemWithFixedTraceHeights,
+    {
+        if self.def_hook_cached_commit().is_some() {
+            return Err(SdkError::Other(eyre::eyre!(
+                "reduced-SWIRL WARP does not yet support deferral proofs"
+            )));
+        }
+        let app_prover = self.reduced_swirl_app_prover(exe)?;
+        // WARP needs the recursive lane's setup-fixed PCS parameters, not its
+        // proving keys. Calling `agg_pk()` here constructs and retains the
+        // complete ordinary leaf/internal aggregation stack merely to clone
+        // these two small values. Besides being duplicate setup work, those
+        // unused host/device keys overlap the custom WARP wrapper keygen and
+        // materially increase its peak memory. The config is the authority
+        // from which `AggProver` itself would build the same keys.
+        let recursive_leaf_params = self.agg_config.params.leaf.clone();
+        let recursive_internal_params = self.agg_config.params.internal.clone();
+        prover::reduced_swirl_production_cuda::prove_reduced_swirl_production_cuda(
+            app_prover,
+            inputs,
+            input_arity,
+            family_target_bits,
+            recursive_leaf_params,
+            recursive_internal_params,
+        )
+        .map_err(|error| SdkError::Other(eyre::eyre!(error)))
+    }
+
+    #[cfg(feature = "rvr")]
+    pub fn prove_reduced_swirl_warp_with_metered_cache(
+        &self,
+        cache_dir: &Path,
+        exe: impl Into<ExecutableFormat>,
+        inputs: StdIn,
+        input_arity: usize,
+        family_target_bits: usize,
+    ) -> Result<
+        (
+            prover::reduced_swirl_production_cuda::ReducedSwirlProductionCudaOutput,
+            MeteredArtifactCacheStatus,
+        ),
+        SdkError,
+    >
+    where
+        VB::SystemChipInventory: openvm_circuit::system::SystemWithFixedTraceHeights,
+    {
+        if self.def_hook_cached_commit().is_some() {
+            return Err(SdkError::Other(eyre::eyre!(
+                "reduced-SWIRL WARP does not yet support deferral proofs"
+            )));
+        }
+        let (app_prover, cache_status) =
+            self.reduced_swirl_app_prover_with_metered_cache(cache_dir, exe)?;
+        // Match `prove_reduced_swirl_warp`: sharing PCS parameters with the
+        // recursive lane must not instantiate its otherwise-unused proving
+        // keys inside the WARP process.
+        let recursive_leaf_params = self.agg_config.params.leaf.clone();
+        let recursive_internal_params = self.agg_config.params.internal.clone();
+        let output = prover::reduced_swirl_production_cuda::prove_reduced_swirl_production_cuda(
+            app_prover,
+            inputs,
+            input_arity,
+            family_target_bits,
+            recursive_leaf_params,
+            recursive_internal_params,
+        )
+        .map_err(|error| SdkError::Other(eyre::eyre!(error)))?;
+        Ok((output, cache_status))
+    }
+}
+
 pub use openvm_stark_sdk::config::baby_bear_poseidon2::{BabyBearPoseidon2Config as SC, F};
-pub use openvm_verify_stark_host::{vk::VerificationBaseline, VmStarkProof};
 
 pub mod builder;
+pub mod compiled;
 pub mod config;
 pub mod fs;
 #[cfg(feature = "evm-prove")]
 pub mod halo2_params;
 pub mod keygen;
-#[cfg(feature = "certified-verifier")]
-pub use openvm_certified_verifier as certified_verifier;
 pub mod prover;
 #[cfg(feature = "evm-verify")]
 mod solidity;
 pub mod types;
 pub mod util;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "root-prover"))]
 mod tests;
 
 mod error;
 mod stdin;
+pub use compiled::{CompiledExeMetered, CompiledExeMeteredCost, CompiledExePure};
+#[cfg(feature = "rvr")]
+pub use compiled::{
+    MeteredArtifactCacheStatus, MeteredArtifactIdentity, MeteredArtifactMetadata,
+    METERED_ARTIFACT_FORMAT_VERSION,
+};
 pub use error::SdkError;
 pub use stdin::*;
 
@@ -94,6 +248,12 @@ pub const OPENVM_VERSION: &str = concat!(
     ".",
     env!("CARGO_PKG_VERSION_MINOR")
 );
+
+struct CompileInput {
+    executable: ExecutableFormat,
+    #[cfg(feature = "rvr")]
+    elf_path: Option<PathBuf>,
+}
 
 // The SDK is only generic in the engine for the non-root SC. The root SC is fixed to
 // BabyBearPoseidon2RootEngine right now.
@@ -109,7 +269,7 @@ pub const OPENVM_VERSION: &str = concat!(
 /// that depends on the program executable.
 ///
 /// Some commonly used methods are:
-/// - [`execute`](Self::execute)
+/// - [`compile_and_execute`](Self::compile_and_execute)
 /// - [`prove`](Self::prove)
 /// - [`verify_proof`](Self::verify_proof)
 #[derive(Getters)]
@@ -151,7 +311,7 @@ where
     #[cfg(feature = "root-prover")]
     root_prover: OnceLock<Arc<RootProver>>,
 
-    deferral_setup: DeferralSetup,
+    def_path_prover: Option<Arc<DeferralPathProver>>,
 
     #[cfg(feature = "evm-prove")]
     #[getset(get = "pub")]
@@ -160,46 +320,6 @@ where
     halo2_prover: OnceLock<Halo2Prover>,
 
     _phantom: PhantomData<E>,
-}
-
-#[derive(Clone, Default)]
-pub enum DeferralSetup {
-    #[default]
-    /// Deferrals are disabled for this GenericSdk. The STARK, root, and halo2 vks are deferral-
-    /// unaware, and trying to prove with def_inputs set causes an error.
-    Disabled,
-    /// The STARK, root, and halo2 vks are deferral-aware (i.e. are equivalent to Active), but
-    /// trying to prove with def_inputs set still causes an error. Use this when a program that
-    /// doesn't use deferrals must be verified by a deferral-aware vk.
-    Aware(DeferralHookCommits),
-    /// The STARK, root, and halo2 vks are deferral-aware (i.e. are equivalent to Aware), and
-    /// deferral inputs can be used and proved.
-    Active(Arc<DeferralAggProver>),
-}
-
-impl DeferralSetup {
-    pub fn hook_cached_commit(&self) -> Option<Digest> {
-        match self {
-            Self::Disabled => None,
-            Self::Aware(commits) => Some(commits.hook_cached_commit),
-            Self::Active(prover) => Some(prover.def_hook_cached_commit()),
-        }
-    }
-
-    pub fn hook_commit(&self) -> Option<Digest> {
-        match self {
-            Self::Disabled => None,
-            Self::Aware(commits) => Some(commits.hook_commit),
-            Self::Active(prover) => Some(prover.def_hook_commit()),
-        }
-    }
-
-    pub fn prover(&self) -> Option<Arc<DeferralAggProver>> {
-        match self {
-            Self::Active(prover) => Some(prover.clone()),
-            Self::Disabled | Self::Aware(_) => None,
-        }
-    }
 }
 
 pub type CpuSdk = GenericSdk<BabyBearPoseidon2Engine, SdkVmCpuBuilder>;
@@ -215,21 +335,26 @@ where
     /// Creates SDK with a standard configuration that includes a set of default VM extensions
     /// loaded.
     ///
-    /// **Note**: To use this configuration, your `openvm.toml` must match
-    /// [`SdkVmConfig::standard`], including the order of the moduli and elliptic curve parameters
-    /// of the respective extensions. See the `openvm-sdk-config` crate documentation for the
-    /// corresponding TOML.
+    /// **Note**: To use this configuration, your `openvm.toml` must match, including the order of
+    /// the moduli and elliptic curve parameters of the respective extensions:
+    /// The `app_vm_config` field of your `openvm.toml` must exactly match the following:
+    ///
+    /// ```toml
+    #[doc = include_str!("../../sdk-config/src/openvm_standard.toml")]
+    /// ```
     pub fn standard(app_params: SystemParams, agg_params: AggregationSystemParams) -> Self {
         GenericSdk::new(AppConfig::standard(app_params), agg_params).unwrap()
     }
 
-    /// Creates SDK with a configuration with RISC-V RV32IM and IO VM extensions loaded.
+    /// Creates SDK with a configuration with RISC-V RV64IM and IO VM extensions loaded.
     ///
-    /// **Note**: To use this configuration, your `openvm.toml` must match
-    /// [`SdkVmConfig::riscv32`]. See the `openvm-sdk-config` crate documentation for the
-    /// corresponding TOML.
-    pub fn riscv32(app_params: SystemParams, agg_params: AggregationSystemParams) -> Self {
-        GenericSdk::new(AppConfig::riscv32(app_params), agg_params).unwrap()
+    /// **Note**: To use this configuration, your `openvm.toml` must exactly match the following:
+    ///
+    /// ```toml
+    #[doc = include_str!("../../sdk-config/src/openvm_riscv64.toml")]
+    /// ```
+    pub fn riscv64(app_params: SystemParams, agg_params: AggregationSystemParams) -> Self {
+        GenericSdk::new(AppConfig::riscv64(app_params), agg_params).unwrap()
     }
 }
 
@@ -272,81 +397,14 @@ where
 
     /// Returns the def_hook_prover cached commit.
     pub fn def_hook_cached_commit(&self) -> Option<Digest> {
-        self.deferral_setup.hook_cached_commit()
+        self.def_path_prover
+            .as_ref()
+            .map(|p| p.def_hook_cached_commit())
     }
 
     /// Returns the deferral hook commit derived from the deferral aggregation path.
     pub fn def_hook_commit(&self) -> Option<Digest> {
-        self.deferral_setup.hook_commit()
-    }
-
-    /// Returns the deferral aggregation prover when this SDK can prove non-empty deferral inputs.
-    pub fn deferral_agg_prover(&self) -> Option<Arc<DeferralAggProver>> {
-        self.deferral_setup.prover()
-    }
-
-    /// Derives the cached commits that the deferral circuit at `def_idx` expects callers to fold
-    /// into its input commit.
-    pub fn deferral_circuit_cached_commits(
-        &self,
-        def_idx: usize,
-    ) -> Result<Vec<CommitBytes>, SdkError> {
-        let deferral_prover = self.deferral_setup.prover().ok_or_else(|| {
-            SdkError::Other(eyre::eyre!(
-                "deferral circuit cached commits require an active deferral prover"
-            ))
-        })?;
-        deferral_prover
-            .multi_deferral_circuit_prover
-            .single_circuit_provers
-            .get(def_idx)
-            .map(|prover| prover.def_circuit_prover.cached_commits())
-            .ok_or_else(|| {
-                SdkError::Other(eyre::eyre!(
-                    "deferral circuit index {def_idx} is not configured"
-                ))
-            })
-    }
-
-    /// Returns serde-serializable proving keys for this SDK.
-    ///
-    /// This errors if `app_pk` or `agg_pk` have not already been generated or seeded into the SDK.
-    /// Optional keys are returned only if they are already cached or were seeded into the SDK.
-    ///
-    /// Halo2 proving keys are intentionally excluded; use `write_halo2_pk_to_file` and
-    /// `read_halo2_pk_from_file` for those.
-    pub fn cached_proving_key(&self) -> Result<SdkCachedProvingKey<VB::VmConfig>, SdkError> {
-        let app_pk = self
-            .app_pk
-            .get()
-            .ok_or_else(|| SdkError::Other(eyre::eyre!("app_pk is not generated")))?
-            .clone();
-        let agg_prover = self
-            .agg_prover
-            .get()
-            .ok_or_else(|| SdkError::Other(eyre::eyre!("agg_pk is not generated")))?;
-        let deferral_prover = self.deferral_setup.prover();
-        Ok(SdkCachedProvingKey {
-            app_pk,
-            agg_pk: AggProvingKey {
-                prefix: AggPrefixProvingKey {
-                    leaf: agg_prover.leaf_prover.get_pk(),
-                    internal_for_leaf: agg_prover.internal_for_leaf_prover.get_pk(),
-                },
-                internal_recursive: agg_prover.internal_recursive_prover.get_pk(),
-            },
-            deferral_pk: deferral_prover
-                .as_ref()
-                .map(|def_agg_prover| def_agg_prover.multi_deferral_circuit_prover.get_pk()),
-            deferral_agg_pk: deferral_prover
-                .as_ref()
-                .map(|def_agg_prover| def_agg_prover.get_pk()),
-            #[cfg(feature = "root-prover")]
-            root_pk: self.root_prover.get().map(|root_prover| RootProvingKey {
-                root_pk: root_prover.0.get_pk(),
-                trace_heights: root_prover.0.get_trace_heights().unwrap_or_default(),
-            }),
-        })
+        self.def_path_prover.as_ref().map(|p| p.def_hook_commit())
     }
 
     /// Builds the guest package located at `pkg_dir`. This function requires that the build target
@@ -401,6 +459,53 @@ where
         };
         Ok(exe)
     }
+
+    fn compile_input(
+        &self,
+        executable: impl Into<ExecutableInput>,
+    ) -> Result<CompileInput, SdkError> {
+        let executable = executable.into();
+        match executable {
+            ExecutableInput::Format(format) => Ok(CompileInput {
+                executable: format,
+                #[cfg(feature = "rvr")]
+                elf_path: None,
+            }),
+            ExecutableInput::ElfFile(path) => {
+                let bytes = read(&path)?;
+                let elf = Elf::decode(&bytes, MEM_SIZE as u32)?;
+                Ok(CompileInput {
+                    executable: ExecutableFormat::Elf(elf),
+                    #[cfg(feature = "rvr")]
+                    elf_path: Some(path),
+                })
+            }
+            #[cfg(feature = "rvr")]
+            ExecutableInput::WithElfPath {
+                executable,
+                elf_path,
+            } => Ok(CompileInput {
+                executable,
+                elf_path: Some(elf_path),
+            }),
+        }
+    }
+
+    #[cfg(feature = "rvr")]
+    fn guest_debug_map(&self, elf_path: &Path, exe: &VmExe<F>) -> Result<GuestDebugMap, SdkError> {
+        let pcs = exe
+            .program
+            .instructions_and_debug_infos
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                slot.as_ref()
+                    .map(|_| exe.program.pc_base + (index as u32) * DEFAULT_PC_STEP)
+            })
+            .collect::<Vec<_>>();
+        GuestDebugMap::from_elf(elf_path, &pcs, &default_addr2line_cmd())
+            .map_err(|err| SdkError::Other(eyre::eyre!(err)))
+    }
 }
 
 // The SDK is only functional for SC = BabyBearPoseidon2Config because that is what recursive
@@ -412,23 +517,70 @@ where
     <VB::VmConfig as VmExecutionConfig<F>>::Executor:
         Executor<F> + MeteredExecutor<F> + PreflightExecutor<F, VB::RecordArena>,
 {
-    /// Returns the user public values as field elements.
-    pub fn execute(
+    /// Compile `app_exe` and execute it, returning the user public values as bytes.
+    pub fn compile_and_execute(
         &self,
-        app_exe: impl Into<ExecutableFormat>,
+        app_exe: impl Into<ExecutableInput>,
         inputs: StdIn,
     ) -> Result<Vec<u8>, SdkError> {
-        let exe = self.convert_to_exe(app_exe)?;
-        let instance = self
-            .executor
+        let compiled = self.compile(app_exe)?;
+        self.execute(&compiled, inputs)
+    }
+
+    /// Compile `app_exe` for pure execution.
+    #[tracing::instrument(name = "sdk.compile", level = "info", skip_all)]
+    pub fn compile(
+        &self,
+        app_exe: impl Into<ExecutableInput>,
+    ) -> Result<CompiledExePure<'_, F>, SdkError> {
+        let input = self.compile_input(app_exe)?;
+        let exe = self.convert_to_exe(input.executable)?;
+        #[cfg(feature = "rvr")]
+        {
+            let guest_debug_map = input
+                .elf_path
+                .as_deref()
+                .map(|elf_path| self.guest_debug_map(elf_path, &exe))
+                .transpose()?;
+            self.executor
+                .rvr_instance(&exe, guest_debug_map.as_ref())
+                .map_err(VirtualMachineError::from)
+                .map_err(SdkError::from)
+        }
+        #[cfg(not(feature = "rvr"))]
+        self.executor
             .instance(&exe)
-            .map_err(VirtualMachineError::from)?;
-        let final_memory = instance
+            .map_err(VirtualMachineError::from)
+            .map_err(SdkError::from)
+    }
+
+    /// Load a previously saved pure-mode rvr artifact. No compatibility validation is performed.
+    #[cfg(feature = "rvr")]
+    pub fn load_compiled(
+        &self,
+        lib_path: &Path,
+        app_exe: impl Into<ExecutableFormat>,
+    ) -> Result<CompiledExePure<'_, F>, SdkError> {
+        let exe = self.convert_to_exe(app_exe)?;
+        self.executor
+            .load_instance(lib_path, &exe)
+            .map_err(VirtualMachineError::from)
+            .map_err(SdkError::from)
+    }
+
+    /// Run a [`CompiledExePure`] against `inputs` and extract the user public values.
+    #[tracing::instrument(name = "sdk.execute", level = "info", skip_all)]
+    pub fn execute(
+        &self,
+        compiled: &CompiledExePure<'_, F>,
+        inputs: StdIn,
+    ) -> Result<Vec<u8>, SdkError> {
+        let final_memory = compiled
             .execute(inputs, None)
             .map_err(VirtualMachineError::from)?
             .memory;
         let public_values = extract_public_values(
-            self.executor.config.as_ref().num_public_values,
+            self.executor.config.as_ref().num_public_values * U16_CELL_SIZE,
             &final_memory.memory,
         );
         Ok(public_values)
@@ -436,26 +588,262 @@ where
 
     /// Executes with segmentation for proof generation.
     /// Returns both user public values and segments with instruction counts and trace heights.
-    pub fn execute_metered(
+    pub fn compile_and_execute_metered(
         &self,
-        app_exe: impl Into<ExecutableFormat>,
+        app_exe: impl Into<ExecutableInput>,
         inputs: StdIn,
     ) -> Result<(Vec<u8>, Vec<Segment>), SdkError> {
-        let app_prover = self.app_prover(app_exe)?;
+        let compiled = self.compile_metered(app_exe)?;
+        self.execute_metered(&compiled, inputs)
+    }
+
+    /// Compile `app_exe` for metered execution. The returned [`CompiledExeMetered`] bundles
+    /// a precomputed `MeteredCtx` so subsequent runs just clone it.
+    #[tracing::instrument(name = "sdk.compile_metered", level = "info", skip_all)]
+    pub fn compile_metered(
+        &self,
+        app_exe: impl Into<ExecutableInput>,
+    ) -> Result<CompiledExeMetered<'_>, SdkError> {
+        let input = self.compile_input(app_exe)?;
+        let app_prover = self.app_prover(input.executable)?;
 
         let vm = app_prover.vm();
         let exe = app_prover.exe();
 
         let ctx = vm.build_metered_ctx(&exe);
-        let interpreter = vm
-            .metered_interpreter(&exe)
+        let executor_idx_to_air_idx = vm.executor_idx_to_air_idx();
+        #[cfg(feature = "rvr")]
+        let artifact_identity = metered_artifact_identity(
+            &exe,
+            &ctx.config,
+            ctx.segmentation_ctx.config(),
+            &executor_idx_to_air_idx,
+        )
+        .map_err(SdkError::Other)?;
+        #[cfg(feature = "rvr")]
+        let guest_debug_map = input
+            .elf_path
+            .as_deref()
+            .map(|elf_path| self.guest_debug_map(elf_path, &exe))
+            .transpose()?;
+        #[cfg(feature = "rvr")]
+        let instance = self
+            .executor
+            .metered_rvr_instance(&exe, &executor_idx_to_air_idx, guest_debug_map.as_ref())
             .map_err(VirtualMachineError::from)?;
+        #[cfg(not(feature = "rvr"))]
+        let instance = self
+            .executor
+            .metered_instance(&exe, &executor_idx_to_air_idx)
+            .map_err(VirtualMachineError::from)?;
+        Ok(CompiledExeMetered {
+            instance,
+            ctx,
+            #[cfg(feature = "rvr")]
+            executor_idx_to_air_idx,
+            #[cfg(feature = "rvr")]
+            artifact_identity,
+        })
+    }
 
-        let (segments, final_state) = interpreter
-            .execute_metered(inputs, ctx)
+    /// Load a previously saved metered-mode artifact after validating its executable, VM shape,
+    /// native toolchain, and shared-library digest.
+    ///
+    /// The execution context and executor-to-AIR mapping are recomputed from `app_exe` and this
+    /// SDK. Values from the cache manifest are never used as trusted execution configuration.
+    #[cfg(feature = "rvr")]
+    pub fn load_compiled_metered(
+        &self,
+        lib_path: &Path,
+        app_exe: impl Into<ExecutableFormat>,
+    ) -> Result<CompiledExeMetered<'_>, SdkError> {
+        let metadata = load_metered_artifact_metadata(lib_path).map_err(SdkError::Other)?;
+        let exe = self.convert_to_exe(app_exe)?;
+        let app_prover = self.app_prover(exe.clone())?;
+        let vm = app_prover.vm();
+        let ctx = vm.build_metered_ctx(&exe);
+        let executor_idx_to_air_idx = vm.executor_idx_to_air_idx();
+        let artifact_identity = metered_artifact_identity(
+            &exe,
+            &ctx.config,
+            ctx.segmentation_ctx.config(),
+            &executor_idx_to_air_idx,
+        )
+        .map_err(SdkError::Other)?;
+        validate_metered_artifact(lib_path, &metadata, &artifact_identity)
+            .map_err(SdkError::Other)?;
+        let instance = self
+            .executor
+            .load_metered_instance(lib_path, &exe, &executor_idx_to_air_idx)
+            .map_err(VirtualMachineError::from)?;
+        Ok(CompiledExeMetered {
+            instance,
+            ctx,
+            executor_idx_to_air_idx,
+            artifact_identity,
+        })
+    }
+
+    /// Load a checked native metered artifact from a content-addressed cache, compiling and
+    /// atomically replacing the entry on a miss or validation failure.
+    #[cfg(feature = "rvr")]
+    #[tracing::instrument(name = "sdk.compile_or_load_metered_cached", level = "info", skip_all)]
+    pub fn compile_or_load_metered_cached(
+        &self,
+        cache_dir: &Path,
+        app_exe: impl Into<ExecutableInput>,
+    ) -> Result<(CompiledExeMetered<'_>, MeteredArtifactCacheStatus), SdkError> {
+        let input = self.compile_input(app_exe)?;
+        let elf_path = input.elf_path.clone();
+        let exe = self.convert_to_exe(input.executable)?;
+        let app_prover = self.app_prover(exe.clone())?;
+        let vm = app_prover.vm();
+        let ctx = vm.build_metered_ctx(&exe);
+        let executor_idx_to_air_idx = vm.executor_idx_to_air_idx();
+        let identity = metered_artifact_identity(
+            &exe,
+            &ctx.config,
+            ctx.segmentation_ctx.config(),
+            &executor_idx_to_air_idx,
+        )
+        .map_err(SdkError::Other)?;
+        let lib_path = identity
+            .cache_library_path(cache_dir)
+            .map_err(SdkError::Other)?;
+        let entry_dir = lib_path
+            .parent()
+            .expect("content-addressed metered artifact has a parent directory");
+        let metadata_path = compiled::metered_artifact_metadata_path(&lib_path);
+
+        let mut status = MeteredArtifactCacheStatus::Miss;
+        if lib_path.is_file() && metadata_path.is_file() {
+            match self.load_compiled_metered(&lib_path, exe.clone()) {
+                Ok(compiled) => {
+                    tracing::info!(path = %lib_path.display(), "native metered artifact cache hit");
+                    return Ok((compiled, MeteredArtifactCacheStatus::Hit));
+                }
+                Err(error) => {
+                    let reason = error.to_string();
+                    tracing::warn!(
+                        path = %lib_path.display(),
+                        %reason,
+                        "rejecting invalid native metered artifact cache entry"
+                    );
+                    status = MeteredArtifactCacheStatus::Rebuilt { reason };
+                }
+            }
+        }
+
+        std::fs::create_dir_all(entry_dir)?;
+        let compile_input = if let Some(elf_path) = elf_path {
+            ExecutableInput::with_elf_path(exe, elf_path)
+        } else {
+            ExecutableInput::from(exe)
+        };
+        let compiled = self.compile_metered(compile_input)?;
+        if compiled.artifact_identity != identity {
+            return Err(SdkError::Other(eyre::eyre!(
+                "native metered cache identity changed while compiling"
+            )));
+        }
+        compiled.save_to_path(&lib_path).map_err(SdkError::Other)?;
+        tracing::info!(path = %lib_path.display(), ?status, "stored native metered artifact");
+        Ok((compiled, status))
+    }
+
+    /// Ensure a checked native metering artifact exists and return its stable cache path.
+    ///
+    /// This drops the temporary loaded instance before returning. A continuation prover can then
+    /// load the same artifact in its own VM without retaining duplicate native-library handles.
+    #[cfg(feature = "rvr")]
+    pub fn prepare_metered_artifact_cache(
+        &self,
+        cache_dir: &Path,
+        app_exe: impl Into<ExecutableInput>,
+    ) -> Result<(PathBuf, MeteredArtifactCacheStatus), SdkError> {
+        let (compiled, status) = self.compile_or_load_metered_cached(cache_dir, app_exe)?;
+        let lib_path = compiled
+            .artifact_identity()
+            .cache_library_path(cache_dir)
+            .map_err(SdkError::Other)?;
+        drop(compiled);
+        Ok((lib_path, status))
+    }
+
+    #[cfg(feature = "rvr")]
+    fn prepare_metered_artifact_for_app_prover(
+        &self,
+        cache_dir: &Path,
+        prover: &AppProver<E, VB>,
+    ) -> Result<(PathBuf, MeteredArtifactCacheStatus), SdkError> {
+        let vm = prover.vm();
+        let exe = prover.exe();
+        let ctx = vm.build_metered_ctx(&exe);
+        let executor_idx_to_air_idx = vm.executor_idx_to_air_idx();
+        let identity = metered_artifact_identity(
+            &exe,
+            &ctx.config,
+            ctx.segmentation_ctx.config(),
+            &executor_idx_to_air_idx,
+        )
+        .map_err(SdkError::Other)?;
+        let lib_path = identity
+            .cache_library_path(cache_dir)
+            .map_err(SdkError::Other)?;
+        let metadata_path = compiled::metered_artifact_metadata_path(&lib_path);
+
+        let mut status = MeteredArtifactCacheStatus::Miss;
+        if lib_path.is_file() && metadata_path.is_file() {
+            match load_metered_artifact_metadata(&lib_path)
+                .and_then(|metadata| validate_metered_artifact(&lib_path, &metadata, &identity))
+            {
+                Ok(()) => {
+                    tracing::info!(path = %lib_path.display(), "native metered artifact cache hit");
+                    return Ok((lib_path, MeteredArtifactCacheStatus::Hit));
+                }
+                Err(error) => {
+                    let reason = error.to_string();
+                    tracing::warn!(
+                        path = %lib_path.display(),
+                        %reason,
+                        "rejecting invalid native metered artifact cache entry"
+                    );
+                    status = MeteredArtifactCacheStatus::Rebuilt { reason };
+                }
+            }
+        }
+
+        let entry_dir = lib_path
+            .parent()
+            .expect("content-addressed metered artifact has a parent directory");
+        std::fs::create_dir_all(entry_dir)?;
+        let instance = vm
+            .metered_instance(&exe)
+            .map_err(VirtualMachineError::from)?;
+        let compiled = CompiledExeMetered {
+            instance,
+            ctx,
+            executor_idx_to_air_idx,
+            artifact_identity: identity,
+        };
+        compiled.save_to_path(&lib_path).map_err(SdkError::Other)?;
+        tracing::info!(path = %lib_path.display(), ?status, "stored native metered artifact");
+        Ok((lib_path, status))
+    }
+
+    /// Run a [`CompiledExeMetered`] against `inputs`.
+    #[tracing::instrument(name = "sdk.execute_metered", level = "info", skip_all)]
+    pub fn execute_metered(
+        &self,
+        compiled: &CompiledExeMetered<'_>,
+        inputs: StdIn,
+    ) -> Result<(Vec<u8>, Vec<Segment>), SdkError> {
+        let (segments, final_state) = compiled
+            .instance
+            .execute_metered(inputs, compiled.ctx.clone())
             .map_err(VirtualMachineError::from)?;
         let public_values = extract_public_values(
-            self.executor.config.as_ref().num_public_values,
+            self.executor.config.as_ref().num_public_values * U16_CELL_SIZE,
             &final_state.memory.memory,
         );
 
@@ -464,29 +852,90 @@ where
 
     /// Executes with cost metering to measure computational cost in trace cells.
     /// Returns both user public values, and cost along with instruction count.
-    pub fn execute_metered_cost(
+    pub fn compile_and_execute_metered_cost(
         &self,
-        app_exe: impl Into<ExecutableFormat>,
+        app_exe: impl Into<ExecutableInput>,
         inputs: StdIn,
     ) -> Result<(Vec<u8>, (u64, u64)), SdkError> {
-        let app_prover = self.app_prover(app_exe)?;
+        let compiled = self.compile_metered_cost(app_exe)?;
+        self.execute_metered_cost(&compiled, inputs)
+    }
+
+    /// Compile `app_exe` for metered-cost execution. See [`Self::compile_metered`].
+    #[tracing::instrument(name = "sdk.compile_metered_cost", level = "info", skip_all)]
+    pub fn compile_metered_cost(
+        &self,
+        app_exe: impl Into<ExecutableInput>,
+    ) -> Result<CompiledExeMeteredCost<'_>, SdkError> {
+        let input = self.compile_input(app_exe)?;
+        let app_prover = self.app_prover(input.executable)?;
 
         let vm = app_prover.vm();
         let exe = app_prover.exe();
 
         let ctx = vm.build_metered_cost_ctx();
-        let interpreter = vm
-            .metered_cost_interpreter(&exe)
+        let executor_idx_to_air_idx = vm.executor_idx_to_air_idx();
+        #[cfg(feature = "rvr")]
+        let guest_debug_map = input
+            .elf_path
+            .as_deref()
+            .map(|elf_path| self.guest_debug_map(elf_path, &exe))
+            .transpose()?;
+        #[cfg(feature = "rvr")]
+        let instance = self
+            .executor
+            .metered_cost_rvr_instance(
+                &exe,
+                &executor_idx_to_air_idx,
+                &ctx.widths,
+                guest_debug_map.as_ref(),
+            )
             .map_err(VirtualMachineError::from)?;
+        #[cfg(not(feature = "rvr"))]
+        let instance = self
+            .executor
+            .metered_cost_instance(&exe, &executor_idx_to_air_idx)
+            .map_err(VirtualMachineError::from)?;
+        Ok(CompiledExeMeteredCost { instance, ctx })
+    }
 
-        let (ctx, final_state) = interpreter
-            .execute_metered_cost(inputs, ctx)
+    /// Load a previously saved metered-cost-mode artifact. The `MeteredCostCtx` is
+    /// rebuilt. Caller supplies `app_exe`; no compatibility validation is performed.
+    #[cfg(feature = "rvr")]
+    pub fn load_compiled_metered_cost(
+        &self,
+        lib_path: &Path,
+        app_exe: impl Into<ExecutableFormat>,
+    ) -> Result<CompiledExeMeteredCost<'_>, SdkError> {
+        let app_prover = self.app_prover(app_exe)?;
+        let vm = app_prover.vm();
+        let exe = app_prover.exe();
+
+        let ctx = vm.build_metered_cost_ctx();
+        let executor_idx_to_air_idx = vm.executor_idx_to_air_idx();
+        let instance = self
+            .executor
+            .load_metered_cost_instance(lib_path, &exe, &executor_idx_to_air_idx, &ctx.widths)
+            .map_err(VirtualMachineError::from)?;
+        Ok(CompiledExeMeteredCost { instance, ctx })
+    }
+
+    /// Run a [`CompiledExeMeteredCost`] against `inputs`.
+    #[tracing::instrument(name = "sdk.execute_metered_cost", level = "info", skip_all)]
+    pub fn execute_metered_cost(
+        &self,
+        compiled: &CompiledExeMeteredCost<'_>,
+        inputs: StdIn,
+    ) -> Result<(Vec<u8>, (u64, u64)), SdkError> {
+        let (ctx, final_state) = compiled
+            .instance
+            .execute_metered_cost(inputs, compiled.ctx.clone())
             .map_err(VirtualMachineError::from)?;
         let instret = ctx.instret;
         let cost = ctx.cost;
 
         let public_values = extract_public_values(
-            self.executor.config.as_ref().num_public_values,
+            self.executor.config.as_ref().num_public_values * U16_CELL_SIZE,
             &final_state.memory.memory,
         );
 
@@ -517,6 +966,33 @@ where
         let proof = prover.prove(inputs, def_inputs)?.0;
         let baseline = prover.generate_baseline();
         Ok((proof, baseline))
+    }
+
+    /// [`Self::prove`] with a checked content-addressed native metering cache.
+    ///
+    /// Warm-cache time excludes native C generation/compilation while preserving the exact
+    /// metered execution and segment schedule. The status lets benchmarks report cold and warm
+    /// runs separately.
+    #[cfg(feature = "rvr")]
+    pub fn prove_with_metered_cache(
+        &self,
+        cache_dir: &Path,
+        app_exe: impl Into<ExecutableFormat>,
+        inputs: StdIn,
+        def_inputs: &[DeferralInput],
+    ) -> Result<
+        (
+            VmStarkProof,
+            VerificationBaseline,
+            MeteredArtifactCacheStatus,
+        ),
+        SdkError,
+    > {
+        let (mut prover, cache_status) = tracing::info_span!("recursive_prover_setup")
+            .in_scope(|| self.prover_with_metered_cache(cache_dir, app_exe))?;
+        let proof = prover.prove(inputs, def_inputs)?.0;
+        let baseline = prover.generate_baseline();
+        Ok((proof, baseline, cache_status))
     }
 
     #[cfg(feature = "evm-prove")]
@@ -552,6 +1028,23 @@ where
         Ok(prover)
     }
 
+    /// Construct an application prover using a checked content-addressed native metering
+    /// artifact. Cache preparation happens before the prover installs the path, so unvalidated
+    /// shared libraries never reach the VM loader through this API.
+    #[cfg(feature = "rvr")]
+    pub fn app_prover_with_metered_cache(
+        &self,
+        cache_dir: &Path,
+        exe: impl Into<ExecutableFormat>,
+    ) -> Result<(AppProver<E, VB>, MeteredArtifactCacheStatus), SdkError> {
+        let exe = self.convert_to_exe(exe)?;
+        let mut prover = self.app_prover(exe)?;
+        let (artifact_path, cache_status) =
+            self.prepare_metered_artifact_for_app_prover(cache_dir, &prover)?;
+        prover.set_metered_artifact_path(artifact_path);
+        Ok((prover, cache_status))
+    }
+
     /// Constructs a new [StarkProver] instance for the given executable.
     /// This function will generate the [AppProvingKey] if it does not already
     /// exist.
@@ -566,9 +1059,25 @@ where
             &app_pk.app_vm_pk,
             app_exe,
             self.agg_prover(),
-            self.deferral_setup.clone(),
+            self.def_path_prover.clone(),
         )?;
         Ok(stark_prover)
+    }
+
+    /// Construct a recursive STARK prover using a checked content-addressed native metering
+    /// artifact.
+    #[cfg(feature = "rvr")]
+    pub fn prover_with_metered_cache(
+        &self,
+        cache_dir: &Path,
+        app_exe: impl Into<ExecutableFormat>,
+    ) -> Result<(StarkProver<E, VB>, MeteredArtifactCacheStatus), SdkError> {
+        let app_exe = self.convert_to_exe(app_exe)?;
+        let mut prover = self.prover(app_exe)?;
+        let (artifact_path, cache_status) =
+            self.prepare_metered_artifact_for_app_prover(cache_dir, &prover.app_prover)?;
+        prover.app_prover.set_metered_artifact_path(artifact_path);
+        Ok((prover, cache_status))
     }
 
     #[cfg(feature = "root-prover")]
@@ -585,7 +1094,7 @@ where
             &app_pk.app_vm_pk,
             app_exe,
             self.agg_prover(),
-            self.deferral_setup.clone(),
+            self.def_path_prover.clone(),
             self.root_prover(),
             #[cfg(feature = "evm-prove")]
             None,
@@ -632,14 +1141,15 @@ where
             .get_or_init(|| {
                 let system_config = self.app_config.app_vm_config.as_ref();
                 let root_params = self.root_params.clone();
+                let app_pk = self.app_pk();
                 let agg_prover = self.agg_prover();
 
-                let (trace_heights, root_pk) = compute_root_proof_heights(
-                    system_config.clone(),
-                    self.agg_config.params.clone(),
-                    self.agg_tree_config,
+                let (trace_heights, root_pk) = compute_root_proof_heights::<E, VB>(
+                    self.app_vm_builder.clone(),
+                    &app_pk.app_vm_pk,
+                    agg_prover.clone(),
                     root_params.clone(),
-                    self.deferral_setup.clone(),
+                    self.def_path_prover.clone(),
                 )
                 .expect("Trace heights did not generate properly");
 
@@ -680,7 +1190,7 @@ where
                     self.app_vm_builder.clone(),
                     &self.app_pk().app_vm_pk,
                     agg_prover.clone(),
-                    self.deferral_setup.clone(),
+                    self.def_path_prover.clone(),
                     root_prover,
                 );
 
@@ -805,23 +1315,6 @@ where
         })
     }
 
-    /// Returns the [VmBaseline] that STARK proofs generated by this Sdk are verified against:
-    /// the executable-independent subset of the [VerificationBaseline], derived from this Sdk's
-    /// config and keys. The app and aggregation proving keys are generated if not already cached.
-    pub fn vm_baseline(&self) -> VmBaseline {
-        let system_config: &SystemConfig = self.app_config.app_vm_config.as_ref();
-        let agg_prover = self.agg_prover();
-        VmBaseline {
-            memory_dimensions: system_config.memory_config.memory_dimensions(),
-            num_user_pvs: system_config.num_public_values,
-            app_vk_commit: agg_prover.leaf_prover.get_vk_commit(false),
-            leaf_vk_commit: agg_prover.internal_for_leaf_prover.get_vk_commit(false),
-            internal_for_leaf_vk_commit: agg_prover.internal_recursive_prover.get_vk_commit(false),
-            internal_recursive_vk_commit: agg_prover.internal_recursive_prover.get_vk_commit(true),
-            expected_def_hook_commit: self.deferral_setup.hook_commit(),
-        }
-    }
-
     // ======================== Verification Methods ========================
 
     /// Verifies aggregate STARK proof of VM execution.
@@ -841,59 +1334,10 @@ where
         Ok(())
     }
 
-    /// Verifies an aggregate STARK proof with the certified Swirl verifier extracted from its Lean
-    /// formalization (linked through FFI; see the [`certified_verifier`] module docs).
-    ///
-    /// Certified verification is scoped to the canonical standard pipeline, so this fails if
-    /// `verified_baseline` — the [`VerificationBaseline`] the proof is verified against by
-    /// [`verify_proof`](Self::verify_proof) — does not have the canonical [`VmBaseline`]
-    /// (`app_exe_commit` is ignored). The expected baseline and the aggregation vk are both
-    /// derived from the canonical standard [`CpuSdk`], making each call keygen-expensive. Use
-    /// alongside [`verify_proof`](Self::verify_proof), not instead of it.
-    #[cfg(feature = "certified-verifier")]
-    pub fn verify_proof_with_certified_verifier(
-        verified_baseline: &VerificationBaseline,
-        proof: &VmStarkProof,
-    ) -> Result<(), SdkError> {
-        let sdk = CpuSdk::standard(
-            config::default_system_params(),
-            AggregationSystemParams::default(),
-        );
-        if VmBaseline::from(verified_baseline) != sdk.vm_baseline() {
-            return Err(SdkError::Other(eyre::eyre!(
-                "the proof's baseline does not match the canonical standard pipeline: certified \
-                 verification only covers proofs generated with the standard app VM config and \
-                 default app and aggregation parameters"
-            )));
-        }
-        let vk = VmStarkVerifyingKey {
-            mvk: (*sdk.agg_vk()).clone(),
-            baseline: verified_baseline.clone(),
-        };
-        certified_verifier::verify_vm_stark_proof(&vk, proof)
-            .map_err(|e| SdkError::Other(eyre::eyre!(e)))
-    }
-
     #[cfg(feature = "evm-verify")]
     /// Generates Solidity verifier artifacts for the cached Halo2 proving key.
     pub fn generate_halo2_verifier_solidity(&self) -> Result<types::EvmHalo2Verifier, SdkError> {
         solidity::generate_halo2_verifier_solidity(&self.halo2_pk(), &self.halo2_params_reader)
-    }
-
-    #[cfg(feature = "evm-verify")]
-    /// Generates Solidity verifier artifacts under `src/{version_name}` in the solc source map.
-    ///
-    /// Solidity embeds source metadata in bytecode, so `version_name` should match the directory
-    /// where the generated verifier contracts will be written.
-    pub fn generate_halo2_verifier_solidity_with_version_name(
-        &self,
-        version_name: &str,
-    ) -> Result<types::EvmHalo2Verifier, SdkError> {
-        solidity::generate_halo2_verifier_solidity_with_version_name(
-            &self.halo2_pk(),
-            &self.halo2_params_reader,
-            version_name,
-        )
     }
 
     #[cfg(feature = "evm-verify")]

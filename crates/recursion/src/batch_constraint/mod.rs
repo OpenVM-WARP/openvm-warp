@@ -8,10 +8,7 @@ use openvm_stark_backend::{
     keygen::types::MultiStarkVerifyingKey,
     poly_common::{eval_eq_sharp_uni, eval_eq_uni, eval_eq_uni_at_one},
     proof::{column_openings_by_rot, BatchConstraintProof, Proof},
-    prover::{
-        AirProvingContext, ColMajorMatrix, CommittedTraceData, DeviceDataTransporter,
-        TraceCommitter,
-    },
+    prover::{AirProvingContext, CommittedTraceData, TraceCommitter},
     AirRef, FiatShamirTranscript, StarkEngine, StarkProtocolConfig, TranscriptHistory,
 };
 use openvm_stark_sdk::config::baby_bear_poseidon2::{BabyBearPoseidon2Config, EF, F};
@@ -19,12 +16,12 @@ use p3_baby_bear::BabyBear;
 use p3_field::{Field, PrimeCharacteristicRing, TwoAdicField};
 use p3_matrix::dense::RowMajorMatrix;
 use p3_maybe_rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
-use strum::{EnumCount, EnumDiscriminants};
 
 use crate::{
     batch_constraint::{
         bus::{
-            BatchConstraintConductorBus, ConstraintsFoldingBus, Eq3bBus, EqNOuterBus,
+            BatchConstraintConductorBus, BatchConstraintEndpointBus,
+            BatchConstraintEndpointClaimBus, ConstraintsFoldingBus, Eq3bBus, EqNOuterBus,
             EqNegInternalBus, EqSharpUniBus, EqZeroNBus, ExpressionClaimBus,
             InteractionsFoldingBus, SumcheckClaimBus, SymbolicExpressionBus,
             UnivariateSumcheckInputBus,
@@ -38,10 +35,13 @@ use crate::{
             InteractionsFoldingAir, InteractionsFoldingBlob, SymbolicExpressionAir,
         },
         expression_claim::{
-            generate_expression_claim_blob, ExpressionClaimAir, ExpressionClaimBlob,
+            generate_expression_claim_blob_for_mode, ExpressionClaimAir, ExpressionClaimBlob,
             ExpressionClaimTraceGenerator,
         },
         fractions_folder::{FractionsFolderAir, FractionsFolderTraceGenerator},
+        partial::{
+            PartialBatchConstraintEndpointAir, PartialBatchConstraintEndpointTraceGenerator,
+        },
         sumcheck::{
             multilinear::MultilinearSumcheckTraceGenerator,
             univariate::UnivariateSumcheckTraceGenerator, MultilinearSumcheckAir,
@@ -54,15 +54,15 @@ use crate::{
         EqNegBaseRandBus, EqNegResultBus, EqNsNLogupMaxBus, ExpressionClaimNMaxBus,
         FractionFolderInputBus, HyperdimBus, InteractionsFoldingInputBus, NLiftBus,
         PublicValuesBus, SelHypercubeBus, SelUniBus, StackingModuleBus, TranscriptBus,
-        XiRandomnessBus,
+        TranscriptEndIndexBus, XiRandomnessBus,
     },
     primitives::{bus::PowerCheckerBus, pow::PowerCheckerCpuTraceGenerator},
     system::{
         AirModule, BatchConstraintPreflight, BusIndexManager, BusInventory, GlobalCtxCpu,
-        Preflight, TraceGenModule, POW_CHECKER_HEIGHT,
+        Preflight, TraceGenModule, VerifierEquationMode, POW_CHECKER_HEIGHT,
     },
     tracegen::{ModuleChip, RowMajorChip, StandardTracegenCtx},
-    utils::MultiVecWithBounds,
+    utils::{MultiProofVecVec, MultiVecWithBounds},
 };
 
 pub mod bus;
@@ -70,6 +70,7 @@ pub mod eq_airs;
 pub mod expr_eval;
 pub mod expression_claim;
 pub mod fractions_folder;
+pub mod partial;
 pub mod sumcheck;
 
 #[cfg(feature = "cuda")]
@@ -78,31 +79,22 @@ mod cuda_abi;
 mod cuda_utils;
 
 /// AIR index within the BatchConstraintModule
-pub(crate) const LOCAL_SYMBOLIC_EXPRESSION_AIR_IDX: usize = 0;
+pub const LOCAL_SYMBOLIC_EXPRESSION_AIR_IDX: usize = 0;
+/// Stable local AIR index of [`ExpressionClaimAir`]. Partial recursion
+/// assemblies use this to replace only the terminal claim-fold trace while
+/// retaining the standard GKR, sumcheck, and expression-evaluation AIRs.
+pub const LOCAL_EXPRESSION_CLAIM_AIR_IDX: usize = 9;
 
-pub fn commit_child_vk<E>(
-    engine: &E,
-    child_vk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
-    has_cached: bool,
-) -> CommittedTraceData<E::PB>
-where
-    E: StarkEngine,
-    E::SC: StarkProtocolConfig<F = F>,
-{
-    let cached_trace_record = expr_eval::build_cached_trace_record(child_vk, has_cached);
-    let cached_trace = expr_eval::generate_symbolic_expr_cached_trace(&cached_trace_record);
-    let cached_trace = ColMajorMatrix::from_row_major(&cached_trace);
-    let cached_trace = engine.device().transport_matrix_to_device(&cached_trace);
-    let (commitment, data) = engine.device().commit(&[&cached_trace]).unwrap();
-    CommittedTraceData {
-        commitment,
-        data: Arc::new(data),
-        trace: cached_trace,
-    }
+#[derive(Clone, Copy, Debug)]
+pub struct PartialBatchConstraintExports {
+    pub endpoint_bus: BatchConstraintEndpointBus,
+    pub column_claims_bus: ColumnClaimsBus,
+    pub opening_point_bus: crate::batch_constraint::bus::LogUpOnlyOpeningPointBus,
 }
 
 pub struct BatchConstraintModule {
     transcript_bus: TranscriptBus,
+    transcript_end_index_bus: TranscriptEndIndexBus,
     constraint_sumcheck_randomness_bus: ConstraintSumcheckRandomnessBus,
     xi_randomness_bus: XiRandomnessBus,
     gkr_claim_bus: BatchConstraintModuleBus,
@@ -145,6 +137,14 @@ pub struct BatchConstraintModule {
 
     max_num_proofs: usize,
     pub(crate) has_cached: bool,
+    /// In no-cached mode, optionally bind the reconstructed symbolic DAG to
+    /// this verifier-key-owned digest instead of exposing the digest as PIs.
+    fixed_dag_commit: Option<[F; openvm_stark_sdk::config::baby_bear_poseidon2::DIGEST_SIZE]>,
+    equation_mode: VerifierEquationMode,
+    endpoint_claim_bus: Option<BatchConstraintEndpointClaimBus>,
+    endpoint_bus: Option<BatchConstraintEndpointBus>,
+    opening_point_export_bus: Option<crate::batch_constraint::bus::LogUpOnlyOpeningPointBus>,
+    deferred_stacking: bool,
 }
 
 impl BatchConstraintModule {
@@ -155,10 +155,49 @@ impl BatchConstraintModule {
         max_num_proofs: usize,
         has_cached: bool,
     ) -> Self {
+        Self::new_with_equation_mode(
+            child_vk,
+            b,
+            bus_inventory,
+            max_num_proofs,
+            has_cached,
+            VerifierEquationMode::AirAndLogUp,
+        )
+    }
+
+    /// Standard AIR-plus-LogUp reduction that internalizes the opening-point
+    /// fanout because stacking is deferred to a transcript-linked terminal proof.
+    pub fn new_deferred_stacking(
+        child_vk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
+        b: &mut BusIndexManager,
+        bus_inventory: BusInventory,
+        max_num_proofs: usize,
+        has_cached: bool,
+    ) -> Self {
+        let mut module = Self::new(child_vk, b, bus_inventory, max_num_proofs, has_cached);
+        module.deferred_stacking = true;
+        module
+    }
+
+    pub fn new_with_equation_mode(
+        child_vk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
+        b: &mut BusIndexManager,
+        bus_inventory: BusInventory,
+        max_num_proofs: usize,
+        has_cached: bool,
+        equation_mode: VerifierEquationMode,
+    ) -> Self {
         let l_skip = child_vk.inner.params.l_skip;
         let max_constraint_degree = child_vk.max_constraint_degree();
+        let endpoint_claim_bus = (!equation_mode.includes_air())
+            .then(|| BatchConstraintEndpointClaimBus::new(b.new_bus_idx()));
+        let endpoint_bus = (!equation_mode.includes_air())
+            .then(|| BatchConstraintEndpointBus::new(b.new_bus_idx()));
+        let opening_point_export_bus = (!equation_mode.includes_air())
+            .then(|| crate::batch_constraint::bus::LogUpOnlyOpeningPointBus::new(b.new_bus_idx()));
         BatchConstraintModule {
             transcript_bus: bus_inventory.transcript_bus,
+            transcript_end_index_bus: bus_inventory.transcript_end_index_bus,
             constraint_sumcheck_randomness_bus: bus_inventory.constraint_randomness_bus,
             xi_randomness_bus: bus_inventory.xi_randomness_bus,
             gkr_claim_bus: bus_inventory.bc_module_bus,
@@ -198,7 +237,62 @@ impl BatchConstraintModule {
             max_constraint_degree,
             max_num_proofs,
             has_cached,
+            fixed_dag_commit: None,
+            equation_mode,
+            endpoint_claim_bus,
+            endpoint_bus,
+            opening_point_export_bus,
+            deferred_stacking: false,
         }
+    }
+
+    /// Internalize the no-cached symbolic-DAG commitment as a fixed relation
+    /// constant. Cached mode cannot use this because its trace commitment
+    /// requires a different authority mechanism.
+    pub fn bind_fixed_dag_commit(
+        &mut self,
+        expected: [F; openvm_stark_sdk::config::baby_bear_poseidon2::DIGEST_SIZE],
+    ) -> Result<(), &'static str> {
+        if self.has_cached || self.fixed_dag_commit.replace(expected).is_some() {
+            return Err("symbolic DAG commitment authority is incompatible or duplicated");
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub(crate) const fn fixed_dag_commit(
+        &self,
+    ) -> Option<[F; openvm_stark_sdk::config::baby_bear_poseidon2::DIGEST_SIZE]> {
+        self.fixed_dag_commit
+    }
+
+    #[must_use]
+    pub const fn equation_mode(&self) -> VerifierEquationMode {
+        self.equation_mode
+    }
+
+    /// Buses a caller must consume/provide when stacking and WHIR are omitted.
+    #[must_use]
+    pub fn partial_exports(&self) -> Option<PartialBatchConstraintExports> {
+        Some(PartialBatchConstraintExports {
+            endpoint_bus: self.endpoint_bus?,
+            column_claims_bus: self.column_opening_bus,
+            opening_point_bus: self.opening_point_export_bus?,
+        })
+    }
+
+    /// Internal expression-claim permutation bus, exposed for sound partial
+    /// assemblies such as protocol-v19's interaction-only LogUp verifier.
+    #[must_use]
+    pub const fn expression_claim_bus(&self) -> ExpressionClaimBus {
+        self.expression_claim_bus
+    }
+
+    /// Internal final-sumcheck-claim bus, exposed so a partial assembly can
+    /// relay the verifier-derived endpoint without trusting a host sidecar.
+    #[must_use]
+    pub const fn sumcheck_claim_bus(&self) -> SumcheckClaimBus {
+        self.sumcheck_bus
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -219,6 +313,11 @@ impl BatchConstraintModule {
             column_openings,
         } = &proof.batch_constraint_proof;
 
+        assert_eq!(
+            preflight.rebased_transcript.is_some(),
+            self.equation_mode == VerifierEquationMode::LogUpOnly,
+            "equation mode and transcript framing disagree"
+        );
         let mut sumcheck_rnd = vec![];
 
         let mut xi = preflight.gkr.xi.iter().map(|(_, x)| *x).collect_vec();
@@ -259,25 +358,39 @@ impl BatchConstraintModule {
 
         let tidx_before_column_openings = ts.len();
 
-        // Common main
-        for (sort_idx, (air_id, _)) in preflight.proof_shape.sorted_trace_vdata.iter().enumerate() {
-            let need_rot = child_vk.inner.per_air[*air_id].params.need_rot;
-            for (col_opening, rot_opening) in
-                column_openings_by_rot(&column_openings[sort_idx][0], need_rot)
+        if self.equation_mode.includes_air() {
+            // Common main
+            for (sort_idx, (air_id, _)) in
+                preflight.proof_shape.sorted_trace_vdata.iter().enumerate()
             {
-                ts.observe_ext(col_opening);
-                ts.observe_ext(rot_opening);
-            }
-        }
-
-        for (sort_idx, (air_id, _)) in preflight.proof_shape.sorted_trace_vdata.iter().enumerate() {
-            let need_rot = child_vk.inner.per_air[*air_id].params.need_rot;
-            for part in column_openings[sort_idx].iter().skip(1) {
-                for (col_opening, rot_opening) in column_openings_by_rot(part, need_rot) {
+                let need_rot = child_vk.inner.per_air[*air_id].params.need_rot;
+                for (col_opening, rot_opening) in
+                    column_openings_by_rot(&column_openings[sort_idx][0], need_rot)
+                {
                     ts.observe_ext(col_opening);
                     ts.observe_ext(rot_opening);
                 }
             }
+
+            for (sort_idx, (air_id, _)) in
+                preflight.proof_shape.sorted_trace_vdata.iter().enumerate()
+            {
+                let need_rot = child_vk.inner.per_air[*air_id].params.need_rot;
+                for part in column_openings[sort_idx].iter().skip(1) {
+                    for (col_opening, rot_opening) in column_openings_by_rot(part, need_rot) {
+                        ts.observe_ext(col_opening);
+                        ts.observe_ext(rot_opening);
+                    }
+                }
+            }
+        }
+
+        let mut final_claim = univariate_round_coeffs
+            .iter()
+            .rev()
+            .fold(EF::ZERO, |acc, &coefficient| acc * r0 + coefficient);
+        for (round, &r) in sumcheck_round_polys.iter().zip(sumcheck_rnd.iter().skip(1)) {
+            final_claim = interpolate_batch_round(final_claim, round, r);
         }
 
         let omega_skip_pows = F::two_adic_generator(l_skip)
@@ -316,6 +429,7 @@ impl BatchConstraintModule {
         eq_sharp_ns_frontloaded.push(eq_sharp_ns[preflight.proof_shape.n_max]);
 
         preflight.batch_constraint = BatchConstraintPreflight {
+            equation_mode: self.equation_mode,
             lambda_tidx,
             tidx_before_univariate,
             tidx_before_multilinear,
@@ -327,13 +441,36 @@ impl BatchConstraintModule {
             eq_sharp_ns,
             eq_ns_frontloaded,
             eq_sharp_ns_frontloaded,
+            final_claim,
         }
     }
 }
 
+fn interpolate_batch_round(cur_sum: EF, evaluations_at_1: &[EF], point: EF) -> EF {
+    let degree = evaluations_at_1.len();
+    let evaluations = core::iter::once(cur_sum - evaluations_at_1[0])
+        .chain(evaluations_at_1.iter().copied())
+        .collect_vec();
+    (0..=degree)
+        .map(|i| {
+            let i_f = EF::from_usize(i);
+            let mut numerator = EF::ONE;
+            let mut denominator = EF::ONE;
+            for j in 0..=degree {
+                if i != j {
+                    let j_f = EF::from_usize(j);
+                    numerator *= point - j_f;
+                    denominator *= i_f - j_f;
+                }
+            }
+            evaluations[i] * numerator * denominator.inverse()
+        })
+        .sum()
+}
+
 impl AirModule for BatchConstraintModule {
     fn num_airs(&self) -> usize {
-        BatchConstraintModuleChipDiscriminants::COUNT
+        13
     }
 
     fn airs<SC: StarkProtocolConfig<F = BabyBear>>(&self) -> Vec<AirRef<SC>> {
@@ -351,7 +488,13 @@ impl AirModule for BatchConstraintModule {
             sel_hypercube_bus: self.sel_hypercube_bus,
             sel_uni_bus: self.sel_uni_bus,
             cnt_proofs: self.max_num_proofs,
-            dag_commit_subair: (!self.has_cached).then_some(Arc::new(DagCommitSubAir::new())),
+            dag_commit_subair: (!self.has_cached).then(|| {
+                Arc::new(self.fixed_dag_commit.map_or_else(
+                    DagCommitSubAir::new,
+                    DagCommitSubAir::new_with_expected_commit,
+                ))
+            }),
+            includes_air: self.equation_mode.includes_air(),
         };
         let fraction_folder_air = FractionsFolderAir {
             transcript_bus: self.transcript_bus,
@@ -370,6 +513,7 @@ impl AirModule for BatchConstraintModule {
             transcript_bus: self.transcript_bus,
             randomness_bus: self.constraint_sumcheck_randomness_bus,
             batch_constraint_conductor_bus: self.batch_constraint_conductor_bus,
+            opening_point_export_bus: self.opening_point_export_bus,
         };
         let sumcheck_lin_air = MultilinearSumcheckAir {
             max_constraint_degree: self.max_constraint_degree,
@@ -378,6 +522,7 @@ impl AirModule for BatchConstraintModule {
             randomness_bus: self.constraint_sumcheck_randomness_bus,
             batch_constraint_conductor_bus: self.batch_constraint_conductor_bus,
             stacking_module_bus: self.stacking_module_bus,
+            opening_point_export_bus: self.opening_point_export_bus,
         };
         let eq_ns_air = EqNsAir {
             zero_n_bus: self.zero_n_bus,
@@ -386,7 +531,11 @@ impl AirModule for BatchConstraintModule {
             sel_hypercube_bus: self.sel_hypercube_bus,
             eq_n_outer_bus: self.eq_n_outer_bus,
             eq_n_logup_n_max_bus: self.eq_n_logup_n_max_bus,
+            constraint_randomness_bus: self.constraint_sumcheck_randomness_bus,
             l_skip,
+            includes_air: self.equation_mode.includes_air(),
+            consume_constraint_randomness: !self.equation_mode.includes_air()
+                || self.deferred_stacking,
         };
         let eq_3b_air = Eq3bAir {
             eq_3b_bus: self.eq_3b_bus,
@@ -417,7 +566,9 @@ impl AirModule for BatchConstraintModule {
             base_rand_bus: self.eq_neg_base_rand_bus,
             internal_bus: self.eq_neg_internal_bus,
             sel_uni_bus: self.sel_uni_bus,
+            constraint_randomness_bus: self.constraint_sumcheck_randomness_bus,
             l_skip: self.l_skip,
+            emit_stacking_outputs: self.equation_mode.includes_air() && !self.deferred_stacking,
         };
         let expression_claim_air = ExpressionClaimAir {
             expression_claim_n_max_bus: self.expression_claim_n_max_bus,
@@ -427,6 +578,8 @@ impl AirModule for BatchConstraintModule {
             eq_n_outer_bus: self.eq_n_outer_bus,
             pow_checker_bus: self.power_checker_bus,
             hyperdim_bus: self.hyperdim_bus,
+            includes_air: self.equation_mode.includes_air(),
+            endpoint_claim_bus: self.endpoint_claim_bus,
         };
         let interactions_folding_air = InteractionsFoldingAir {
             transcript_bus: self.transcript_bus,
@@ -445,8 +598,7 @@ impl AirModule for BatchConstraintModule {
             air_shape_bus: self.air_shape_bus,
             constraints_folding_input_bus: self.constraints_folding_input_bus,
         };
-        // WARNING: SymbolicExpressionAir MUST be the first AIR in verifier circuit
-        vec![
+        let mut airs = vec![
             Arc::new(symbolic_expression_air) as AirRef<_>,
             Arc::new(fraction_folder_air) as AirRef<_>,
             Arc::new(sumcheck_uni_air) as AirRef<_>,
@@ -458,9 +610,23 @@ impl AirModule for BatchConstraintModule {
             Arc::new(eq_uni_air) as AirRef<_>,
             Arc::new(expression_claim_air) as AirRef<_>,
             Arc::new(interactions_folding_air) as AirRef<_>,
-            Arc::new(constraints_folding_air) as AirRef<_>,
-            Arc::new(eq_neg_air) as AirRef<_>,
-        ]
+        ];
+        if let Some(endpoint_bus) = self.endpoint_bus {
+            airs.push(Arc::new(PartialBatchConstraintEndpointAir {
+                transcript_bus: self.transcript_bus,
+                stacking_module_bus: self.stacking_module_bus,
+                transcript_end_index_bus: self.transcript_end_index_bus,
+                claim_bus: self
+                    .endpoint_claim_bus
+                    .expect("partial endpoint claim bus must exist"),
+                endpoint_bus,
+            }) as AirRef<_>);
+        } else {
+            airs.push(Arc::new(constraints_folding_air) as AirRef<_>);
+        }
+        airs.push(Arc::new(eq_neg_air) as AirRef<_>);
+        // WARNING: SymbolicExpressionAir MUST be the first AIR in verifier circuit.
+        airs
     }
 }
 
@@ -675,23 +841,31 @@ impl BatchConstraintBlobCpu {
         child_vk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
         proofs: &[Proof<BabyBearPoseidon2Config>],
         preflights: &[Preflight],
+        equation_mode: VerifierEquationMode,
     ) -> Self {
         let proofs = proofs.iter().collect_vec();
         let preflights = preflights.iter().collect_vec();
         let common_blob = BatchConstraintBlob::new(child_vk, &proofs, &preflights);
-        let cf_blob =
-            ConstraintsFoldingBlob::new(&child_vk.inner, &common_blob.expr_evals, &preflights);
+        let cf_blob = equation_mode.includes_air().then(|| {
+            ConstraintsFoldingBlob::new(&child_vk.inner, &common_blob.expr_evals, &preflights)
+        });
         let if_blob = InteractionsFoldingBlob::new(
             &child_vk.inner,
             &common_blob.expr_evals,
             &common_blob.eq_3b_blob,
             &preflights,
         );
-        let expr_claim_blob =
-            generate_expression_claim_blob(&cf_blob.folded_claims, &if_blob.folded_claims);
+        let empty_cf = MultiProofVecVec::new();
+        let expr_claim_blob = generate_expression_claim_blob_for_mode(
+            cf_blob
+                .as_ref()
+                .map_or(&empty_cf, |blob| &blob.folded_claims),
+            &if_blob.folded_claims,
+            equation_mode.includes_air(),
+        );
         Self {
             common_blob,
-            cf_blob: Some(cf_blob),
+            cf_blob,
             if_blob: Some(if_blob),
             expr_claim_blob,
         }
@@ -718,7 +892,13 @@ impl<SC: StarkProtocolConfig<F = F>> TraceGenModule<GlobalCtxCpu, CpuBackend<SC>
         ctx: &Self::ModuleSpecificCtx<'_>,
         required_heights: Option<&[usize]>,
     ) -> Option<Vec<AirProvingContext<CpuBackend<SC>>>> {
-        let blob = BatchConstraintBlobCpu::new(child_vk, proofs, preflights);
+        if preflights
+            .iter()
+            .any(|preflight| preflight.batch_constraint.equation_mode != self.equation_mode)
+        {
+            return None;
+        }
+        let blob = BatchConstraintBlobCpu::new(child_vk, proofs, preflights, self.equation_mode);
         let pow_checker = ctx.1.clone();
         let ctx = (
             StandardTracegenCtx {
@@ -730,24 +910,7 @@ impl<SC: StarkProtocolConfig<F = F>> TraceGenModule<GlobalCtxCpu, CpuBackend<SC>
             ctx.0,
         );
 
-        let chips = [
-            BatchConstraintModuleChip::SymbolicExpression {
-                max_num_proofs: self.max_num_proofs,
-                has_cached: self.has_cached,
-            },
-            BatchConstraintModuleChip::FractionsFolder,
-            BatchConstraintModuleChip::SumcheckUni,
-            BatchConstraintModuleChip::SumcheckLin,
-            BatchConstraintModuleChip::EqNs,
-            BatchConstraintModuleChip::Eq3b,
-            BatchConstraintModuleChip::EqSharpUni,
-            BatchConstraintModuleChip::EqSharpUniReceiver,
-            BatchConstraintModuleChip::EqUni,
-            BatchConstraintModuleChip::ExpressionClaim { pow_checker },
-            BatchConstraintModuleChip::InteractionsFolding,
-            BatchConstraintModuleChip::ConstraintsFolding,
-            BatchConstraintModuleChip::EqNeg,
-        ];
+        let chips = self.tracegen_chips(pow_checker);
 
         let span = tracing::Span::current();
         chips
@@ -765,10 +928,46 @@ impl<SC: StarkProtocolConfig<F = F>> TraceGenModule<GlobalCtxCpu, CpuBackend<SC>
     }
 }
 
+impl BatchConstraintModule {
+    pub fn cached_trace_record(
+        &self,
+        child_vk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
+    ) -> CachedTraceRecord {
+        expr_eval::build_cached_trace_record(child_vk, self.has_cached)
+    }
+
+    /// Generates and then commits to the cache trace for `SymbolicExpressionAir`. Returns the
+    /// committed PCS data.
+    /// The cached-main trace committing the child constraint DAG, for
+    /// callers that commit on their own device.
+    pub fn child_vk_cached_trace(
+        &self,
+        child_vk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
+    ) -> RowMajorMatrix<F> {
+        expr_eval::generate_symbolic_expr_cached_trace(&self.cached_trace_record(child_vk))
+    }
+
+    pub fn commit_child_vk<E, SC: StarkProtocolConfig<F = F>>(
+        &self,
+        engine: &E,
+        child_vk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
+    ) -> CommittedTraceData<CpuBackend<SC>>
+    where
+        E: StarkEngine<SC = SC, PB = CpuBackend<SC>>,
+    {
+        let cached_trace =
+            expr_eval::generate_symbolic_expr_cached_trace(&self.cached_trace_record(child_vk));
+        let (commitment, data) = engine.device().commit(&[&cached_trace]).unwrap();
+        CommittedTraceData {
+            commitment,
+            data: Arc::new(data),
+            trace: cached_trace,
+        }
+    }
+}
+
 // NOTE: ordering of enum must match AIR ordering
-#[derive(strum_macros::Display, EnumDiscriminants)]
-#[strum_discriminants(derive(strum_macros::EnumCount))]
-#[strum_discriminants(repr(usize))]
+#[derive(strum_macros::Display)]
 enum BatchConstraintModuleChip {
     SymbolicExpression {
         max_num_proofs: usize,
@@ -784,15 +983,83 @@ enum BatchConstraintModuleChip {
     EqUni,
     ExpressionClaim {
         pow_checker: Arc<PowerCheckerCpuTraceGenerator<2, POW_CHECKER_HEIGHT>>,
+        includes_air: bool,
     },
     InteractionsFolding,
     ConstraintsFolding,
-    EqNeg,
+    PartialEndpoint,
+    EqNeg {
+        uses_stacking_point: bool,
+    },
+}
+
+impl BatchConstraintModule {
+    /// Canonical witness-generator order for both CPU and CUDA. Keeping the
+    /// mode split here prevents the CUDA path from silently reverting a
+    /// `LogUpOnly` verifier to the standard AIR-plus-LogUp equation.
+    fn tracegen_chips(
+        &self,
+        pow_checker: Arc<PowerCheckerCpuTraceGenerator<2, POW_CHECKER_HEIGHT>>,
+    ) -> Vec<BatchConstraintModuleChip> {
+        let mut chips = vec![
+            BatchConstraintModuleChip::SymbolicExpression {
+                max_num_proofs: self.max_num_proofs,
+                has_cached: self.has_cached,
+            },
+            BatchConstraintModuleChip::FractionsFolder,
+            BatchConstraintModuleChip::SumcheckUni,
+            BatchConstraintModuleChip::SumcheckLin,
+            BatchConstraintModuleChip::EqNs,
+            BatchConstraintModuleChip::Eq3b,
+            BatchConstraintModuleChip::EqSharpUni,
+            BatchConstraintModuleChip::EqSharpUniReceiver,
+            BatchConstraintModuleChip::EqUni,
+            BatchConstraintModuleChip::ExpressionClaim {
+                pow_checker,
+                includes_air: self.equation_mode.includes_air(),
+            },
+            BatchConstraintModuleChip::InteractionsFolding,
+        ];
+        chips.push(if self.equation_mode.includes_air() {
+            BatchConstraintModuleChip::ConstraintsFolding
+        } else {
+            BatchConstraintModuleChip::PartialEndpoint
+        });
+        chips.push(BatchConstraintModuleChip::EqNeg {
+            uses_stacking_point: self.equation_mode.includes_air() && !self.deferred_stacking,
+        });
+        chips
+    }
 }
 
 impl BatchConstraintModuleChip {
     fn index(&self) -> usize {
-        BatchConstraintModuleChipDiscriminants::from(self) as usize
+        match self {
+            Self::SymbolicExpression { .. } => 0,
+            Self::FractionsFolder => 1,
+            Self::SumcheckUni => 2,
+            Self::SumcheckLin => 3,
+            Self::EqNs => 4,
+            Self::Eq3b => 5,
+            Self::EqSharpUni => 6,
+            Self::EqSharpUniReceiver => 7,
+            Self::EqUni => 8,
+            Self::ExpressionClaim { .. } => 9,
+            Self::InteractionsFolding => 10,
+            Self::ConstraintsFolding | Self::PartialEndpoint => 11,
+            Self::EqNeg { .. } => 12,
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn has_cuda_tracegen(&self) -> bool {
+        matches!(
+            self,
+            Self::SymbolicExpression { .. }
+                | Self::Eq3b
+                | Self::InteractionsFolding
+                | Self::ConstraintsFolding
+        )
     }
 }
 
@@ -861,22 +1128,38 @@ impl RowMajorChip<F> for BatchConstraintModuleChip {
                 },
                 required_height,
             ),
-            ExpressionClaim { pow_checker } => ExpressionClaimTraceGenerator.generate_trace(
+            ExpressionClaim {
+                pow_checker,
+                includes_air,
+            } => ExpressionClaimTraceGenerator.generate_trace(
                 &expression_claim::ExpressionClaimCtx {
                     blob: &blob.expr_claim_blob,
                     proofs,
                     preflights,
                     pow_checker: pow_checker.as_ref(),
+                    includes_air: *includes_air,
                 },
                 required_height,
             ),
             InteractionsFolding => expr_eval::InteractionsFoldingTraceGenerator
                 .generate_trace(&(child_vk, blob, preflights), required_height),
             ConstraintsFolding => expr_eval::ConstraintsFoldingTraceGenerator.generate_trace(
-                &(blob.cf_blob.as_ref().unwrap(), preflights),
+                &(
+                    blob.cf_blob
+                        .as_ref()
+                        .expect("constraint folding is absent in LogUpOnly mode"),
+                    preflights,
+                ),
                 required_height,
             ),
-            EqNeg => EqNegTraceGenerator.generate_trace(
+            PartialEndpoint => PartialBatchConstraintEndpointTraceGenerator
+                .generate_trace(&preflights, required_height),
+            EqNeg {
+                uses_stacking_point,
+            } => EqNegTraceGenerator {
+                uses_stacking_point: *uses_stacking_point,
+            }
+            .generate_trace(
                 &(child_vk, preflights, &blob.common_blob.selector_counts),
                 required_height,
             ),
@@ -888,16 +1171,49 @@ impl RowMajorChip<F> for BatchConstraintModuleChip {
 pub mod cuda_tracegen {
     use openvm_cuda_backend::{data_transporter::transport_matrix_h2d_row, GpuBackend};
     use openvm_cuda_common::stream::GpuDeviceCtx;
+    use openvm_poseidon2_air::POSEIDON2_WIDTH;
 
     use super::*;
     use crate::{
         batch_constraint::expr_eval::{
-            constraints_folding::cuda::ConstraintsFoldingBlobGpu,
+            build_cached_trace_record, constraints_folding::cuda::ConstraintsFoldingBlobGpu,
             interactions_folding::cuda::InteractionsFoldingBlobGpu,
         },
         cuda::{preflight::PreflightGpu, proof::ProofGpu, vk::VerifyingKeyGpu, GlobalCtxGpu},
         tracegen::cuda::StandardTracegenGpuCtx,
     };
+
+    /// One context in the canonical `LogUpOnlyPartialVerifier` AIR order.
+    ///
+    /// The resumed/extended transcript and its rebased proof-shape adapter are
+    /// still generated by the CPU oracle; all other variants are generated
+    /// directly on the CUDA device. Keeping the origin explicit prevents
+    /// callers from accidentally treating a host matrix as a resident CUDA
+    /// trace.
+    pub enum LogUpOnlyCudaProvingContext {
+        Device(AirProvingContext<GpuBackend>),
+        CpuTranscript(AirProvingContext<CpuBackend<BabyBearPoseidon2Config>>),
+        CpuRebasedProofShape(AirProvingContext<CpuBackend<BabyBearPoseidon2Config>>),
+    }
+
+    /// CUDA partial-verifier packet with the physical Poseidon owner omitted.
+    /// `contexts` is in the exact order returned by
+    /// `LogUpOnlyPartialVerifier::airs_without_poseidon`.
+    pub struct LogUpOnlySharedPoseidonCudaContexts {
+        pub contexts: Vec<LogUpOnlyCudaProvingContext>,
+        pub poseidon2_permutation_inputs: Vec<[F; POSEIDON2_WIDTH]>,
+        pub poseidon2_compression_inputs: Vec<[F; POSEIDON2_WIDTH]>,
+    }
+
+    impl LogUpOnlySharedPoseidonCudaContexts {
+        #[must_use]
+        pub fn grouped_input(self) -> (Vec<[F; POSEIDON2_WIDTH]>, Vec<[F; POSEIDON2_WIDTH]>) {
+            (
+                self.poseidon2_permutation_inputs,
+                self.poseidon2_compression_inputs,
+            )
+        }
+    }
 
     impl ModuleChip<GpuBackend> for BatchConstraintModuleChip {
         type Ctx<'a> = (
@@ -952,7 +1268,14 @@ pub mod cuda_tracegen {
                     ),
                 ConstraintsFolding => expr_eval::ConstraintsFoldingTraceGenerator
                     .generate_proving_ctx(
-                        &(child_vk, preflights, &blob.cf_blob, ctx.0.device_ctx),
+                        &(
+                            child_vk,
+                            preflights,
+                            blob.cf_blob
+                                .as_ref()
+                                .expect("constraint folding is absent in LogUpOnly mode"),
+                            ctx.0.device_ctx,
+                        ),
                         required_height,
                     ),
                 _ => unreachable!(),
@@ -962,7 +1285,7 @@ pub mod cuda_tracegen {
 
     pub(in crate::batch_constraint) struct BatchConstraintBlobGpu {
         pub common_blob: BatchConstraintBlob,
-        pub cf_blob: ConstraintsFoldingBlobGpu,
+        pub cf_blob: Option<ConstraintsFoldingBlobGpu>,
         pub if_blob: InteractionsFoldingBlobGpu,
         pub expr_claim_blob: ExpressionClaimBlob,
     }
@@ -974,16 +1297,19 @@ pub mod cuda_tracegen {
             proofs: &[ProofGpu],
             preflights: &[PreflightGpu],
             device_ctx: &GpuDeviceCtx,
+            equation_mode: VerifierEquationMode,
         ) -> Self {
             let cpu_proofs = proofs.iter().map(|p| &p.cpu).collect_vec();
             let cpu_preflights = preflights.iter().map(|p| &p.cpu).collect_vec();
             let common_blob = BatchConstraintBlob::new(&child_vk.cpu, &cpu_proofs, &cpu_preflights);
-            let cf_blob = ConstraintsFoldingBlobGpu::new(
-                child_vk,
-                &common_blob.expr_evals,
-                preflights,
-                device_ctx,
-            );
+            let cf_blob = equation_mode.includes_air().then(|| {
+                ConstraintsFoldingBlobGpu::new(
+                    child_vk,
+                    &common_blob.expr_evals,
+                    preflights,
+                    device_ctx,
+                )
+            });
             let if_blob = InteractionsFoldingBlobGpu::new(
                 child_vk,
                 &common_blob.expr_evals,
@@ -991,8 +1317,14 @@ pub mod cuda_tracegen {
                 preflights,
                 device_ctx,
             );
-            let expr_claim_blob =
-                generate_expression_claim_blob(&cf_blob.folded_claims, &if_blob.folded_claims);
+            let empty_cf = MultiProofVecVec::new();
+            let expr_claim_blob = generate_expression_claim_blob_for_mode(
+                cf_blob
+                    .as_ref()
+                    .map_or(&empty_cf, |blob| &blob.folded_claims),
+                &if_blob.folded_claims,
+                equation_mode.includes_air(),
+            );
             Self {
                 common_blob,
                 cf_blob,
@@ -1021,7 +1353,19 @@ pub mod cuda_tracegen {
             let cached_trace_record = module_ctx.0;
             let pow_checker = module_ctx.1.clone();
             let device_ctx = module_ctx.2;
-            let blob = BatchConstraintBlobGpu::new(child_vk, proofs, preflights, device_ctx);
+            if preflights
+                .iter()
+                .any(|preflight| preflight.cpu.batch_constraint.equation_mode != self.equation_mode)
+            {
+                return None;
+            }
+            let blob = BatchConstraintBlobGpu::new(
+                child_vk,
+                proofs,
+                preflights,
+                device_ctx,
+                self.equation_mode,
+            );
             let ctx = (
                 StandardTracegenGpuCtx {
                     vk: child_vk,
@@ -1033,28 +1377,10 @@ pub mod cuda_tracegen {
                 cached_trace_record,
             );
 
-            // Chips with cuda kernels for tracegen
-            let gpu_chips = [
-                BatchConstraintModuleChip::SymbolicExpression {
-                    max_num_proofs: self.max_num_proofs,
-                    has_cached: self.has_cached,
-                },
-                BatchConstraintModuleChip::Eq3b,
-                BatchConstraintModuleChip::ConstraintsFolding,
-                BatchConstraintModuleChip::InteractionsFolding,
-            ];
-            // Chips that will use fallback cpu tracegen
-            let cpu_chips = [
-                BatchConstraintModuleChip::FractionsFolder,
-                BatchConstraintModuleChip::SumcheckUni,
-                BatchConstraintModuleChip::SumcheckLin,
-                BatchConstraintModuleChip::EqNs,
-                BatchConstraintModuleChip::EqSharpUni,
-                BatchConstraintModuleChip::EqSharpUniReceiver,
-                BatchConstraintModuleChip::EqUni,
-                BatchConstraintModuleChip::ExpressionClaim { pow_checker },
-                BatchConstraintModuleChip::EqNeg,
-            ];
+            let (gpu_chips, cpu_chips): (Vec<_>, Vec<_>) = self
+                .tracegen_chips(pow_checker)
+                .into_iter()
+                .partition(BatchConstraintModuleChip::has_cuda_tracegen);
             let span = tracing::Span::current();
             // NOTE: do NOT use par_iter since that will lead to kernels on cuda streams != default
             // stream, whereas previous H2D transfer was on default stream.
@@ -1127,6 +1453,36 @@ pub mod cuda_tracegen {
                 .sorted_by(|a, b| a.0.cmp(&b.0))
                 .map(|(_index, ctx)| ctx)
                 .collect()
+        }
+    }
+
+    impl BatchConstraintModule {
+        /// Generates and then commits to the cache trace for `SymbolicExpressionAir`. Returns the
+        /// committed PCS data. The engine may use any GPU backend (e.g. BabyBear Poseidon2 or
+        /// BabyBear Bn254 Poseidon2) — only its `device().commit()` method is called.
+        pub fn commit_child_vk_gpu<E>(
+            &self,
+            engine: &E,
+            child_vk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
+            device_ctx: &GpuDeviceCtx,
+        ) -> CommittedTraceData<E::PB>
+        where
+            E: StarkEngine,
+            E::PB: openvm_stark_backend::prover::ProverBackend<
+                Val = F,
+                Matrix = openvm_cuda_backend::base::DeviceMatrix<F>,
+            >,
+            E::PD: TraceCommitter<E::PB>,
+        {
+            let cached_trace_record = build_cached_trace_record(child_vk, self.has_cached);
+            let cached_trace = expr_eval::generate_symbolic_expr_cached_trace(&cached_trace_record);
+            let d_cached_trace = transport_matrix_h2d_row(&cached_trace, device_ctx).unwrap();
+            let (commitment, data) = engine.device().commit(&[&d_cached_trace]).unwrap();
+            CommittedTraceData {
+                commitment,
+                trace: d_cached_trace,
+                data: Arc::new(data),
+            }
         }
     }
 }

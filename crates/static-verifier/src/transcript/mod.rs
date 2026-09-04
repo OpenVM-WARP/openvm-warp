@@ -27,11 +27,11 @@ use crate::{
 
 /// Number of BabyBear values bit-packed into one BN254 word (base-2^31).
 /// = floor(254 / 31) = 8
-pub(crate) const NUM_OBS_PER_WORD: usize = 8;
+const NUM_OBS_PER_WORD: usize = 8;
 
 /// Number of BabyBear samples extracted from one BN254 word (base-BabyBear decomposition).
 /// Must match `compute_num_samples_per_elem` in `MultiFieldTranscript`.
-pub(crate) const NUM_SAMPLES_PER_WORD: usize = 5;
+const NUM_SAMPLES_PER_WORD: usize = 5;
 
 /// Precomputed bounds for the base-BabyBear hint decomposition.
 ///
@@ -162,7 +162,7 @@ fn constrain_base_baby_bear_decomposition(
     })
 }
 
-pub(crate) fn decompose_bn254_to_base_baby_bear_digits(
+fn decompose_bn254_to_base_baby_bear_digits(
     ctx: &mut Context<Fr>,
     baby_bear: &BabyBearChip,
     packed: AssignedValue<Fr>,
@@ -183,11 +183,11 @@ pub(crate) fn decompose_bn254_to_base_baby_bear_digits(
 }
 
 #[derive(Clone, Debug)]
-pub struct DigestWire<F = AssignedValue<Fr>> {
-    pub elems: [F; DIGEST_WIDTH],
+pub struct DigestWire {
+    pub elems: [AssignedValue<Fr>; DIGEST_WIDTH],
 }
 
-pub fn digest_wire_from_root<F: Copy>(root: F) -> DigestWire<F> {
+pub fn digest_wire_from_root(root: AssignedValue<Fr>) -> DigestWire {
     DigestWire {
         elems: array::from_fn(|_| root),
     }
@@ -237,7 +237,17 @@ impl TranscriptChip {
     // --- Low-level sponge (matches DuplexSponge::absorb/squeeze) ---
 
     fn sponge_absorb(&mut self, ctx: &mut Context<Fr>, value: AssignedValue<Fr>) {
+        let gate = self.baby_bear.range().gate();
         self.sponge_state[self.absorb_idx] = value;
+        // Protocol-v29 length binding: every absorbed BN254 word increments
+        // the first capacity lane before a possible permutation. This must
+        // exactly mirror `DuplexSponge::absorb`; otherwise the Halo2 static
+        // verifier derives a different Root transcript.
+        self.sponge_state[POSEIDON2_RATE] = gate.add(
+            ctx,
+            self.sponge_state[POSEIDON2_RATE],
+            QuantumCell::Constant(Fr::ONE),
+        );
         self.absorb_idx += 1;
         if self.absorb_idx == POSEIDON2_RATE {
             self.permute_state(ctx);

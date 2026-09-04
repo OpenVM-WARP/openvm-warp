@@ -28,7 +28,7 @@ use crate::{
         ChipInventory, ChipInventoryError, ExecutionBridge, ExecutionBus, ExecutionState,
         ExecutorInventory, ExecutorInventoryError, MatrixRecordArena, PhantomSubExecutor,
         RowMajorMatrixArena, SystemConfig, VmBuilder, VmChipComplex, VmCircuitConfig,
-        VmExecutionConfig, VmField, BOUNDARY_AIR_ID, CONNECTOR_AIR_ID, DEFAULT_BLOCK_SIZE,
+        VmExecutionConfig, VmField, BLOCK_FE_WIDTH, BOUNDARY_AIR_ID, CONNECTOR_AIR_ID,
         PROGRAM_AIR_ID,
     },
     system::{
@@ -36,7 +36,7 @@ use crate::{
         memory::{
             offline_checker::{MemoryBridge, MemoryBus},
             online::GuestMemory,
-            MemoryAirInventory, MemoryController, TimestampedEquipartition, CHUNK,
+            MemoryAirInventory, MemoryController, TimestampedEquipartition, DIGEST_WIDTH,
         },
         phantom::{
             CycleEndPhantomExecutor, CycleStartPhantomExecutor, NopPhantomExecutor, PhantomAir,
@@ -73,6 +73,11 @@ pub trait SystemChipComplex<RA, PB: ProverBackend> {
     /// Loads the program in the form of a cached trace with prover data.
     fn load_program(&mut self, cached_program_trace: CommittedTraceData<PB>);
 
+    /// Borrow the exact cached program commitment already used by segment
+    /// proving. Aggregation layers may retain a shallow clone, but must not
+    /// re-encode or recommit the program merely to authenticate the same root.
+    fn cached_program_trace(&self) -> Option<&CommittedTraceData<PB>>;
+
     /// Transport the initial memory state to device. This may be called before preflight execution
     /// begins and start async device processes in parallel to execution.
     fn transport_init_memory_to_device(&mut self, memory: &GuestMemory);
@@ -92,13 +97,14 @@ pub trait SystemChipComplex<RA, PB: ProverBackend> {
     /// This function **must** return `Some` if called after
     /// [`generate_proving_ctx`](Self::generate_proving_ctx) and may return `None` if called before
     /// that.
-    fn memory_top_tree(&self) -> Option<&[[PB::Val; CHUNK]]>;
+    fn memory_top_tree(&self) -> Option<&[[PB::Val; DIGEST_WIDTH]]>;
 }
 
 /// Trait meant to be implemented on a SystemChipComplex.
 pub trait SystemWithFixedTraceHeights {
-    /// `heights` will have length equal to number of system AIRs, in AIR ID order. This function
-    /// must guarantee that the system trace matrices generated have the required heights.
+    /// `heights` is the whole AIR-ordered height vector, not just the leading system block: the
+    /// system owns AIRs at both ends of it. This function must guarantee that the system trace
+    /// matrices generated have the required heights.
     fn override_trace_heights(&mut self, heights: &[u32]);
 }
 
@@ -113,7 +119,7 @@ pub struct SystemRecords<F> {
     pub touched_memory: TouchedMemory<F>,
 }
 
-pub type TouchedMemory<F> = TimestampedEquipartition<F, DEFAULT_BLOCK_SIZE>;
+pub type TouchedMemory<F> = TimestampedEquipartition<F, BLOCK_FE_WIDTH>;
 
 #[derive(Clone, AnyEnum, Executor, MeteredExecutor, PreflightExecutor, From)]
 #[cfg_attr(feature = "aot", derive(AotExecutor, AotMeteredExecutor))]
@@ -220,6 +226,14 @@ impl<F: PrimeField32> VmExecutionConfig<F> for SystemConfig {
         inventory.add_executor(phantom, [phantom_opcode])?;
 
         Ok(inventory)
+    }
+
+    #[cfg(feature = "rvr")]
+    fn create_rvr_extensions(
+        &self,
+        _air_idx: Option<&[usize]>,
+    ) -> rvr_openvm_lift::ExtensionRegistry<F> {
+        rvr_openvm_lift::ExtensionRegistry::new()
     }
 }
 
@@ -338,6 +352,10 @@ where
         let _ = self.program_chip.cached.replace(cached_program_trace);
     }
 
+    fn cached_program_trace(&self) -> Option<&CommittedTraceData<CpuBackend<SC>>> {
+        self.program_chip.cached.as_ref()
+    }
+
     fn transport_init_memory_to_device(&mut self, memory: &GuestMemory) {
         self.memory_controller
             .set_initial_memory(memory.memory.clone());
@@ -370,7 +388,7 @@ where
             .collect()
     }
 
-    fn memory_top_tree(&self) -> Option<&[[Val<SC>; CHUNK]]> {
+    fn memory_top_tree(&self) -> Option<&[[Val<SC>; DIGEST_WIDTH]]> {
         let top_tree = &self.memory_controller.interface_chip.merkle_chip.top_tree;
         (!top_tree.is_empty()).then_some(top_tree.as_slice())
     }
@@ -450,5 +468,11 @@ where
         assert_eq!(heights[CONNECTOR_AIR_ID], 2);
         self.memory_controller
             .set_override_trace_heights(&heights[BOUNDARY_AIR_ID..]);
+        let poseidon2_height = heights[heights.len() - 2] as usize;
+        self.memory_controller
+            .hasher_chip
+            .as_ref()
+            .expect("persistent-memory Poseidon2 chip is installed")
+            .set_forced_height(poseidon2_height);
     }
 }

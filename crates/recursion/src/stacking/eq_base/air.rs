@@ -21,9 +21,14 @@ use crate::{
         EqNegBaseRandMessage, EqNegResultBus, EqNegResultMessage, WhirOpeningPointBus,
         WhirOpeningPointMessage,
     },
+    native_warp::{
+        NativeReductionEndpointInputBus, NativeReductionEndpointInputMessage,
+        NATIVE_REDUCTION_ENDPOINT_STACKING_POINT,
+    },
     stacking::bus::{
         EqBaseBus, EqBaseMessage, EqKernelLookupBus, EqKernelLookupMessage, EqRandValuesLookupBus,
-        EqRandValuesLookupMessage,
+        EqRandValuesLookupMessage, OrderedStackingSourcePointBus,
+        OrderedStackingSourcePointMessage,
     },
     subairs::nested_for_loop::{NestedForLoopIoCols, NestedForLoopSubAir},
     utils::{
@@ -78,6 +83,9 @@ pub struct EqBaseCols<F> {
 pub struct EqBaseAir {
     // External buses
     pub constraint_randomness_bus: ConstraintSumcheckRandomnessBus,
+    /// Setup-authority source point in ordered mode. Legacy mode continues to
+    /// consume coordinate zero from `constraint_randomness_bus`.
+    pub ordered_source_point_bus: Option<OrderedStackingSourcePointBus>,
     pub whir_opening_point_bus: WhirOpeningPointBus,
 
     // Internal buses
@@ -89,6 +97,13 @@ pub struct EqBaseAir {
 
     // Other fields
     pub l_skip: usize,
+    /// False in a partial assembly without the WHIR module: gates off the
+    /// opening-point sends.
+    pub emit_whir_point: bool,
+    /// Reduced-source counterpart of `whir_opening_point_bus`. These rows
+    /// expose the exact prism coordinates
+    /// `u_0, u_0^2, ..., u_0^(2^(l_skip-1))` already used by ordinary WHIR.
+    pub native_point_export: Option<(NativeReductionEndpointInputBus, usize)>,
 }
 
 impl BaseAirWithPublicValues<F> for EqBaseAir {}
@@ -161,29 +176,55 @@ where
             .when(and(local.is_valid, local.is_last))
             .assert_eq(local.row_idx, AB::F::from_usize(self.l_skip));
 
-        self.whir_opening_point_bus.send(
-            builder,
-            local.proof_idx,
-            WhirOpeningPointMessage {
-                idx: local.row_idx,
-                value: local.u_pow,
-            },
-            is_valid_transition,
-        );
+        if self.emit_whir_point {
+            self.whir_opening_point_bus.send(
+                builder,
+                local.proof_idx,
+                WhirOpeningPointMessage {
+                    idx: local.row_idx,
+                    value: local.u_pow,
+                },
+                is_valid_transition.clone(),
+            );
+        }
+        if let Some((endpoint_input_bus, point_lookups)) = self.native_point_export {
+            endpoint_input_bus.add_key_with_lookups(
+                builder,
+                NativeReductionEndpointInputMessage {
+                    reduction: local.proof_idx.into(),
+                    kind: AB::Expr::from_usize(NATIVE_REDUCTION_ENDPOINT_STACKING_POINT),
+                    index: local.row_idx.into(),
+                    value: local.u_pow.map(Into::into),
+                },
+                is_valid_transition.clone() * AB::Expr::from_usize(point_lookups),
+            );
+        }
 
         /*
          * Receive the values of u_0 and r_0 from the AIRs that sample them. Send u_0
          * and r_0 to EqNegAir.
          */
-        self.constraint_randomness_bus.receive(
-            builder,
-            local.proof_idx,
-            ConstraintSumcheckRandomness {
-                idx: AB::Expr::ZERO,
-                challenge: local.r_pow.map(Into::into),
-            },
-            local.is_first,
-        );
+        if let Some(source_point_bus) = self.ordered_source_point_bus {
+            source_point_bus.receive(
+                builder,
+                local.proof_idx,
+                OrderedStackingSourcePointMessage {
+                    coordinate_idx: AB::Expr::ZERO,
+                    value: local.r_pow.map(Into::into),
+                },
+                local.is_first,
+            );
+        } else {
+            self.constraint_randomness_bus.receive(
+                builder,
+                local.proof_idx,
+                ConstraintSumcheckRandomness {
+                    idx: AB::Expr::ZERO,
+                    challenge: local.r_pow.map(Into::into),
+                },
+                local.is_first,
+            );
+        }
 
         self.eq_rand_values_bus.lookup_key(
             builder,

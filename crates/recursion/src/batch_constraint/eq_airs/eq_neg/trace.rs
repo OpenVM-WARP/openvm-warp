@@ -3,7 +3,7 @@ use std::borrow::BorrowMut;
 use openvm_stark_backend::{
     keygen::types::MultiStarkVerifyingKey, poly_common::eval_eq_uni_at_one,
 };
-use openvm_stark_sdk::config::baby_bear_poseidon2::{BabyBearPoseidon2Config, F};
+use openvm_stark_sdk::config::baby_bear_poseidon2::{BabyBearPoseidon2Config, EF, F};
 use p3_field::{BasedVectorSpace, Field, PrimeCharacteristicRing, TwoAdicField};
 use p3_matrix::dense::RowMajorMatrix;
 
@@ -14,7 +14,9 @@ use crate::{
     utils::MultiVecWithBounds,
 };
 
-pub struct EqNegTraceGenerator;
+pub struct EqNegTraceGenerator {
+    pub uses_stacking_point: bool,
+}
 
 impl RowMajorChip<F> for EqNegTraceGenerator {
     type Ctx<'a> = (
@@ -59,7 +61,11 @@ impl RowMajorChip<F> for EqNegTraceGenerator {
 
         for (proof_idx, preflight) in preflights.iter().enumerate() {
             let initial_omega = F::two_adic_generator(vk.inner.params.l_skip);
-            let initial_u = preflight.stacking.sumcheck_rnd[0];
+            let initial_u = if self.uses_stacking_point {
+                preflight.stacking.sumcheck_rnd[0]
+            } else {
+                EF::ZERO
+            };
             let mut initial_r = preflight.batch_constraint.sumcheck_rnd[0];
             let mut initial_r_omega = initial_r * initial_omega;
 

@@ -79,6 +79,37 @@ __global__ void reverse_affines_setup(
     affines[rev_idx] = {a, b_values[global_idx]};
 }
 
+/// Runtime-sized counterpart for large verifier batches.  All metadata
+/// arrays live on device, avoiding both template explosion and CUDA's kernel
+/// parameter-size limit.
+static __global__ void reverse_affines_setup_dynamic(
+    const uint2 *__restrict__ keys,
+    AffineFpExt *__restrict__ affines,
+    const FpExtWithTidx *__restrict__ a_constants,
+    const FpExt *__restrict__ b_values,
+    const uint32_t *__restrict__ x_bounds,
+    uint32_t *const *__restrict__ y_bounds,
+    uint32_t n
+) {
+    uint32_t global_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (global_idx >= n) {
+        return;
+    }
+
+    auto [x, y] = keys[global_idx];
+    uint32_t start_idx_for_x = (x == 0) ? 0 : x_bounds[x - 1];
+    uint32_t x_segment_idx = global_idx - start_idx_for_x;
+
+    uint32_t start_idx_for_y = (y == 0) ? 0 : y_bounds[x][y - 1];
+    uint32_t y_segment_idx = x_segment_idx - start_idx_for_y;
+
+    uint32_t end_idx_for_y = y_bounds[x][y];
+    uint32_t rev_idx = start_idx_for_x + end_idx_for_y - 1 - y_segment_idx;
+
+    auto [a, _] = a_constants[x];
+    affines[rev_idx] = {a, b_values[global_idx]};
+}
+
 /*
  * Takes size-n AffineFpExt values and performs an in-place inclusive segmented scan,
  * where segments are defined by equality of adjacent keys in `d_keys`.

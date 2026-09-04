@@ -18,7 +18,7 @@ import { HomePage } from "vocs/components";
 
     ```bash [Build with OpenVM]
     # install `cargo openvm`
-    cargo +1.91 install --locked --git https://github.com/openvm-org/openvm.git --tag v2.1.0 cargo-openvm
+    cargo +1.91 install --locked --git https://github.com/openvm-org/openvm.git --tag v2.0.0-beta.2 cargo-openvm
 
     # create a starter OpenVM project
     cargo openvm init fibonacci
@@ -27,8 +27,8 @@ import { HomePage } from "vocs/components";
     // .. snip ..
     let vm_config = SdkVmConfig::builder()
         .system(Default::default())
-        .rv32i(Default::default())
-        .rv32m(Default::default())
+        .rv64i(Default::default())
+        .rv64m(Default::default())
         .io(Default::default())
         .build();
     ```

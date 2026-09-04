@@ -3,6 +3,7 @@ pub mod bus;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod gkr;
+pub mod native_warp;
 pub mod primitives;
 pub mod proof_shape;
 pub mod stacking;

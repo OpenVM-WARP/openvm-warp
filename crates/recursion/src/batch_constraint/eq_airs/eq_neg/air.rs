@@ -18,8 +18,8 @@ use p3_matrix::Matrix;
 use crate::{
     batch_constraint::bus::{EqNegInternalBus, EqNegInternalMessage},
     bus::{
-        EqNegBaseRandBus, EqNegBaseRandMessage, EqNegResultBus, EqNegResultMessage, SelUniBus,
-        SelUniBusMessage,
+        ConstraintSumcheckRandomness, ConstraintSumcheckRandomnessBus, EqNegBaseRandBus,
+        EqNegBaseRandMessage, EqNegResultBus, EqNegResultMessage, SelUniBus, SelUniBusMessage,
     },
     subairs::nested_for_loop::{NestedForLoopIoCols, NestedForLoopSubAir},
     utils::{
@@ -67,7 +67,9 @@ pub struct EqNegAir {
     pub base_rand_bus: EqNegBaseRandBus,
     pub internal_bus: EqNegInternalBus,
     pub sel_uni_bus: SelUniBus,
+    pub constraint_randomness_bus: ConstraintSumcheckRandomnessBus,
     pub l_skip: usize,
+    pub emit_stacking_outputs: bool,
 }
 
 impl<F> BaseAirWithPublicValues<F> for EqNegAir {}
@@ -181,15 +183,27 @@ where
             ext_field_multiply_scalar(local.r_pow, initial_omega),
         );
 
-        self.base_rand_bus.receive(
-            builder,
-            local.proof_idx,
-            EqNegBaseRandMessage {
-                u: local.u_pow,
-                r: local.r_pow,
-            },
-            local.is_first,
-        );
+        if self.emit_stacking_outputs {
+            self.base_rand_bus.receive(
+                builder,
+                local.proof_idx,
+                EqNegBaseRandMessage {
+                    u: local.u_pow,
+                    r: local.r_pow,
+                },
+                local.is_first,
+            );
+        } else {
+            self.constraint_randomness_bus.receive(
+                builder,
+                local.proof_idx,
+                ConstraintSumcheckRandomness {
+                    idx: AB::Expr::ZERO,
+                    challenge: local.r_pow.map(Into::into),
+                },
+                local.is_first,
+            );
+        }
 
         self.internal_bus.send(
             builder,
@@ -371,15 +385,17 @@ where
 
         let is_neg = local.neg_hypercube * local.neg_hypercube_nz_inv;
         builder.when(local.neg_hypercube).assert_one(is_neg.clone());
-        self.result_bus.send(
-            builder,
-            local.proof_idx,
-            EqNegResultMessage {
-                n: AB::Expr::ZERO - local.neg_hypercube,
-                eq,
-                k_rot,
-            },
-            is_neg * next.is_last_hypercube,
-        );
+        if self.emit_stacking_outputs {
+            self.result_bus.send(
+                builder,
+                local.proof_idx,
+                EqNegResultMessage {
+                    n: AB::Expr::ZERO - local.neg_hypercube,
+                    eq,
+                    k_rot,
+                },
+                is_neg * next.is_last_hypercube,
+            );
+        }
     }
 }

@@ -16,6 +16,7 @@ use p3_matrix::Matrix;
 use crate::{
     batch_constraint::bus::{
         BatchConstraintConductorBus, BatchConstraintConductorMessage,
+        BatchConstraintEndpointClaimBus, BatchConstraintEndpointClaimMessage,
         BatchConstraintInnerMessageType, EqNOuterBus, EqNOuterMessage, ExpressionClaimBus,
         ExpressionClaimMessage, SumcheckClaimBus, SumcheckClaimMessage,
     },
@@ -102,6 +103,8 @@ pub struct ExpressionClaimAir {
     pub eq_n_outer_bus: EqNOuterBus,
     pub pow_checker_bus: PowerCheckerBus,
     pub hyperdim_bus: HyperdimBus,
+    pub includes_air: bool,
+    pub endpoint_claim_bus: Option<BatchConstraintEndpointClaimBus>,
 }
 
 impl<F> BaseAirWithPublicValues<F> for ExpressionClaimAir {}
@@ -180,11 +183,11 @@ where
         let is_last_in_proof: AB::Expr =
             LoopSubAir::local_is_last(local.is_valid, next.is_valid, next.is_first);
 
-        // Each proof starts with group 0 (interactions) and ends with 1 (constraints).
-        // Start with group 0 is guaranteed by NestedForLoop
+        // Each proof starts with group 0. Ordinary verification then includes
+        // group 1 (AIR constraints), while LogUpOnly must end in group 0.
         builder
             .when(is_last_in_proof.clone())
-            .assert_one(local.group_idx);
+            .assert_eq(local.group_idx, AB::Expr::from_bool(self.includes_air));
 
         // === Claim indexing constraints ===
         builder.assert_bool(local.n_sign);
@@ -314,6 +317,17 @@ where
             },
             local.is_first * local.is_valid,
         );
+
+        if let Some(endpoint_claim_bus) = self.endpoint_claim_bus {
+            endpoint_claim_bus.send(
+                builder,
+                local.proof_idx,
+                BatchConstraintEndpointClaimMessage {
+                    value: local.cur_sum.map(Into::into),
+                },
+                local.is_first * local.is_valid,
+            );
+        }
 
         self.hyperdim_bus.lookup_key(
             builder,

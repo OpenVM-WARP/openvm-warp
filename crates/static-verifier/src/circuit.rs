@@ -4,7 +4,7 @@ use core::cmp::Reverse;
 use std::{borrow::Borrow, fmt, sync::Arc};
 
 use halo2_base::{
-    gates::circuit::builder::BaseCircuitBuilder, halo2_proofs::halo2curves::bn256::Fr,
+    gates::circuit::builder::BaseCircuitBuilder, halo2_proofs::halo2curves::bn256::Fr, Context,
 };
 use itertools::Itertools;
 use openvm_cpu_backend::CpuBackend;
@@ -27,8 +27,7 @@ use openvm_verify_stark_host::pvs::CONSTRAINT_EVAL_AIR_ID;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    backend::Halo2Backend,
-    chip_traits::{PopulateInputs, Poseidon2Inst, TranscriptInst},
+    field::baby_bear::{BabyBearChip, BabyBearExtChip},
     stages::{
         full_pipeline::{
             constrained_verify, extract_public_values, load_proof_wire, ProofWire,
@@ -165,29 +164,31 @@ impl StaticVerifierCircuit {
     ///
     /// This function should be used internally or for testing only.
     /// Production uses with the continuations framework **must** use [`Self::populate`] instead.
-    pub fn populate_verify_stark_constraints<B: TranscriptInst + Poseidon2Inst + PopulateInputs>(
+    pub fn populate_verify_stark_constraints(
         &self,
-        b: &mut B,
+        ctx: &mut Context<Fr>,
+        ext_chip: &BabyBearExtChip,
         proof: &Proof<RootConfig>,
-    ) -> ProofWire<B::F> {
-        let mut profiler = crate::profiling::CellProfiler::new("static_verifier", b.cell_count());
+    ) -> ProofWire {
+        let mut profiler = crate::profiling::CellProfiler::new("static_verifier", ctx.advice.len());
 
-        profiler.push("load_proof_wire", b.cell_count());
-        let proof_wire = load_proof_wire(b, proof, &self.log_heights_per_air);
-        profiler.pop(b.cell_count());
+        profiler.push("load_proof_wire", ctx.advice.len());
+        let proof_wire = load_proof_wire(ctx, ext_chip, proof, &self.log_heights_per_air);
+        profiler.pop(ctx.advice.len());
 
-        profiler.push("constrained_verify", b.cell_count());
+        profiler.push("constrained_verify", ctx.advice.len());
         constrained_verify(
-            b,
+            ctx,
+            ext_chip,
             &self.root_vk,
             &proof_wire,
             &self.trace_id_to_air_id,
             &self.log_heights_per_air,
             &self.stacked_layouts,
         );
-        profiler.pop(b.cell_count());
+        profiler.pop(ctx.advice.len());
 
-        profiler.print(b.cell_count());
+        profiler.print(ctx.advice.len());
 
         #[cfg(feature = "cell-profiling")]
         if let Ok(dir) = std::env::var("OPENVM_PROFILE_DIR") {
@@ -195,74 +196,16 @@ impl StaticVerifierCircuit {
             profiler.write_flamegraph(
                 &format!("{dir}/static_verifier_constraints.svg"),
                 "Static Verifier Constraints",
-                b.cell_count(),
+                ctx.advice.len(),
             );
             profiler.write_flamegraph_reversed(
                 &format!("{dir}/static_verifier_constraints_rev.svg"),
                 "Static Verifier Constraints (reversed)",
-                b.cell_count(),
+                ctx.advice.len(),
             );
         }
 
         proof_wire
-    }
-
-    /// Backend-generic full populate: STARK verification constraints, the
-    /// symbolic-DAG onion-commit pin, and public-value extraction. Returns
-    /// the public value wires.
-    pub fn populate_pvs<B: TranscriptInst + Poseidon2Inst + PopulateInputs>(
-        &self,
-        b: &mut B,
-        proof: &Proof<RootConfig>,
-    ) -> StaticVerifierPvs<B::F> {
-        let mut profiler = crate::profiling::CellProfiler::new("populate", b.cell_count());
-
-        profiler.push("verify_stark_constraints", b.cell_count());
-        let proof_wire = &self.populate_verify_stark_constraints(b, proof);
-        profiler.pop(b.cell_count());
-
-        debug_assert!(
-            proof_wire
-                .cached_commitment_roots
-                .iter()
-                .all(|commits| commits.is_empty()),
-            "RootVerifierCircuit has no cached trace"
-        );
-        profiler.push("pin_dag_onion_commit", b.cell_count());
-        let &DagCommitPvs::<_> {
-            commit: onion_commit,
-        } = proof_wire.public_values[CONSTRAINT_EVAL_AIR_ID]
-            .as_slice()
-            .borrow();
-        for (bb_wire, bb_const) in onion_commit
-            .into_iter()
-            .zip_eq(self.internal_recursive_dag_onion_commit)
-        {
-            let loaded_const = b.bb_load_constant(bb_const);
-            b.bb_assert_equal(bb_wire.into(), loaded_const);
-        }
-        profiler.pop(b.cell_count());
-
-        profiler.push("extract_public_values", b.cell_count());
-        let pvs_wire = extract_public_values(b, proof_wire);
-        profiler.pop(b.cell_count());
-
-        #[cfg(feature = "cell-profiling")]
-        if let Ok(dir) = std::env::var("OPENVM_PROFILE_DIR") {
-            let _ = std::fs::create_dir_all(&dir);
-            profiler.write_flamegraph(
-                &format!("{dir}/populate.svg"),
-                "Static Verifier Populate",
-                b.cell_count(),
-            );
-            profiler.write_flamegraph_reversed(
-                &format!("{dir}/populate_rev.svg"),
-                "Static Verifier Populate (reversed)",
-                b.cell_count(),
-            );
-        }
-
-        pvs_wire
     }
 
     /// Populate a builder with the static verifier constraints and return the public values.
@@ -272,10 +215,57 @@ impl StaticVerifierCircuit {
         proof: &Proof<RootConfig>,
     ) -> StaticVerifierPvs<Fr> {
         let range = builder.range_chip();
+        let ext_chip = BabyBearExtChip::new(BabyBearChip::new(Arc::new(range)));
         let ctx = builder.main(0);
-        let mut backend = Halo2Backend::new(Arc::new(range), ctx);
 
-        let pvs_wire = self.populate_pvs(&mut backend, proof);
+        let mut profiler = crate::profiling::CellProfiler::new("populate", ctx.advice.len());
+
+        profiler.push("verify_stark_constraints", ctx.advice.len());
+        let proof_wire = &self.populate_verify_stark_constraints(ctx, &ext_chip, proof);
+        profiler.pop(ctx.advice.len());
+
+        debug_assert!(
+            proof_wire
+                .cached_commitment_roots
+                .iter()
+                .all(|commits| commits.is_empty()),
+            "RootVerifierCircuit has no cached trace"
+        );
+        profiler.push("pin_dag_onion_commit", ctx.advice.len());
+        let &DagCommitPvs::<_> {
+            commit: onion_commit,
+        } = proof_wire.public_values[CONSTRAINT_EVAL_AIR_ID]
+            .as_slice()
+            .borrow();
+        for (bb_wire, bb_const) in onion_commit
+            .into_iter()
+            .zip_eq(self.internal_recursive_dag_onion_commit)
+        {
+            let loaded_const = ext_chip.base().load_constant(ctx, bb_const);
+            ext_chip
+                .base()
+                .assert_equal(ctx, bb_wire.into(), loaded_const);
+        }
+        profiler.pop(ctx.advice.len());
+
+        profiler.push("extract_public_values", ctx.advice.len());
+        let pvs_wire = extract_public_values(ctx, ext_chip.base(), proof_wire);
+        profiler.pop(ctx.advice.len());
+
+        #[cfg(feature = "cell-profiling")]
+        if let Ok(dir) = std::env::var("OPENVM_PROFILE_DIR") {
+            let _ = std::fs::create_dir_all(&dir);
+            profiler.write_flamegraph(
+                &format!("{dir}/populate.svg"),
+                "Static Verifier Populate",
+                ctx.advice.len(),
+            );
+            profiler.write_flamegraph_reversed(
+                &format!("{dir}/populate_rev.svg"),
+                "Static Verifier Populate (reversed)",
+                ctx.advice.len(),
+            );
+        }
 
         let pvs_vec = pvs_wire.to_vec();
         let pvs_fr = pvs_vec.iter().map(|v| *v.value()).collect_vec();

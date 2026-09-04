@@ -8,10 +8,7 @@ use openvm_circuit::system::memory::{
 use openvm_continuations::prover::debug_constraints;
 use openvm_continuations::{
     circuit::{deferral::DeferralMerkleProofs, Circuit},
-    prover::{
-        assert_all_airs_required, keygen_all_required, DeferralCircuitProver,
-        DeferralCircuitProverKey,
-    },
+    prover::DeferralCircuitProver,
     CommitBytes, VkCommitBytes, SC,
 };
 use openvm_cpu_backend::CpuBackend;
@@ -21,7 +18,7 @@ use openvm_recursion_circuit::system::{
     AggregationSubCircuit, VerifierConfig, VerifierSubCircuit, VerifierTraceGen,
 };
 use openvm_stark_backend::{
-    codec::{Decode, Encode},
+    codec::Decode,
     keygen::types::{MultiStarkProvingKey, MultiStarkVerifyingKey},
     proof::Proof,
     prover::{CommittedTraceData, DeviceDataTransporter, ProverBackend, ProverDevice},
@@ -32,7 +29,6 @@ use openvm_stark_sdk::config::baby_bear_poseidon2::{
 };
 use openvm_verify_stark_host::VmStarkProof;
 use p3_field::{Field, PrimeField32};
-use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
 use crate::{DeferredVerifyCircuit, DeferredVerifyTraceGen, DeferredVerifyTraceGenImpl};
@@ -128,7 +124,7 @@ where
         system_params: SystemParams,
         memory_dimensions: MemoryDimensions,
         num_user_pvs: usize,
-        def_hook_commit: Option<CommitBytes>,
+        def_hook_commit: Option<PB::Commitment>,
         def_idx: usize,
     ) -> Self
     where
@@ -137,6 +133,7 @@ where
         E::PD: DeviceDataTransporter<SC, PB> + Clone,
         PB::Val: Field + PrimeField32,
         PB::Matrix: Clone,
+        PB::Commitment: Into<CommitBytes>,
     {
         let verifier_circuit = S::new(
             child_vk.clone(),
@@ -144,6 +141,7 @@ where
                 continuations_enabled: true,
                 final_state_bus_enabled: true,
                 has_cached: true,
+                tail_mode: openvm_recursion_circuit::system::VerifierTailMode::Complete,
             },
         );
         let engine = E::new(system_params);
@@ -152,6 +150,7 @@ where
             vk_pre_hash: child_vk.pre_hash.into(),
         };
         let child_vk_pcs_data = verifier_circuit.commit_child_vk(&engine, &child_vk);
+        let def_hook_commit = def_hook_commit.map(Into::into);
         let circuit = Arc::new(DeferredVerifyCircuit::new(
             Arc::new(verifier_circuit),
             internal_recursive_vk_commit,
@@ -160,7 +159,7 @@ where
             num_user_pvs,
             def_idx,
         ));
-        let (pk, vk) = keygen_all_required(&engine, &circuit.airs());
+        let (pk, vk) = engine.keygen(&circuit.airs());
         Self {
             pk: Arc::new(pk),
             vk: Arc::new(vk),
@@ -178,23 +177,27 @@ where
         pk: Arc<MultiStarkProvingKey<SC>>,
         memory_dimensions: MemoryDimensions,
         num_user_pvs: usize,
-        def_hook_commit: Option<CommitBytes>,
+        def_hook_commit: Option<PB::Commitment>,
         def_idx: usize,
     ) -> Self
     where
         S: AggregationSubCircuit + VerifierTraceGen<PB, SC, EngineDeviceCtx<E>>,
         T: DeferredVerifyTraceGen<PB, EngineDeviceCtx<E>>,
+        E::PD: DeviceDataTransporter<SC, PB> + Clone,
+        PB::Val: Field + PrimeField32,
         PB::Matrix: Clone,
+        PB::Commitment: Into<CommitBytes>,
     {
-        assert_all_airs_required(&pk);
         let verifier_circuit = S::new(
             child_vk.clone(),
             VerifierConfig {
                 continuations_enabled: true,
                 final_state_bus_enabled: true,
                 has_cached: true,
+                tail_mode: openvm_recursion_circuit::system::VerifierTailMode::Complete,
             },
         );
+        let def_hook_commit = def_hook_commit.map(Into::into);
         let internal_recursive_vk_commit = VkCommitBytes {
             cached_commit: internal_recursive_cached_commit,
             vk_pre_hash: child_vk.pre_hash.into(),
@@ -271,42 +274,6 @@ where
     E: StarkEngine<PB = PB, SC = SC>,
     PB::Matrix: Clone,
 {
-    fn from_pk(pk: DeferralCircuitProverKey<SC>) -> Self {
-        let aux = DeferralVerifyProvingAux::decode(&mut pk.aux.as_slice())
-            .expect("failed to decode verify-stark deferral proving aux");
-        Self::new(DeferredVerifyProver::from_pk::<E>(
-            aux.child_vk,
-            aux.internal_recursive_cached_commit,
-            pk.base_pk,
-            aux.memory_dimensions,
-            aux.num_user_pvs,
-            aux.def_hook_commit,
-            aux.def_idx,
-        ))
-    }
-
-    fn get_pk(&self) -> Arc<DeferralCircuitProverKey<SC>> {
-        let aux = DeferralVerifyProvingAux {
-            child_vk: self.prover.child_vk.clone(),
-            internal_recursive_cached_commit: self
-                .prover
-                .circuit
-                .internal_recursive_vk_commit
-                .cached_commit,
-            memory_dimensions: self.prover.circuit.memory_dimensions,
-            num_user_pvs: self.prover.circuit.num_user_pvs,
-            def_hook_commit: self.prover.circuit.def_hook_commit,
-            def_idx: self.prover.circuit.def_idx,
-        };
-        let mut encoded_aux = Vec::new();
-        aux.encode(&mut encoded_aux)
-            .expect("failed to encode verify-stark deferral proving aux");
-        Arc::new(DeferralCircuitProverKey {
-            base_pk: self.prover.get_pk(),
-            aux: encoded_aux,
-        })
-    }
-
     fn get_vk(&self) -> Arc<MultiStarkVerifyingKey<SC>> {
         self.prover.get_vk()
     }
@@ -324,38 +291,5 @@ where
 
     fn get_def_idx(&self) -> usize {
         self.prover.circuit.def_idx
-    }
-
-    fn cached_commits(&self) -> Vec<CommitBytes> {
-        vec![self.prover.get_cached_commit().into()]
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct DeferralVerifyProvingAux {
-    child_vk: Arc<MultiStarkVerifyingKey<SC>>,
-    internal_recursive_cached_commit: CommitBytes,
-    memory_dimensions: MemoryDimensions,
-    num_user_pvs: usize,
-    def_hook_commit: Option<CommitBytes>,
-    def_idx: usize,
-}
-
-impl Encode for DeferralVerifyProvingAux {
-    fn encode<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        let bytes = bitcode::serialize(self).map_err(std::io::Error::other)?;
-        std::io::Write::write_all(writer, &(bytes.len() as u64).to_le_bytes())?;
-        std::io::Write::write_all(writer, &bytes)
-    }
-}
-
-impl Decode for DeferralVerifyProvingAux {
-    fn decode<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let mut len_bytes = [0u8; 8];
-        std::io::Read::read_exact(reader, &mut len_bytes)?;
-        let len = u64::from_le_bytes(len_bytes) as usize;
-        let mut bytes = vec![0u8; len];
-        std::io::Read::read_exact(reader, &mut bytes)?;
-        bitcode::deserialize(&bytes).map_err(std::io::Error::other)
     }
 }

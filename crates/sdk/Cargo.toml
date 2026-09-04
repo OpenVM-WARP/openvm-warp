@@ -1,10 +1,8 @@
 [package]
 name = "openvm-sdk"
-description = "OpenVM SDK for executing, proving, and verifying guest programs."
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 homepage.workspace = true
 repository.workspace = true
 license.workspace = true
@@ -13,7 +11,9 @@ autoexamples = false
 [dependencies]
 openvm-stark-backend = { workspace = true }
 openvm-stark-sdk = { workspace = true, features = ["cpu-backend"] }
+openvm-cpu-backend = { workspace = true }
 openvm-cuda-backend = { workspace = true, optional = true }
+openvm-cuda-common = { workspace = true, optional = true }
 
 openvm-build = { workspace = true }
 openvm-circuit = { workspace = true }
@@ -26,11 +26,11 @@ openvm-deferral-circuit = { workspace = true }
 openvm-continuations = { workspace = true }
 openvm-verify-stark-host = { workspace = true }
 openvm-verify-stark-circuit = { workspace = true }
-openvm-certified-verifier = { workspace = true, optional = true }
 openvm-static-verifier = { workspace = true, optional = true }
-halo2-base = { workspace = true, optional = true }
+halo2-base = { workspace = true, optional = true, features = ["halo2-axiom"] }
 
 alloy-sol-types = { workspace = true, optional = true }
+forge-fmt = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 
 bitcode = { workspace = true }
@@ -46,13 +46,22 @@ itertools = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_with = { workspace = true, features = ["hex"] }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+zstd = { workspace = true }
+libc = "0.2"
 metrics = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+openvm-stark-backend = { workspace = true, features = ["test-utils"] }
+openvm-circuit-primitives = { workspace = true }
+openvm-riscv-circuit = { workspace = true, features = ["test-utils"] }
+openvm-riscv-transpiler = { workspace = true }
 
 [features]
 default = ["parallel", "jemalloc"]
-certified-verifier = ["dep:openvm-certified-verifier"]
 root-prover = [
     "openvm-continuations/root-prover",
     "openvm-stark-sdk/baby-bear-bn254-poseidon2",
@@ -70,20 +79,32 @@ evm-verify = [
     "dep:alloy-sol-types",
     "dep:tempfile",
 ]
-metrics = [
-    "dep:metrics",
-    "openvm-continuations/metrics",
-    "openvm-sdk-config/metrics",
+# Optional Solidity code formatting; requires Rust 1.91+ due to foundry/alloy transitive deps.
+evm-verify-fmt = [
+    "evm-verify",
+    "dep:forge-fmt",
 ]
-aot = ["openvm-circuit/aot", "openvm-sdk-config/aot"]
-tco = ["openvm-circuit/tco", "openvm-sdk-config/tco"]
+metrics = ["dep:metrics", "openvm-continuations/metrics", "openvm-sdk-config/metrics"]
+aot = [
+    "openvm-circuit/aot",
+    "openvm-sdk-config/aot",
+]
+rvr = [
+    "openvm-circuit/rvr",
+    "openvm-sdk-config/rvr",
+]
+profiling = ["openvm-circuit/profiling"]
+tco = [
+    "openvm-circuit/tco",
+    "openvm-sdk-config/tco",
+]
 unprotected = ["openvm-circuit/unprotected"]
 
 # for guest profiling:
 perf-metrics = [
     "openvm-circuit/perf-metrics",
     "openvm-transpiler/function-span",
-    "openvm-sdk-config/perf-metrics",
+    "openvm-sdk-config/perf-metrics"
 ]
 
 # turns on stark-backend debugger in all proofs
@@ -97,14 +118,17 @@ jemalloc-prof = ["openvm-circuit/jemalloc-prof"]
 
 cuda = [
     "dep:openvm-cuda-backend",
+    "dep:openvm-cuda-common",
     "openvm-circuit/cuda",
     "openvm-sdk-config/cuda",
     "openvm-continuations/cuda",
     "openvm-verify-stark-circuit/cuda",
     "openvm-static-verifier?/cuda",
 ]
-halo2-gpu = ["cuda", "openvm-static-verifier?/halo2-gpu"]
-cell-profiling = ["evm-prove", "openvm-static-verifier/cell-profiling"]
+cell-profiling = [
+    "evm-prove",
+    "openvm-static-verifier/cell-profiling",
+]
 
 [[example]]
 name = "sdk_app"

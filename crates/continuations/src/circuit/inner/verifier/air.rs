@@ -26,9 +26,9 @@ use p3_field::{Field, PrimeCharacteristicRing};
 use p3_matrix::Matrix;
 
 use crate::circuit::{
-    inner::{
-        bus::{PvsAirConsistencyBus, PvsAirConsistencyMessage},
-        VerifierCircuitType,
+    inner::bus::{
+        PvsAirConsistencyBus, PvsAirConsistencyMessage, VerifierLayerIdentityBus,
+        VerifierLayerIdentityMessage,
     },
     root::NUM_DIGESTS_IN_VM_COMMIT,
     subair::{HashSliceCtx, HashSliceSubAir},
@@ -56,9 +56,10 @@ pub struct VerifierPvsAir {
     pub pre_hash_bus: PreHashBus,
     pub range_bus: RangeCheckerBus,
     pub pvs_air_consistency_bus: PvsAirConsistencyBus,
+    /// Enabled only by History-v4 recursive sub-circuits. The message is
+    /// derived from authenticated child verifier PVS on every valid row.
+    pub verifier_layer_identity_bus: Option<VerifierLayerIdentityBus>,
     pub deferral_config: VerifierDeferralConfig,
-
-    pub verifier_type: VerifierCircuitType,
 }
 
 impl<F> BaseAir<F> for VerifierPvsAir {
@@ -328,6 +329,17 @@ impl<AB: AirBuilder + InteractionBuilder + AirBuilderWithPublicValues> Air<AB> f
             },
             local.is_valid * consistency_mult,
         );
+        if let Some(bus) = self.verifier_layer_identity_bus {
+            bus.add_key_with_lookups(
+                builder,
+                local.proof_idx,
+                VerifierLayerIdentityMessage {
+                    internal_flag: local.child_pvs.internal_flag.into(),
+                    recursion_depth: local.child_pvs.recursion_depth.into(),
+                },
+                local.is_valid,
+            );
+        }
 
         /*
          * Finally, we need to constrain that the public values this AIR produces are consistent
@@ -344,8 +356,6 @@ impl<AB: AirBuilder + InteractionBuilder + AirBuilderWithPublicValues> Air<AB> f
             recursion_depth,
             internal_recursive_vk_commit,
         } = builder.public_values()[0..base_pvs_width].borrow();
-
-        builder.assert_eq(internal_flag, AB::Expr::from_u8(self.verifier_type as u8));
 
         // constrain internal_flag is 0 at the leaf level
         builder

@@ -49,6 +49,7 @@ mod final_poly_mle_eval;
 mod final_poly_query_eval;
 pub mod folding;
 mod initial_opened_values;
+pub mod multi_constraint;
 mod non_initial_opened_values;
 mod query;
 mod sumcheck;
@@ -61,11 +62,6 @@ pub(crate) fn num_queries_per_round(params: &SystemParams) -> Vec<usize> {
         .iter()
         .map(|round| round.num_queries)
         .collect()
-}
-
-pub(crate) fn whir_round_encoder(num_rounds: usize) -> Encoder {
-    // Encoder requires at least 2 flags to work correctly.
-    Encoder::new(num_rounds.max(2), 2, false)
 }
 
 #[inline]
@@ -641,6 +637,10 @@ pub(crate) struct WhirBlobCpu {
     pre_query_claims: FlattenedVec<EF, PerProofLayout>,
     eq_partials: FlattenedVec<EF, PerProofLayout>,
     final_poly_at_u: Vec<EF>,
+    /// Value consumed by the last WHIR round.  The legacy owner fills this
+    /// with `eq(alpha, u_prefix) * final_poly(u_suffix)`; the
+    /// multi-constraint owner fills it with the generalized weighted sum.
+    final_poly_mle_evals: Vec<EF>,
     zi_roots: FlattenedVec<F, WhirQueryLayout>,
     zis: FlattenedVec<F, WhirQueryLayout>,
     yis: FlattenedVec<EF, WhirQueryLayout>,
@@ -660,6 +660,7 @@ struct WhirBlobBuilder {
     pre_query_claims: Vec<EF>,
     eq_partials: Vec<EF>,
     final_poly_at_u: Vec<EF>,
+    final_poly_mle_evals: Vec<EF>,
     zi_roots: Vec<F>,
     zis: Vec<F>,
     yis: Vec<EF>,
@@ -697,6 +698,7 @@ impl WhirBlobBuilder {
             pre_query_claims: Vec::with_capacity(num_proofs * num_whir_rounds),
             eq_partials: Vec::with_capacity(num_proofs * sumcheck_rows_per_proof),
             final_poly_at_u: Vec::with_capacity(num_proofs),
+            final_poly_mle_evals: Vec::with_capacity(num_proofs),
             zi_roots: Vec::with_capacity(num_proofs * queries_per_proof),
             zis: Vec::with_capacity(num_proofs * queries_per_proof),
             yis: Vec::with_capacity(num_proofs * queries_per_proof),
@@ -737,6 +739,7 @@ impl WhirBlobBuilder {
             ),
             eq_partials: FlattenedVec::from_parts(sumcheck_layout, self.eq_partials),
             final_poly_at_u: self.final_poly_at_u,
+            final_poly_mle_evals: self.final_poly_mle_evals,
             zi_roots: FlattenedVec::from_parts(query_layout.clone(), self.zi_roots),
             zis: FlattenedVec::from_parts(query_layout.clone(), self.zis),
             yis: FlattenedVec::from_parts(query_layout, self.yis),
@@ -759,6 +762,9 @@ impl AirModule for WhirModule {
         let num_rounds = params.num_whir_rounds();
         let num_queries_per_round = num_queries_per_round(params);
 
+        // Encoder requires at least 2 flags to work correctly
+        let whir_round_encoder = Encoder::new(num_rounds.max(2), 2, false);
+
         let whir_round_air: AirRef<SC> = Arc::new(WhirRoundAir {
             whir_module_bus: self.bus_inventory.whir_module_bus,
             commitments_bus: self.bus_inventory.commitments_bus,
@@ -768,16 +774,18 @@ impl AirModule for WhirModule {
             verify_queries_bus: self.verify_queries_bus,
             final_poly_mle_eval_bus: self.final_poly_mle_eval_bus,
             final_poly_query_eval_bus: self.final_poly_query_eval_bus,
+            terminal_bus: None,
             query_bus: self.query_bus,
             gamma_bus: self.gamma_bus,
             k: params.k_whir(),
             num_rounds,
             initial_log_domain_size,
+            coefficient_two_coset_initial_domain: false,
             final_poly_len: 1 << params.log_final_poly_len(),
             pow_bits: params.whir.query_phase_pow_bits,
             folding_pow_bits: params.whir.folding_pow_bits,
             generator: F::GENERATOR,
-            whir_round_encoder: whir_round_encoder(num_rounds),
+            whir_round_encoder,
             num_queries_per_round: num_queries_per_round.clone(),
         });
         let whir_sumcheck_air = SumcheckAir {
@@ -872,6 +880,7 @@ impl WhirModule {
         params: &SystemParams,
         query_layout: &WhirQueryLayout,
         blob: &mut WhirBlobBuilder,
+        coefficient_two_coset_initial_domain: bool,
     ) {
         let k_whir = params.k_whir();
         let num_whir_rounds = params.num_whir_rounds();
@@ -923,11 +932,22 @@ impl WhirModule {
 
             blob.pre_query_claims.push(claim);
 
-            let omega = F::two_adic_generator(log_rs_domain_size);
+            let omega = F::two_adic_generator(
+                log_rs_domain_size - usize::from(coefficient_two_coset_initial_domain && i == 0),
+            );
             let round_alphas = &preflight.whir.alphas[i * k_whir..(i + 1) * k_whir];
             for (query_idx, &sample) in round_queries.iter().enumerate() {
                 let index = sample.as_canonical_u32() & ((1 << (log_rs_domain_size - k_whir)) - 1);
-                let zi_root = omega.exp_u64(index as u64);
+                let zi_root = if coefficient_two_coset_initial_domain && i == 0 {
+                    let subgroup_root = omega.exp_u64((index >> 1) as u64);
+                    if index & 1 == 0 {
+                        subgroup_root
+                    } else {
+                        subgroup_root * F::GENERATOR
+                    }
+                } else {
+                    omega.exp_u64(index as u64)
+                };
                 let zi = zi_root.exp_power_of_2(k_whir);
                 let record_start = blob.fold_records.len();
                 let yi = if i == 0 {
@@ -982,8 +1002,9 @@ impl WhirModule {
         // Evaluate the MLE of the table `final_poly` (interpreted as hypercube evaluations)
         // at `u[t..]`. This matches the eval-to-coeff RS encoding semantics.
         let t = k_whir * num_whir_rounds;
-        blob.final_poly_at_u
-            .push(eval_final_poly_at_u(&proof.whir_proof.final_poly, &u[t..]));
+        let final_poly_at_u = eval_final_poly_at_u(&proof.whir_proof.final_poly, &u[t..]);
+        blob.final_poly_at_u.push(final_poly_at_u);
+        blob.final_poly_mle_evals.push(final_poly_at_u * eq_partial);
     }
 
     fn enqueue_pow_requests_for_proof(
@@ -991,6 +1012,7 @@ impl WhirModule {
         preflight: &Preflight,
         params: &SystemParams,
         query_layout: &WhirQueryLayout,
+        coefficient_two_coset_initial_domain: bool,
     ) {
         let mu_pow_bits = params.whir.mu_pow_bits;
         let folding_pow_bits = params.whir.folding_pow_bits;
@@ -1029,22 +1051,40 @@ impl WhirModule {
         for (i, query_range) in query_layout.iter_round_query_ranges() {
             let round_queries = &preflight.whir.queries[query_range];
             let log_rs_domain_size = initial_log_rs_domain_size - i;
-            let omega = F::two_adic_generator(log_rs_domain_size);
+            let omega = F::two_adic_generator(
+                log_rs_domain_size - usize::from(coefficient_two_coset_initial_domain && i == 0),
+            );
             let shift_bits = initial_log_rs_domain_size - k_whir + 1 - i;
             let per_query_lookups = if i == 0 {
                 preflight.initial_row_states.len() as u32
             } else {
                 1
             };
-            exp_bits_len_gen.add_requests_with_shift(round_queries.iter().copied().map(|sample| {
-                (
-                    omega,
-                    sample,
-                    log_rs_domain_size - k_whir,
-                    shift_bits,
-                    per_query_lookups,
-                )
-            }));
+            if coefficient_two_coset_initial_domain && i == 0 {
+                for &sample in round_queries {
+                    let quotient = F::from_u32(sample.as_canonical_u32() >> 1);
+                    exp_bits_len_gen.add_request(omega, quotient, log_rs_domain_size - k_whir - 1);
+                    // The external query owner consumes two shift-table rows
+                    // per initial query.  Their exponentiation side is the
+                    // canonical no-op 1^0 = 1.
+                    exp_bits_len_gen.add_requests_with_shift([
+                        (F::ONE, sample, 0, 1, 1),
+                        (F::ONE, sample, 0, shift_bits, 2),
+                    ]);
+                }
+            } else {
+                exp_bits_len_gen.add_requests_with_shift(round_queries.iter().copied().map(
+                    |sample| {
+                        (
+                            omega,
+                            sample,
+                            log_rs_domain_size - k_whir,
+                            shift_bits,
+                            per_query_lookups,
+                        )
+                    },
+                ));
+            }
         }
     }
 
@@ -1104,11 +1144,41 @@ impl WhirModule {
 
     #[tracing::instrument(skip_all)]
     fn generate_blob(
-        &self,
         child_vk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
         proofs: &[&Proof<BabyBearPoseidon2Config>],
         preflights: &[&Preflight],
         exp_bits_len_gen: &ExpBitsLenCpuTraceGenerator,
+    ) -> WhirBlobCpu {
+        Self::generate_blob_with_initial_domain(
+            child_vk,
+            proofs,
+            preflights,
+            exp_bits_len_gen,
+            false,
+        )
+    }
+
+    pub(crate) fn generate_blob_coefficient_two_coset(
+        child_vk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
+        proofs: &[&Proof<BabyBearPoseidon2Config>],
+        preflights: &[&Preflight],
+        exp_bits_len_gen: &ExpBitsLenCpuTraceGenerator,
+    ) -> WhirBlobCpu {
+        Self::generate_blob_with_initial_domain(
+            child_vk,
+            proofs,
+            preflights,
+            exp_bits_len_gen,
+            true,
+        )
+    }
+
+    fn generate_blob_with_initial_domain(
+        child_vk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
+        proofs: &[&Proof<BabyBearPoseidon2Config>],
+        preflights: &[&Preflight],
+        exp_bits_len_gen: &ExpBitsLenCpuTraceGenerator,
+        coefficient_two_coset_initial_domain: bool,
     ) -> WhirBlobCpu {
         let params = &child_vk.inner.params;
         let k_whir = params.k_whir();
@@ -1161,6 +1231,7 @@ impl WhirModule {
                 params,
                 &query_layout,
                 &mut blob,
+                coefficient_two_coset_initial_domain,
             );
 
             blob.whir_round_tidx_per_round
@@ -1173,6 +1244,7 @@ impl WhirModule {
                 preflight,
                 params,
                 &query_layout,
+                coefficient_two_coset_initial_domain,
             );
 
             Self::append_initial_opened_values_accs_for_proof(
@@ -1220,7 +1292,7 @@ impl<SC: StarkProtocolConfig<F = F>> TraceGenModule<GlobalCtxCpu, CpuBackend<SC>
     ) -> Option<Vec<AirProvingContext<CpuBackend<SC>>>> {
         let proofs = proofs.iter().collect_vec();
         let preflights = preflights.iter().collect_vec();
-        let blob = self.generate_blob(child_vk, &proofs, &preflights, exp_bits_len_gen);
+        let blob = Self::generate_blob(child_vk, &proofs, &preflights, exp_bits_len_gen);
         let ctx = (
             StandardTracegenCtx {
                 vk: child_vk,
@@ -1689,7 +1761,7 @@ mod cuda_tracegen {
                 .map(|preflight| &preflight.cpu)
                 .collect_vec();
 
-            let blob = self.generate_blob(
+            let blob = Self::generate_blob(
                 &child_vk.cpu,
                 &proofs_cpu,
                 &preflights_cpu,

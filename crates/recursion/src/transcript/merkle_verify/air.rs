@@ -43,8 +43,6 @@ use crate::{
 pub struct MerkleVerifyCols<T> {
     /// Index of the proof this row is for
     pub proof_idx: T,
-    /// Query occurrence within the WHIR round
-    pub query_idx: T,
     /// Indicator: whether this row is valid
     pub is_valid: T,
     /// Indicator: whether this is the last row of a merkle proof
@@ -191,7 +189,6 @@ impl<AB: AirBuilder + InteractionBuilder> Air<AB> for MerkleVerifyAir {
             MerkleVerifyBusMessage {
                 value: local.left.map(Into::into),
                 merkle_idx_bit_src: local.merkle_idx_bit_src.into(),
-                query_idx: local.query_idx.into(),
                 current_idx_bit_src: left_child_current_idx,
                 total_depth: local.total_depth.into(),
                 height: local.height.into(),
@@ -208,7 +205,6 @@ impl<AB: AirBuilder + InteractionBuilder> Air<AB> for MerkleVerifyAir {
             MerkleVerifyBusMessage {
                 value: local.right.map(Into::into),
                 merkle_idx_bit_src: local.merkle_idx_bit_src.into(),
-                query_idx: local.query_idx.into(),
                 current_idx_bit_src: right_child_current_idx,
                 total_depth: local.total_depth.into(),
                 height: local.height.into(),
@@ -226,7 +222,6 @@ impl<AB: AirBuilder + InteractionBuilder> Air<AB> for MerkleVerifyAir {
             MerkleVerifyBusMessage {
                 value: local.compression_output.map(Into::into),
                 merkle_idx_bit_src: local.merkle_idx_bit_src.into(),
-                query_idx: local.query_idx.into(),
                 current_idx_bit_src: local.current_idx_bit_src.into(),
                 total_depth: local.total_depth.into(),
                 height: local.height + AB::Expr::ONE,

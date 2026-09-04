@@ -12,8 +12,11 @@ use openvm_verify_stark_host::VmStarkProof;
 #[cfg(feature = "evm-prove")]
 use crate::prover::Halo2Prover;
 use crate::{
-    prover::{vm::types::VmProvingKey, AggProver, InternalLayerMetadata, RootProver, StarkProver},
-    DeferralInput, DeferralSetup, StdIn, SC,
+    prover::{
+        vm::types::VmProvingKey, AggProver, DeferralPathProver, InternalLayerMetadata, RootProver,
+        StarkProver,
+    },
+    DeferralInput, StdIn, SC,
 };
 
 /// EVM prover that produces a root STARK proof with Halo2 wrapping.
@@ -45,18 +48,12 @@ where
         app_vm_pk: &VmProvingKey<VB::VmConfig>,
         app_exe: Arc<VmExe<Val<SC>>>,
         agg_prover: Arc<AggProver>,
-        deferral_setup: DeferralSetup,
+        def_prover: Option<Arc<DeferralPathProver>>,
         root_prover: Arc<RootProver>,
         #[cfg(feature = "evm-prove")] halo2_prover: Option<Halo2Prover>,
     ) -> Result<Self> {
         Ok(Self {
-            stark_prover: StarkProver::new(
-                vm_builder,
-                app_vm_pk,
-                app_exe,
-                agg_prover,
-                deferral_setup,
-            )?,
+            stark_prover: StarkProver::new(vm_builder, app_vm_pk, app_exe, agg_prover, def_prover)?,
             root_prover,
             #[cfg(feature = "evm-prove")]
             halo2_prover,
@@ -88,9 +85,8 @@ where
 
         const MAX_ROOT_TRACEGEN_RETRIES: usize = 8;
         let agg_prover = &self.stark_prover.agg_prover;
-        let root_engine = self.root_prover.create_engine();
         self.root_prover
-            .prove(stark_proof, &root_engine, MAX_ROOT_TRACEGEN_RETRIES, |p| {
+            .prove(stark_proof, MAX_ROOT_TRACEGEN_RETRIES, |p| {
                 agg_prover.wrap_proof(p, metadata)
             })
     }
@@ -125,7 +121,7 @@ where
             .halo2_prover
             .as_ref()
             .unwrap()
-            .prove_for_evm(&root_proof)?;
+            .prove_for_evm(&root_proof);
         Ok(evm_proof)
     }
 }

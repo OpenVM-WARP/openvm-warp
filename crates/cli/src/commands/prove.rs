@@ -17,6 +17,7 @@ use openvm_sdk::{
 };
 use openvm_sdk_config::SdkVmConfig;
 use openvm_stark_backend::keygen::types::MultiStarkProvingKey;
+use p3_bn254::Bn254;
 
 use super::{RunArgs, RunCargoArgs};
 use crate::{
@@ -105,7 +106,7 @@ enum ProveSubCommand {
         #[arg(
             long,
             action,
-            help = "Path to root proving key, by default uses ${HOME}/.openvm/v[OPENVM_VERSION]/root.pk",
+            help = "Path to root proving key, by default will be ${HOME}/.openvm/root.pk",
             help_heading = "OpenVM Options"
         )]
         root_pk: Option<PathBuf>,
@@ -113,7 +114,7 @@ enum ProveSubCommand {
         #[arg(
             long,
             action,
-            help = "Path to Halo2 proving key, by default uses ${HOME}/.openvm/v[OPENVM_VERSION]/halo2.pk",
+            help = "Path to Halo2 proving key, by default will be ${HOME}/.openvm/halo2.pk",
             help_heading = "OpenVM Options"
         )]
         halo2_pk: Option<PathBuf>,
@@ -162,11 +163,9 @@ impl ProveCmd {
                     .build()?;
                 let (exe, target_name) = load_or_build_exe(run_args, cargo_args)?;
 
-                let mut prover = sdk.app_prover(exe)?;
-                let exe_commit = CommitBytes::from(prover.app_exe_commit());
-                println!("exe commit: {exe_commit}");
-
-                let app_proof = prover.prove(read_to_stdin(&run_args.input)?)?;
+                let app_proof = sdk
+                    .app_prover(exe)?
+                    .prove(read_to_stdin(&run_args.input)?)?;
 
                 let proof_path = if let Some(proof) = proof {
                     proof
@@ -204,8 +203,10 @@ impl ProveCmd {
                     app_exe_commit: CommitBytes::from(baseline.app_exe_commit),
                     app_vm_commit: CommitBytes::from(app_vm_commit),
                 };
-                println!("exe commit: {}", app_commit.app_exe_commit);
-                println!("vm commit: {}", app_commit.app_vm_commit);
+                let exe_commit_bn254 = Bn254::from(app_commit.app_exe_commit);
+                let vm_commit_bn254 = Bn254::from(app_commit.app_vm_commit);
+                println!("exe commit: {:?}", exe_commit_bn254);
+                println!("vm commit: {:?}", vm_commit_bn254);
 
                 let (stark_proof, _metadata) =
                     prover.prove(read_to_stdin(&run_args.input)?, &[])?;
@@ -258,8 +259,8 @@ impl ProveCmd {
                     .agg_tree_config(*agg_tree_config)
                     .build()?;
                 let mut prover = sdk.evm_prover(exe)?;
-                let exe_commit = CommitBytes::from(prover.stark_prover.app_prover.app_exe_commit());
-                println!("exe commit: {exe_commit}");
+                let exe_commit = prover.stark_prover.app_prover.app_exe_commit();
+                println!("exe commit: {:?}", exe_commit);
                 let evm_proof = prover.prove_evm(read_to_stdin(&run_args.input)?, &[])?;
 
                 let proof_path = if let Some(proof) = proof {

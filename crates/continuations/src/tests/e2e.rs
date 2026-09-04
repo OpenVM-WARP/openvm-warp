@@ -8,7 +8,6 @@ use openvm_circuit::{
         hasher::poseidon2::vm_poseidon2_hasher,
         instructions::{exe::VmExe, DEFERRAL_AS},
         ContinuationVmProver, Streams, VirtualMachine, VmInstance,
-        DEFAULT_DEFERRAL_ADDR_SPACE_CELLS,
     },
     system::memory::{
         dimensions::MemoryDimensions,
@@ -18,16 +17,16 @@ use openvm_circuit::{
 };
 use openvm_cuda_backend::{BabyBearBn254Poseidon2GpuEngine, BabyBearPoseidon2GpuEngine};
 use openvm_deferral_circuit::{
-    DeferralExtension, DeferralFn, Rv32DeferralBuilder, Rv32DeferralConfig,
+    DeferralExtension, DeferralFn, Rv64DeferralBuilder, Rv64DeferralConfig,
 };
 use openvm_deferral_transpiler::DeferralTranspilerExtension;
 use openvm_recursion_circuit::{
     prelude::DIGEST_SIZE,
     utils::{poseidon2_hash_slice, poseidon2_hash_slice_with_states},
 };
-use openvm_rv32im_circuit::{Rv32I, Rv32Io, Rv32M};
-use openvm_rv32im_transpiler::{
-    Rv32ITranspilerExtension, Rv32IoTranspilerExtension, Rv32MTranspilerExtension,
+use openvm_riscv_circuit::{Rv64I, Rv64Io, Rv64M};
+use openvm_riscv_transpiler::{
+    Rv64ITranspilerExtension, Rv64IoTranspilerExtension, Rv64MTranspilerExtension,
 };
 use openvm_stark_backend::{proof::Proof, AirRef, StarkEngine};
 use openvm_stark_sdk::{
@@ -51,7 +50,7 @@ use super::{
 use crate::{
     circuit::{
         deferral::{DeferralCircuitPvs, DeferralMerkleProofs, DEF_HOOK_PVS_AIR_ID},
-        inner::{ProofsType, VerifierCircuitType},
+        inner::ProofsType,
     },
     prover::{
         engine_device_ctx, ChildVkKind, DeferralChildVkKind,
@@ -120,7 +119,7 @@ fn input_commit_to_f(commit: &[u8; 32]) -> [F; DIGEST_SIZE] {
 fn commit_to_stdin_fields(commit: &[u8; 32]) -> Vec<F> {
     commit
         .iter()
-        .flat_map(|b| [*b, 0, 0, 0])
+        .flat_map(|b| [*b, 0, 0, 0, 0, 0, 0, 0])
         .map(F::from_u8)
         .collect()
 }
@@ -263,20 +262,17 @@ fn test_deferral_e2e() -> Result<()> {
     let (_, def_circuit_vk) = gpu_engine.keygen(&[empty_air]);
     let def_circuit_vk = Arc::new(def_circuit_vk);
 
-    let def_leaf_prover = DeferralInnerProver::new::<GpuEngine>(
-        def_circuit_vk.clone(),
-        leaf_system_params(),
-        VerifierCircuitType::Leaf,
-    );
+    let def_leaf_prover =
+        DeferralInnerProver::new::<GpuEngine>(def_circuit_vk.clone(), leaf_system_params(), false);
     let def_i0_prover = DeferralInnerProver::new::<GpuEngine>(
         def_leaf_prover.get_vk(),
         internal_system_params(),
-        VerifierCircuitType::InternalForLeaf,
+        false,
     );
     let def_i1_prover = DeferralInnerProver::new::<GpuEngine>(
         def_i0_prover.get_vk(),
         internal_system_params(),
-        VerifierCircuitType::InternalRecursive,
+        true,
     );
     let hook_prover_for_commit = DeferralHookProver::new::<GpuEngine>(
         def_i1_prover.get_vk(),
@@ -314,16 +310,16 @@ fn test_deferral_e2e() -> Result<()> {
     let transpiler_commits = vec![def_circuit_commit_bytes; NUM_DEF_CIRCUITS];
 
     // =========================================================================
-    // SECTION 1: Set up Rv32DeferralConfig, build ELF, set up deferral streams.
+    // SECTION 1: Set up Rv64DeferralConfig, build ELF, set up deferral streams.
     // =========================================================================
     let mut system = test_system_config();
-    system.memory_config.addr_spaces[DEFERRAL_AS as usize].num_cells =
-        DEFAULT_DEFERRAL_ADDR_SPACE_CELLS;
-    let config = Rv32DeferralConfig {
+    system.memory_config.addr_spaces[DEFERRAL_AS as usize].num_cells = 1 << 25;
+
+    let config = Rv64DeferralConfig {
         system: system.clone(),
-        rv32i: Rv32I,
-        rv32m: Rv32M::default(),
-        io: Rv32Io,
+        rv64i: Rv64I,
+        rv64m: Rv64M::default(),
+        io: Rv64Io,
         deferral: make_deferral_extension(transpiler_commits.clone()),
     };
 
@@ -334,9 +330,9 @@ fn test_deferral_e2e() -> Result<()> {
     let exe = VmExe::from_elf(
         elf,
         Transpiler::<F>::default()
-            .with_extension(Rv32ITranspilerExtension)
-            .with_extension(Rv32MTranspilerExtension)
-            .with_extension(Rv32IoTranspilerExtension)
+            .with_extension(Rv64ITranspilerExtension)
+            .with_extension(Rv64MTranspilerExtension)
+            .with_extension(Rv64IoTranspilerExtension)
             .with_extension(DeferralTranspilerExtension::new(transpiler_commits)),
     )?;
 
@@ -376,7 +372,7 @@ fn test_deferral_e2e() -> Result<()> {
     // SECTION 2: Run the VM, capture merkle proofs before and after execution.
     // =========================================================================
     let app_engine = GpuEngine::new(app_system_params());
-    let (vm, app_pk) = VirtualMachine::new_with_keygen(app_engine, Rv32DeferralBuilder, config)?;
+    let (vm, app_pk) = VirtualMachine::new_with_keygen(app_engine, Rv64DeferralBuilder, config)?;
     let cached_program_trace = vm.commit_program_on_device(&exe.program);
     let mut instance = VmInstance::new(vm, exe.into(), cached_program_trace)?;
 
@@ -465,7 +461,7 @@ fn test_deferral_e2e() -> Result<()> {
         let leaf_prover = DeferralInnerProver::new::<GpuEngine>(
             def_circuit_vk.clone(),
             leaf_system_params(),
-            VerifierCircuitType::Leaf,
+            false,
         );
 
         let mut current_proofs = proofs;
@@ -488,7 +484,7 @@ fn test_deferral_e2e() -> Result<()> {
         let i4l_prover = DeferralInnerProver::new::<GpuEngine>(
             leaf_prover.get_vk(),
             internal_system_params(),
-            VerifierCircuitType::InternalForLeaf,
+            false,
         );
         let mut next = Vec::with_capacity(current_proofs.len().div_ceil(2));
         let layer_merkle_depth = if current_proofs.len() == 1 {
@@ -510,7 +506,7 @@ fn test_deferral_e2e() -> Result<()> {
         let ir_prover = DeferralInnerProver::new::<GpuEngine>(
             i4l_prover.get_vk(),
             internal_system_params(),
-            VerifierCircuitType::InternalRecursive,
+            true,
         );
         loop {
             let mut next = Vec::with_capacity(current_proofs.len().div_ceil(2));
@@ -563,7 +559,7 @@ fn test_deferral_e2e() -> Result<()> {
     let leaf_prover = InnerProver::<MAX_NUM_PROOFS>::new::<GpuEngine>(
         Arc::new(app_pk.get_vk()),
         leaf_system_params(),
-        VerifierCircuitType::Leaf,
+        false,
         Some(def_hook_cached_commit),
     );
     warn!("proving VM leaf aggregation");
@@ -573,7 +569,7 @@ fn test_deferral_e2e() -> Result<()> {
     let i4l_prover = InnerProver::<MAX_NUM_PROOFS>::new::<GpuEngine>(
         leaf_prover.get_vk(),
         internal_system_params(),
-        VerifierCircuitType::InternalForLeaf,
+        false,
         Some(def_hook_cached_commit),
     );
     warn!("proving VM internal-for-leaf");
@@ -583,7 +579,7 @@ fn test_deferral_e2e() -> Result<()> {
     let ir_prover = InnerProver::<MAX_NUM_PROOFS>::new::<GpuEngine>(
         i4l_prover.get_vk(),
         internal_system_params(),
-        VerifierCircuitType::InternalRecursive,
+        true,
         Some(def_hook_cached_commit),
     );
     warn!("proving VM internal-recursive");
@@ -597,7 +593,7 @@ fn test_deferral_e2e() -> Result<()> {
     let deferral_leaf_prover = InnerProver::<MAX_NUM_PROOFS>::new::<GpuEngine>(
         hook_prover_for_commit.get_vk(),
         leaf_system_params(),
-        VerifierCircuitType::Leaf,
+        false,
         Some(def_hook_cached_commit),
     );
 
@@ -639,7 +635,7 @@ fn test_deferral_e2e() -> Result<()> {
     let def_i4l_prover = InnerProver::<MAX_NUM_PROOFS>::new::<GpuEngine>(
         deferral_leaf_prover.get_vk(),
         internal_system_params(),
-        VerifierCircuitType::InternalForLeaf,
+        false,
         Some(def_hook_cached_commit),
     );
     warn!("proving deferral-path internal-for-leaf");
@@ -653,7 +649,7 @@ fn test_deferral_e2e() -> Result<()> {
     let def_ir_prover = InnerProver::<MAX_NUM_PROOFS>::new::<GpuEngine>(
         def_i4l_prover.get_vk(),
         internal_system_params(),
-        VerifierCircuitType::InternalRecursive,
+        false,
         Some(def_hook_cached_commit),
     );
     warn!("proving deferral-path internal-recursive");
@@ -750,7 +746,7 @@ fn test_deferral_e2e() -> Result<()> {
         None,
     );
     let root_vk = root_prover.get_vk();
-    let engine = root_prover.create_engine::<RootEngine>();
+    let engine = RootEngine::new(root_vk.inner.params.clone());
     let proving_ctx = root_prover.generate_proving_ctx::<<RootEngine as StarkEngine>::PB, _>(
         combined_proof,
         &user_pvs_proof,
@@ -758,8 +754,7 @@ fn test_deferral_e2e() -> Result<()> {
         engine_device_ctx(&engine),
     );
     warn!("proving root (GPU)");
-    let root_proof =
-        root_prover.root_prove_from_ctx::<RootEngine>(proving_ctx.unwrap(), &engine)?;
+    let root_proof = root_prover.root_prove_from_ctx::<RootEngine>(proving_ctx.unwrap())?;
     engine.verify(&root_vk, &root_proof)?;
 
     Ok(())

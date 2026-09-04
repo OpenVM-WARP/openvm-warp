@@ -26,6 +26,19 @@ pub trait Arena {
         0
     }
 
+    /// Pins the generated trace to `height` rows regardless of how many records were written.
+    ///
+    /// Trace generation normally derives the height from the records actually produced, so a
+    /// caller cannot know it without running trace generation. Pinning it lets a caller plan
+    /// heights from the metered upper bound instead, which is what lets the native-WARP lane
+    /// drop its shape-only planning pass. The extra rows are the same padding rows trace
+    /// generation already emits between the record count and the next power of two -- each chip
+    /// fills them itself -- so this widens the padding region without changing its contents.
+    ///
+    /// `height` must be a power of two (or zero) and at least the height the arena would have
+    /// produced on its own; implementations are free to assert that.
+    fn force_trace_height(&mut self, height: usize);
+
     #[cfg(feature = "metrics")]
     fn allocated_bytes(&self) -> Option<usize> {
         None
@@ -132,6 +145,23 @@ impl<F: Field> Arena for MatrixRecordArena<F> {
     fn current_trace_height(&self) -> usize {
         self.trace_offset / self.width
     }
+
+    fn force_trace_height(&mut self, height: usize) {
+        assert!(
+            height.is_power_of_two() || height == 0,
+            "forced trace height {height} must be a power of two"
+        );
+        // The buffer is already zeroed to the metered capacity, so growing is a resize and
+        // shrinking is only legal down to the rows actually written. `into_matrix` then keeps
+        // the whole buffer instead of truncating to `next_pow2(rows_used)`.
+        assert!(
+            height * self.width >= self.trace_offset,
+            "forced trace height {height} is below the {} rows already written",
+            self.trace_offset / self.width.max(1)
+        );
+        self.set_capacity(height);
+        self.force_matrix_dimensions();
+    }
 }
 
 impl<F: Field> RowMajorMatrixArena<F> for MatrixRecordArena<F> {
@@ -169,6 +199,9 @@ impl<F: Field> RowMajorMatrixArena<F> for MatrixRecordArena<F> {
 
 pub struct DenseRecordArena {
     pub records_buffer: Cursor<Vec<u8>>,
+    /// When set, trace generation emits exactly this many rows instead of deriving the height
+    /// from the record count. See [`Arena::force_trace_height`].
+    forced_height: Option<usize>,
 }
 
 const MAX_ALIGNMENT: usize = 32;
@@ -182,6 +215,7 @@ impl DenseRecordArena {
         cursor.set_position(offset as u64);
         Self {
             records_buffer: cursor,
+            forced_height: None,
         }
     }
 
@@ -250,6 +284,48 @@ impl DenseRecordArena {
     pub fn get_record_seeker<R, L>(&mut self) -> RecordSeeker<'_, DenseRecordArena, R, L> {
         RecordSeeker::new(self.allocated_mut())
     }
+
+    /// The trace height pinned by [`Arena::force_trace_height`], if any.
+    ///
+    /// Trace generation is expected to use this in place of its own
+    /// `next_power_of_two_or_zero(record_count)`. The tracegen kernels already fill every row at
+    /// or beyond the record count with that chip's padding row, so a larger height yields the
+    /// same trace with a longer padding region.
+    pub fn forced_height(&self) -> Option<usize> {
+        self.forced_height
+    }
+
+    /// Resolves the padded height for `rows_used`, applying an optional setup-planned height.
+    ///
+    /// CUDA trace generators whose number of AIR rows is not one-to-one with arena records
+    /// should use this helper instead of open-coding their padding calculation. This keeps the
+    /// setup and proving shapes identical while still rejecting a metered height that is too
+    /// small for the records produced by execution.
+    pub fn resolve_trace_height(forced_height: Option<usize>, rows_used: usize) -> usize {
+        let natural_height = next_power_of_two_or_zero(rows_used);
+        let trace_height = forced_height.unwrap_or(natural_height);
+        assert!(
+            trace_height.is_power_of_two() || trace_height == 0,
+            "resolved trace height {trace_height} must be a power of two"
+        );
+        assert!(
+            trace_height >= natural_height,
+            "forced trace height {trace_height} is below natural height {natural_height}"
+        );
+        trace_height
+    }
+
+    /// The padded trace height for `rows_used`, honouring [`Self::forced_height`].
+    pub fn trace_height_for_rows(&self, rows_used: usize) -> usize {
+        Self::resolve_trace_height(self.forced_height, rows_used)
+    }
+
+    /// The trace height this arena would produce for a chip whose records are `record_size`
+    /// bytes each, honouring [`Self::forced_height`].
+    pub fn trace_height(&self, record_size: usize) -> usize {
+        debug_assert_eq!(self.allocated().len() % record_size, 0);
+        self.trace_height_for_rows(self.allocated().len() / record_size)
+    }
 }
 
 impl Arena for DenseRecordArena {
@@ -266,6 +342,14 @@ impl Arena for DenseRecordArena {
     #[cfg(feature = "metrics")]
     fn allocated_bytes(&self) -> Option<usize> {
         Some(self.allocated().len())
+    }
+
+    fn force_trace_height(&mut self, height: usize) {
+        assert!(
+            height.is_power_of_two() || height == 0,
+            "forced trace height {height} must be a power of two"
+        );
+        self.forced_height = Some(height);
     }
 }
 
@@ -701,5 +785,82 @@ where
         let core_record: C = core_buffer.custom_borrow(layout);
 
         (adapter_record, core_record)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use openvm_stark_backend::{p3_field::PrimeCharacteristicRing, p3_matrix::Matrix};
+    use p3_baby_bear::BabyBear;
+
+    use super::*;
+
+    type F = BabyBear;
+
+    #[test]
+    fn forcing_a_matrix_arena_pads_beyond_the_rows_written() {
+        const WIDTH: usize = 3;
+        // Capacity 5 rounds up to 8; two rows written would otherwise truncate to 2.
+        let mut arena = MatrixRecordArena::<F>::with_capacity(5, WIDTH);
+        arena.alloc_buffer(2);
+        arena.force_trace_height(8);
+        let matrix = arena.into_matrix();
+        assert_eq!(matrix.height(), 8);
+        assert_eq!(matrix.width(), WIDTH);
+        // The forced rows are the same zero padding the unforced path emits.
+        assert!(matrix.values[2 * WIDTH..].iter().all(|v| *v == F::ZERO));
+    }
+
+    #[test]
+    fn an_unforced_matrix_arena_still_truncates() {
+        const WIDTH: usize = 3;
+        let mut arena = MatrixRecordArena::<F>::with_capacity(5, WIDTH);
+        arena.alloc_buffer(2);
+        assert_eq!(arena.into_matrix().height(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "is below the")]
+    fn forcing_a_matrix_arena_below_the_rows_written_panics() {
+        const WIDTH: usize = 3;
+        let mut arena = MatrixRecordArena::<F>::with_capacity(8, WIDTH);
+        arena.alloc_buffer(5);
+        arena.force_trace_height(4);
+    }
+
+    #[test]
+    fn a_dense_arena_reports_the_forced_height_in_place_of_the_record_count() {
+        const RECORD_SIZE: usize = 16;
+        let mut arena = DenseRecordArena::with_byte_capacity(RECORD_SIZE * 8);
+        arena.alloc_bytes(RECORD_SIZE * 3);
+        // Three records would generate four rows.
+        assert_eq!(arena.forced_height(), None);
+        assert_eq!(arena.trace_height(RECORD_SIZE), 4);
+        arena.force_trace_height(8);
+        assert_eq!(arena.forced_height(), Some(8));
+        assert_eq!(arena.trace_height(RECORD_SIZE), 8);
+    }
+
+    #[test]
+    fn a_dense_arena_with_no_records_still_owes_the_forced_padding() {
+        const RECORD_SIZE: usize = 16;
+        let mut arena = DenseRecordArena::with_byte_capacity(RECORD_SIZE * 8);
+        assert_eq!(arena.trace_height(RECORD_SIZE), 0);
+        // A chip that executed zero times in a segment the metered pass sized for four still
+        // owes four rows of padding, so the empty-arena shortcut cannot be unconditional.
+        arena.force_trace_height(4);
+        assert_eq!(arena.trace_height(RECORD_SIZE), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "is below natural height")]
+    fn a_dense_arena_rejects_a_forced_height_below_the_rows_used() {
+        DenseRecordArena::resolve_trace_height(Some(4), 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be a power of two")]
+    fn forcing_a_non_power_of_two_height_panics() {
+        DenseRecordArena::with_byte_capacity(64).force_trace_height(3);
     }
 }

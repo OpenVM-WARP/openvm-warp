@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Local pre-CI check: runs fmt, clippy, and tests only on crates changed vs a target branch.
-# Usage: ./scripts/pre-push.sh [target-branch]  (default: main)
+# Usage: ./scripts/pre-push.sh [target-branch]  (default: develop-v2.0.0-beta)
 #
 # Guest program builds are cached in target/ for fast re-runs.
 # To reclaim disk space: ./scripts/clean-guest-builds.sh
@@ -20,7 +20,7 @@
 # To bypass the hook for a single push:  git push --no-verify
 set -euo pipefail
 
-TARGET="${1:-main}"
+TARGET="${1:-develop-v2.0.0-beta}"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
@@ -209,7 +209,7 @@ for i in "${!CRATE_NAMES[@]}"; do
             heavy=1
             echo -n "(heavy) "
         fi
-        args=(nextest run --cargo-profile=fast -p "$name")
+        args=(nextest run --cargo-profile=fast --no-tests=pass -p "$name")
         [ -n "$feats" ] && args+=(--features "$feats")
         [ "$heavy" -eq 1 ] && args+=(--profile=heavy)
         [ "$name" = "cargo-openvm" ] && args+=(--test-threads=1)

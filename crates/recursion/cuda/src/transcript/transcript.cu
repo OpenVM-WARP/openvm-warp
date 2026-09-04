@@ -4,6 +4,7 @@
 #include "ptr_array.h"
 #include "switch_macro.h"
 #include "types.h"
+#include "util.cuh"
 
 #include <cassert>
 #include <cstddef>
@@ -85,11 +86,80 @@ __global__ void transcript_air_tracegen_kernel(
     Array<Fp, WIDTH> prev_state = states[state_idx];
 
     // For sample rows, prev_state is the post_state of the prior row. For observe rows,
-    // the first num_ops elements are overwritten with observed field elements.
+    // the first num_ops elements are overwritten with observed field elements, and the
+    // first capacity lane counts the absorbed operations (length binding, matching
+    // DuplexSponge::absorb).
     if (!is_sample) {
         for (uint8_t i = 0; i < num_ops; i++) {
             prev_state.arr[i] = transcript_values[proof_idx][tidx + i];
         }
+        prev_state.arr[CHUNK] = prev_state.arr[CHUNK] + Fp(static_cast<uint32_t>(num_ops));
+    }
+
+    COL_WRITE_ARRAY(row, TranscriptCols, prev_state, prev_state.arr);
+    COL_WRITE_ARRAY(
+        row, TranscriptCols, post_state, permuted ? states[state_idx + 1].arr : prev_state.arr
+    );
+
+    if (permuted) {
+        auto array_buffer = reinterpret_cast<Array<Fp, WIDTH> *>(poseidon2_buffer);
+        array_buffer[poseidon2_buffer_offsets[proof_idx] + state_idx] = prev_state;
+    }
+}
+
+__global__ void transcript_air_tracegen_kernel_dynamic(
+    Fp *trace,
+    size_t height,
+    const uint32_t *__restrict__ row_bounds,
+    Fp *const *__restrict__ transcript_values,
+    Fp *const *__restrict__ start_states,
+    TranscriptAirRecord *const *__restrict__ records,
+    Fp *poseidon2_buffer,
+    const uint32_t *__restrict__ poseidon2_buffer_offsets,
+    uint32_t num_proofs
+) {
+    uint32_t global_row_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (global_row_idx >= height) return;
+    RowSlice row(trace + global_row_idx, height);
+
+    uint32_t proof_idx = partition_point_leq(row_bounds, num_proofs, global_row_idx);
+    if (proof_idx >= num_proofs) {
+        row.fill_zero(0, sizeof(TranscriptCols<uint8_t>));
+        return;
+    }
+    uint32_t proof_row_start = proof_idx == 0 ? 0 : row_bounds[proof_idx - 1];
+    uint32_t row_idx = global_row_idx - proof_row_start;
+
+    auto [is_sample, permuted, num_ops, tidx, state_idx] = records[proof_idx][row_idx];
+
+    COL_WRITE_VALUE(row, TranscriptCols, proof_idx, proof_idx);
+    COL_WRITE_VALUE(row, TranscriptCols, is_proof_start, row_idx == 0);
+    COL_WRITE_VALUE(row, TranscriptCols, is_sample, is_sample);
+    COL_WRITE_VALUE(row, TranscriptCols, tidx, tidx);
+
+#pragma unroll
+    for (uint8_t i = 0; i < CHUNK; i++) {
+        COL_WRITE_VALUE(row, TranscriptCols, mask[i], i < num_ops);
+    }
+
+    // Each trace row represents 1 <= num_ops <= CHUNK operations, all of which are either
+    // samples or observes, that are followed by either 0 or 1 permutes. The sponge state
+    // is permuted after (a) 8 observes, (b) an observe that is followed by a sample, or
+    // (c) 8 samples followed by another sample. Note prev_state is the state immediately
+    // prior to the permute, while post_state is the state immediately after. If there was
+    // no permute (i.e. sample row followed by an observe), then post_state == prev_state.
+    auto states = reinterpret_cast<const Array<Fp, WIDTH> *>(start_states[proof_idx]);
+    Array<Fp, WIDTH> prev_state = states[state_idx];
+
+    // For sample rows, prev_state is the post_state of the prior row. For observe rows,
+    // the first num_ops elements are overwritten with observed field elements, and the
+    // first capacity lane counts the absorbed operations (length binding, matching
+    // DuplexSponge::absorb).
+    if (!is_sample) {
+        for (uint8_t i = 0; i < num_ops; i++) {
+            prev_state.arr[i] = transcript_values[proof_idx][tidx + i];
+        }
+        prev_state.arr[CHUNK] = prev_state.arr[CHUNK] + Fp(static_cast<uint32_t>(num_ops));
     }
 
     COL_WRITE_ARRAY(row, TranscriptCols, prev_state, prev_state.arr);
@@ -119,28 +189,54 @@ extern "C" int _transcript_air_tracegen(
     assert(width == sizeof(TranscriptCols<uint8_t>));
     auto [grid, block] = kernel_launch_params(height, 256);
 
-    SWITCH_BLOCK(
-        num_proofs,
-        NUM_PROOFS,
-        (transcript_air_tracegen_kernel<NUM_PROOFS><<<grid, block, 0, stream>>>(
-             d_trace,
-             height,
-             Array<uint32_t, NUM_PROOFS>(h_row_bounds),
-             PtrArray<Fp, NUM_PROOFS>(d_transcript_values),
-             PtrArray<Fp, NUM_PROOFS>(d_start_states),
-             PtrArray<TranscriptAirRecord, NUM_PROOFS>(d_records),
-             d_poseidon2_buffer,
-             Array<uint32_t, NUM_PROOFS>(h_poseidon2_offsets)
-        );),
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-        8
-    )
+    if (num_proofs <= 8) {
+        SWITCH_BLOCK(
+            num_proofs,
+            NUM_PROOFS,
+            (transcript_air_tracegen_kernel<NUM_PROOFS><<<grid, block, 0, stream>>>(
+                 d_trace,
+                 height,
+                 Array<uint32_t, NUM_PROOFS>(h_row_bounds),
+                 PtrArray<Fp, NUM_PROOFS>(d_transcript_values),
+                 PtrArray<Fp, NUM_PROOFS>(d_start_states),
+                 PtrArray<TranscriptAirRecord, NUM_PROOFS>(d_records),
+                 d_poseidon2_buffer,
+                 Array<uint32_t, NUM_PROOFS>(h_poseidon2_offsets)
+            );),
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8
+        )
+    } else {
+        DeviceArrayCopy<uint32_t> row_bounds(h_row_bounds, num_proofs, stream);
+        DeviceArrayCopy<Fp *> transcript_values(d_transcript_values, num_proofs, stream);
+        DeviceArrayCopy<Fp *> start_states(d_start_states, num_proofs, stream);
+        DeviceArrayCopy<TranscriptAirRecord *> records(d_records, num_proofs, stream);
+        DeviceArrayCopy<uint32_t> poseidon2_offsets(h_poseidon2_offsets, num_proofs, stream);
+        if (row_bounds.status() != cudaSuccess) return row_bounds.status();
+        if (transcript_values.status() != cudaSuccess) return transcript_values.status();
+        if (start_states.status() != cudaSuccess) return start_states.status();
+        if (records.status() != cudaSuccess) return records.status();
+        if (poseidon2_offsets.status() != cudaSuccess) return poseidon2_offsets.status();
+        int ret = cudaStreamSynchronize(stream);
+        if (ret) return ret;
+        transcript_air_tracegen_kernel_dynamic<<<grid, block, 0, stream>>>(
+            d_trace,
+            height,
+            row_bounds.get(),
+            transcript_values.get(),
+            start_states.get(),
+            records.get(),
+            d_poseidon2_buffer,
+            poseidon2_offsets.get(),
+            num_proofs
+        );
+    }
 
     return CHECK_KERNEL();
 }

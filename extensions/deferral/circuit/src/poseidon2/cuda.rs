@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use openvm_circuit::{arch::DenseRecordArena, utils::next_power_of_two_or_zero};
+use openvm_circuit::arch::DenseRecordArena;
 use openvm_circuit_primitives::Chip;
 use openvm_cuda_backend::{base::DeviceMatrix, prelude::F, GpuBackend};
 use openvm_cuda_common::{
@@ -71,56 +71,62 @@ impl DeferralPoseidon2ChipGpu {
 }
 
 impl Chip<DenseRecordArena, GpuBackend> for DeferralPoseidon2ChipGpu {
-    fn generate_proving_ctx(&self, _: DenseRecordArena) -> AirProvingContext<GpuBackend> {
+    fn generate_proving_ctx(&self, arena: DenseRecordArena) -> AirProvingContext<GpuBackend> {
+        let forced_height = arena.forced_height();
         let mut num_records = self.idx.to_host_on(&self.device_ctx).unwrap()[0] as usize;
         if num_records == 0 {
-            return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
+            let trace_height = DenseRecordArena::resolve_trace_height(forced_height, 0);
+            if trace_height == 0 {
+                return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
+            }
         }
 
         let dedup_records =
             DeviceBuffer::<F>::with_capacity_on(num_records * DIGEST_SIZE * 2, &self.device_ctx);
         let dedup_counts =
             DeviceBuffer::<DeferralPoseidon2Count>::with_capacity_on(num_records, &self.device_ctx);
-        unsafe {
-            let d_num_records = [num_records].to_device_on(&self.device_ctx).unwrap();
-            let mut temp_bytes = 0;
-            poseidon2::deduplicate_records_get_temp_bytes(
-                &self.records,
-                &self.counts,
-                num_records,
-                &d_num_records,
-                &mut temp_bytes,
-                self.device_ctx.stream.as_raw(),
-            )
-            .expect("Failed to get deferral poseidon2 temp bytes");
+        if num_records != 0 {
+            unsafe {
+                let d_num_records = [num_records].to_device_on(&self.device_ctx).unwrap();
+                let mut temp_bytes = 0;
+                poseidon2::deduplicate_records_get_temp_bytes(
+                    &self.records,
+                    &self.counts,
+                    num_records,
+                    &d_num_records,
+                    &mut temp_bytes,
+                    self.device_ctx.stream.as_raw(),
+                )
+                .expect("Failed to get deferral poseidon2 temp bytes");
 
-            let d_temp_storage = if temp_bytes == 0 {
-                DeviceBuffer::<u8>::new()
-            } else {
-                DeviceBuffer::<u8>::with_capacity_on(temp_bytes, &self.device_ctx)
-            };
+                let d_temp_storage = if temp_bytes == 0 {
+                    DeviceBuffer::<u8>::new()
+                } else {
+                    DeviceBuffer::<u8>::with_capacity_on(temp_bytes, &self.device_ctx)
+                };
 
-            poseidon2::deduplicate_records(
-                &self.records,
-                &self.counts,
-                &dedup_records,
-                &dedup_counts,
-                num_records,
-                &d_num_records,
-                &d_temp_storage,
-                temp_bytes,
-                self.device_ctx.stream.as_raw(),
-            )
-            .expect("Failed to deduplicate deferral poseidon2 records");
+                poseidon2::deduplicate_records(
+                    &self.records,
+                    &self.counts,
+                    &dedup_records,
+                    &dedup_counts,
+                    num_records,
+                    &d_num_records,
+                    &d_temp_storage,
+                    temp_bytes,
+                    self.device_ctx.stream.as_raw(),
+                )
+                .expect("Failed to deduplicate deferral poseidon2 records");
 
-            num_records = *d_num_records
-                .to_host_on(&self.device_ctx)
-                .unwrap()
-                .first()
-                .unwrap();
+                num_records = *d_num_records
+                    .to_host_on(&self.device_ctx)
+                    .unwrap()
+                    .first()
+                    .unwrap();
+            }
         }
 
-        let trace_height = next_power_of_two_or_zero(num_records);
+        let trace_height = DenseRecordArena::resolve_trace_height(forced_height, num_records);
         let trace = DeviceMatrix::<F>::with_capacity_on(
             trace_height,
             Self::trace_width(),

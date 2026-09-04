@@ -3,10 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use openvm_circuit::{
-    arch::{DenseRecordArena, RecordSeeker},
-    utils::next_power_of_two_or_zero,
-};
+use openvm_circuit::arch::{DenseRecordArena, RecordSeeker};
 use openvm_circuit_primitives::{
     bitwise_op_lookup::BitwiseOperationLookupChipGPU, var_range::VariableRangeCheckerChipGPU, Chip,
 };
@@ -28,7 +25,6 @@ pub struct Sha2SharedRecordsGpu {
 pub struct Sha2MainChipGpu<C: Sha2Config> {
     records: Arc<Mutex<Option<Sha2SharedRecordsGpu>>>,
     range_checker: Arc<VariableRangeCheckerChipGPU>,
-    bitwise_lookup: Arc<BitwiseOperationLookupChipGPU<8>>,
     pointer_max_bits: u32,
     timestamp_max_bits: u32,
     _marker: PhantomData<C>,
@@ -38,14 +34,12 @@ impl<C: Sha2Config> Sha2MainChipGpu<C> {
     pub fn new(
         records: Arc<Mutex<Option<Sha2SharedRecordsGpu>>>,
         range_checker: Arc<VariableRangeCheckerChipGPU>,
-        bitwise_lookup: Arc<BitwiseOperationLookupChipGPU<8>>,
         pointer_max_bits: u32,
         timestamp_max_bits: u32,
     ) -> Self {
         Self {
             records,
             range_checker,
-            bitwise_lookup,
             pointer_max_bits,
             timestamp_max_bits,
             _marker: PhantomData,
@@ -58,10 +52,8 @@ where
     C: Sha2Config,
 {
     fn generate_proving_ctx(&self, mut arena: DenseRecordArena) -> AirProvingContext<GpuBackend> {
+        let forced_height = arena.forced_height();
         let records = arena.allocated_mut();
-        if records.is_empty() {
-            return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
-        }
 
         let mut record_offsets = Vec::<usize>::new();
         let mut offset = 0usize;
@@ -75,7 +67,11 @@ where
         }
 
         let num_records = record_offsets.len();
-        let trace_height = next_power_of_two_or_zero(num_records);
+        let trace_height = DenseRecordArena::resolve_trace_height(forced_height, num_records);
+        if trace_height == 0 {
+            *self.records.lock().unwrap() = None;
+            return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
+        }
         let device_ctx = &self.range_checker.device_ctx;
         let trace =
             DeviceMatrix::<F>::with_capacity_on(trace_height, C::MAIN_CHIP_WIDTH, device_ctx);
@@ -94,8 +90,6 @@ where
                         &d_record_offsets,
                         self.pointer_max_bits,
                         &self.range_checker.count,
-                        &self.bitwise_lookup.count,
-                        8,
                         self.timestamp_max_bits,
                         device_ctx.stream.as_raw(),
                     )
@@ -110,8 +104,6 @@ where
                         &d_record_offsets,
                         self.pointer_max_bits,
                         &self.range_checker.count,
-                        &self.bitwise_lookup.count,
-                        8,
                         self.timestamp_max_bits,
                         device_ctx.stream.as_raw(),
                     )
@@ -135,34 +127,37 @@ where
 pub struct Sha2BlockHasherChipGpu<C: Sha2Config> {
     records: Arc<Mutex<Option<Sha2SharedRecordsGpu>>>,
     bitwise_lookup: Arc<BitwiseOperationLookupChipGPU<8>>,
+    /// Range checker for digest-row `final_hash` limbs.
+    pub range_checker: Arc<VariableRangeCheckerChipGPU>,
     _marker: PhantomData<C>,
 }
 
-impl<C, R> Chip<R, GpuBackend> for Sha2BlockHasherChipGpu<C>
+impl<C> Chip<DenseRecordArena, GpuBackend> for Sha2BlockHasherChipGpu<C>
 where
     C: Sha2Config,
 {
     /// We don't use the record arena associated with this chip. Instead, we will use the record
     /// arena provided by the main chip, which will be passed to this chip after the main chip's
     /// tracegen is done.
-    fn generate_proving_ctx(&self, _: R) -> AirProvingContext<GpuBackend> {
+    fn generate_proving_ctx(&self, arena: DenseRecordArena) -> AirProvingContext<GpuBackend> {
         let mut records = self.records.lock().unwrap();
-        if records.is_none() {
+        let shared = records.take();
+        let num_records = shared.as_ref().map_or(0, |shared| shared.num_records);
+        let rows_used = num_records * C::ROWS_PER_BLOCK;
+        let trace_height = arena.trace_height_for_rows(rows_used);
+        if trace_height == 0 {
             return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
         }
-
         let Sha2SharedRecordsGpu {
             d_records,
             d_record_offsets,
             num_records,
-        } = records.take().unwrap();
+        } = shared.unwrap_or_else(|| Sha2SharedRecordsGpu {
+            d_records: DeviceBuffer::new(),
+            d_record_offsets: DeviceBuffer::new(),
+            num_records: 0,
+        });
 
-        if num_records == 0 {
-            return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
-        }
-
-        let rows_used = num_records * C::ROWS_PER_BLOCK;
-        let trace_height = next_power_of_two_or_zero(rows_used);
         let device_ctx = &self.bitwise_lookup.device_ctx;
         let trace =
             DeviceMatrix::<F>::with_capacity_on(trace_height, C::BLOCK_HASHER_WIDTH, device_ctx);
@@ -207,8 +202,8 @@ where
                         num_blocks,
                         &d_prev_hashes,
                         &self.bitwise_lookup.count,
-                        8,
                         &d_scratch,
+                        &self.range_checker.count,
                         device_ctx.stream.as_raw(),
                     )
                     .unwrap();
@@ -263,8 +258,8 @@ where
                         num_blocks,
                         &d_prev_hashes,
                         &self.bitwise_lookup.count,
-                        8,
                         &d_scratch,
+                        &self.range_checker.count,
                         device_ctx.stream.as_raw(),
                     )
                     .unwrap();
@@ -296,10 +291,12 @@ impl<C: Sha2Config> Sha2BlockHasherChipGpu<C> {
     pub fn new(
         records: Arc<Mutex<Option<Sha2SharedRecordsGpu>>>,
         bitwise_lookup: Arc<BitwiseOperationLookupChipGPU<8>>,
+        range_checker: Arc<VariableRangeCheckerChipGPU>,
     ) -> Self {
         Self {
             records,
             bitwise_lookup,
+            range_checker,
             _marker: PhantomData,
         }
     }

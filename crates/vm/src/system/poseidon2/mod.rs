@@ -49,6 +49,13 @@ impl<F: VmField> Poseidon2PeripheryChip<F> {
             Self::Register1(Poseidon2PeripheryBaseChip::new(poseidon2_config))
         }
     }
+
+    pub fn set_forced_height(&self, height: usize) {
+        match self {
+            Self::Register0(chip) => chip.set_forced_height(height),
+            Self::Register1(chip) => chip.set_forced_height(height),
+        }
+    }
 }
 
 pub fn new_poseidon2_periphery_air<SC>(

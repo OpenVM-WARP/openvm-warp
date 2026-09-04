@@ -79,6 +79,7 @@ pub struct GkrInputAir {
     pub xi_sampler_bus: GkrXiSamplerBus,
     pub constraints_folding_input_bus: ConstraintsFoldingInputBus,
     pub interactions_folding_input_bus: InteractionsFoldingInputBus,
+    pub includes_air: bool,
 }
 
 impl<F: Field> BaseAir<F> for GkrInputAir {
@@ -310,12 +311,14 @@ impl<AB: AirBuilder + InteractionBuilder> Air<AB> for GkrInputAir {
             local.is_enabled,
         );
 
-        self.constraints_folding_input_bus.send(
-            builder,
-            local.proof_idx,
-            ConstraintsFoldingInputMessage { tidx: tidx_end },
-            local.is_enabled,
-        );
+        if self.includes_air {
+            self.constraints_folding_input_bus.send(
+                builder,
+                local.proof_idx,
+                ConstraintsFoldingInputMessage { tidx: tidx_end },
+                local.is_enabled,
+            );
+        }
         self.interactions_folding_input_bus.send(
             builder,
             local.proof_idx,

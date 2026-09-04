@@ -18,11 +18,25 @@ where
     /// Generates trace and clears internal records state.
     fn generate_proving_ctx(&self, _: RA) -> AirProvingContext<CpuBackend<SC>> {
         let width = Poseidon2PeripheryCols::<Val<SC>, SBOX_REGISTERS>::width();
-        if !self.nonempty.load(std::sync::atomic::Ordering::Relaxed) {
+        let forced_height = self.take_forced_height();
+        let natural_height = if self.nonempty.load(std::sync::atomic::Ordering::Relaxed) {
+            next_power_of_two_or_zero(self.records.len())
+        } else {
+            0
+        };
+        let height = if forced_height == 0 {
+            natural_height
+        } else {
+            assert!(
+                forced_height >= natural_height,
+                "forced Poseidon2 trace height {forced_height} is below natural height {natural_height}"
+            );
+            forced_height
+        };
+        if height == 0 {
             let trace = RowMajorMatrix::new(vec![], width);
             return AirProvingContext::simple_no_pis(trace);
         }
-        let height = next_power_of_two_or_zero(self.records.len());
 
         let mut inputs = Vec::with_capacity(height);
         let mut multiplicities = Vec::with_capacity(height);

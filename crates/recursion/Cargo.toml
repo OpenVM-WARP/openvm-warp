@@ -1,13 +1,9 @@
 [package]
 name = "openvm-recursion-circuit"
-description = "OpenVM STARK recursion (sub-)circuit"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
-rust-version.workspace = true
-homepage.workspace = true
-repository.workspace = true
-license.workspace = true
+description = "OpenVM STARK recursion (sub-)circuit"
 
 [dependencies]
 p3-maybe-rayon.workspace = true
@@ -29,6 +25,7 @@ tracing.workspace = true
 derive-new.workspace = true
 strum.workspace = true
 strum_macros.workspace = true
+serde.workspace = true
 
 openvm-cuda-common = { workspace = true, optional = true }
 openvm-cuda-backend = { workspace = true, optional = true }

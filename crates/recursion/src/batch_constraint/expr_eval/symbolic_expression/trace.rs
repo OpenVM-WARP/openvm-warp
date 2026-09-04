@@ -418,6 +418,19 @@ pub struct CachedTraceRecord {
     pub dag_commit_info: Option<DagCommitInfo<F>>,
 }
 
+impl CachedTraceRecord {
+    /// Reconstruct the setup-owned cached symbolic-expression table.
+    ///
+    /// The recursive prover commits this exact matrix as the child-VK cached
+    /// trace.  Exposing the deterministic reconstruction lets other proving
+    /// protocols authenticate openings against the same setup table without
+    /// copying values out of a backend-specific committed matrix.
+    #[must_use]
+    pub fn to_cached_trace_matrix(&self) -> RowMajorMatrix<F> {
+        generate_symbolic_expr_cached_trace(self)
+    }
+}
+
 pub(crate) fn build_cached_trace_record(
     child_vk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
     has_cached: bool,

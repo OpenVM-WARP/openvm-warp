@@ -162,7 +162,7 @@ Below, each AIR lists every bus it touches. Direction: S=send, R=receive, P=prov
 **EqSharpUniAir**
 - `XiRandomnessBus` (R)
 - `EqSharpUniBus` (S, R)
-- `BatchConstraintConductorBus` (P)
+- `BatchConstraintConductorBus` (L, P)
 
 **EqSharpUniReceiverAir**
 - `BatchConstraintConductorBus` (L)
@@ -295,7 +295,7 @@ Below, each AIR lists every bus it touches. Direction: S=send, R=receive, P=prov
 - `ColumnClaimsBus` (S)
 - `TranscriptBus` (R)
 - `AirShapeBus` (L)
-- `StackingModuleTidxBus` (S)
+- `StackingModuleTidxBus` (S, R)
 - `ClaimCoefficientsBus` (S)
 - `SumcheckClaimsBus` (S)
 - `EqKernelLookupBus` (L)
@@ -306,6 +306,7 @@ Below, each AIR lists every bus it touches. Direction: S=send, R=receive, P=prov
 - `StackingModuleTidxBus` (R, S)
 - `SumcheckClaimsBus` (R, S)
 - `EqRandValuesLookupBus` (P)
+- `EqKernelLookupBus` (L)
 
 **SumcheckRoundsAir**
 - `ConstraintSumcheckRandomnessBus` (R)

@@ -23,7 +23,7 @@ use crate::{
         MemoryConfig,
     },
     system::{
-        memory::{merkle::MerkleTree, AddressMap, CHUNK},
+        memory::{merkle::MerkleTree, AddressMap, DIGEST_WIDTH},
         program::ProgramChip,
     },
 };
@@ -64,22 +64,34 @@ impl<SC: StarkProtocolConfig> Chip<(), CpuBackend<SC>> for ProgramChip<SC> {
 ///
 /// **Note**: This function recomputes the Merkle tree for the initial memory image.
 pub fn compute_exe_commit_from_mem_config<F: PrimeField32>(
-    program_commitment: &[F; CHUNK],
+    program_commitment: &[F; DIGEST_WIDTH],
     exe: &VmExe<F>,
     memory_config: &MemoryConfig,
-) -> [F; CHUNK] {
+) -> [F; DIGEST_WIDTH] {
     let hasher = vm_poseidon2_hasher();
-    let memory_dimensions = memory_config.memory_dimensions();
-    let mut memory_image = AddressMap::new(memory_config.addr_spaces.clone());
-    memory_image.set_from_sparse(&exe.init_memory);
-    let init_memory_commit =
-        MerkleTree::from_memory(&memory_image, &memory_dimensions, &hasher).root();
+    let init_memory_commit = compute_initial_memory_commit_from_mem_config(exe, memory_config);
     compute_exe_commit(
         &hasher,
         program_commitment,
         &init_memory_commit,
         F::from_u32(exe.pc_start),
     )
+}
+
+/// Computes the Merkle root of an executable's initial memory image using the
+/// VM's configured address-space dimensions.
+///
+/// This is exposed separately so proof systems can bind their own VM-state
+/// digest to the same initial memory root used by [`compute_exe_commit`].
+pub fn compute_initial_memory_commit_from_mem_config<F: PrimeField32>(
+    exe: &VmExe<F>,
+    memory_config: &MemoryConfig,
+) -> [F; DIGEST_WIDTH] {
+    let hasher = vm_poseidon2_hasher();
+    let memory_dimensions = memory_config.memory_dimensions();
+    let mut memory_image = AddressMap::new(memory_config.addr_spaces.clone());
+    memory_image.set_from_sparse(&exe.init_memory);
+    MerkleTree::from_memory(&memory_image, &memory_dimensions, &hasher).root()
 }
 
 /// Computes a Merklelized hash of:
@@ -91,11 +103,11 @@ pub fn compute_exe_commit_from_mem_config<F: PrimeField32>(
 /// and a cryptographic compression function (for internal nodes).
 pub fn compute_exe_commit<F: PrimeField32>(
     hasher: &Poseidon2Hasher<F>,
-    program_commit: &[F; CHUNK],
-    init_memory_root: &[F; CHUNK],
+    program_commit: &[F; DIGEST_WIDTH],
+    init_memory_root: &[F; DIGEST_WIDTH],
     pc_start: F,
-) -> [F; CHUNK] {
-    let mut padded_pc_start = [F::ZERO; CHUNK];
+) -> [F; DIGEST_WIDTH] {
+    let mut padded_pc_start = [F::ZERO; DIGEST_WIDTH];
     padded_pc_start[0] = pc_start;
     let program_hash = hasher.hash(program_commit);
     let memory_hash = hasher.hash(init_memory_root);

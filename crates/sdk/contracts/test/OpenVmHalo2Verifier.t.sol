@@ -2,18 +2,15 @@
 pragma solidity 0.8.19;
 
 import { LibString } from "./helpers/LibString.sol";
-import { Test, console2, safeconsole as console, stdError } from "forge-std/Test.sol";
+import { Test, console2, safeconsole as console } from "forge-std/Test.sol";
 import { IOpenVmHalo2Verifier } from "../src/IOpenVmHalo2Verifier.sol";
 
 contract TemplateTest is Test {
-    // BN254 scalar field modulus (Fr), as specified in EIP-197:
-    // https://eips.ethereum.org/EIPS/eip-197
-    uint256 constant BN254_SCALAR_MODULUS = 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001;
-
     bytes proofData;
-    bytes32 appExeCommit = 0x2222222222222222222222222222222222222222222222222222222222222222;
-    bytes32 appVmCommit = 0x1111111111111111111111111111111111111111111111111111111111111111;
+    bytes32 appExeCommit = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF;
+    bytes32 appVmCommit = 0xEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE;
     bytes guestPvs;
+
     uint256 publicValuesLength;
     uint256 fullProofWords;
     uint256 fullProofLength;
@@ -44,8 +41,9 @@ contract TemplateTest is Test {
 
         IOpenVmHalo2Verifier verifier = _compileAndDeployOpenVmVerifier(publicValuesLength);
 
-        (bool success,) = address(verifier)
-            .delegatecall(abi.encodeCall(IOpenVmHalo2Verifier.verify, (guestPvs, proofData, appExeCommit, appVmCommit)));
+        (bool success,) = address(verifier).delegatecall(
+            abi.encodeCall(IOpenVmHalo2Verifier.verify, (guestPvs, proofData, appExeCommit, appVmCommit))
+        );
         require(success, "Verification failed");
     }
 
@@ -116,100 +114,10 @@ contract TemplateTest is Test {
         verifier.verify(pvs, _proofData, appExeCommit, appVmCommit);
     }
 
-    function test_RevertWhen_InvalidAppExeCommit() public {
-        publicValuesLength = 32;
-        IOpenVmHalo2Verifier verifier = _compileAndDeployOpenVmVerifier(publicValuesLength);
-
-        bytes memory pvs = new bytes(publicValuesLength);
-        bytes memory _proofData = new bytes(55 * 32);
-        bytes32 invalidAppExeCommit = bytes32(BN254_SCALAR_MODULUS);
-        bytes4 sig = bytes4(keccak256("InvalidAppExeCommit(bytes32)"));
-
-        vm.expectRevert(abi.encodeWithSelector(sig, invalidAppExeCommit));
-        verifier.verify(pvs, _proofData, invalidAppExeCommit, appVmCommit);
-    }
-
-    function test_RevertWhen_InvalidAppVmCommit() public {
-        publicValuesLength = 32;
-        IOpenVmHalo2Verifier verifier = _compileAndDeployOpenVmVerifier(publicValuesLength);
-
-        bytes memory pvs = new bytes(publicValuesLength);
-        bytes memory _proofData = new bytes(55 * 32);
-        bytes32 invalidAppVmCommit = bytes32(BN254_SCALAR_MODULUS);
-        bytes4 sig = bytes4(keccak256("InvalidAppVmCommit(bytes32)"));
-
-        vm.expectRevert(abi.encodeWithSelector(sig, invalidAppVmCommit));
-        verifier.verify(pvs, _proofData, appExeCommit, invalidAppVmCommit);
-    }
-
-    function test_OnlyVerifySelectorIsExposed() public {
-        bytes memory methodIdentifiers = _compiledOpenVmVerifierMethodIdentifiers(32);
-        assertEq(string(methodIdentifiers), "24270d54: verify(bytes,bytes,bytes32,bytes32)");
-    }
-
-    function test_RevertWhen_ProofDataPrefixIsNonZero() public {
-        publicValuesLength = 32;
-        IOpenVmHalo2Verifier verifier = _compileAndDeployOpenVmVerifier(publicValuesLength);
-
-        bytes memory pvs = new bytes(publicValuesLength);
-        bytes memory invalidProofData = proofData;
-        invalidProofData[0] = bytes1(uint8(1));
-
-        vm.expectRevert(stdError.assertionError);
-        verifier.verify(pvs, invalidProofData, appExeCommit, appVmCommit);
-    }
-
-    function test_Bn254ScalarModulusMatchesEcmulPrecompile() public view {
-        (uint256 qx, uint256 qy) = _ecMul(1, 2, BN254_SCALAR_MODULUS);
-        assertEq(qx, 0, "q * G should be point at infinity");
-        assertEq(qy, 0, "q * G should be point at infinity");
-
-        (uint256 qPlusOneX, uint256 qPlusOneY) = _ecMul(1, 2, BN254_SCALAR_MODULUS + 1);
-        assertEq(qPlusOneX, 1, "(q + 1) * G should wrap to G");
-        assertEq(qPlusOneY, 2, "(q + 1) * G should wrap to G");
-    }
-
     function _compileAndDeployOpenVmVerifier(uint256 _publicValuesLength)
         private
         returns (IOpenVmHalo2Verifier verifier)
     {
-        string memory inlinedCode = _inlinedOpenVmVerifierCode(_publicValuesLength);
-
-        // Must use solc 0.8.19
-        string[] memory commands = new string[](3);
-        commands[0] = "sh";
-        commands[1] = "-c";
-        commands[2] = string.concat(
-            "cat <<'SOL' | solc --no-optimize-yul --bin --optimize --optimize-runs 100000 - ",
-            " | awk 'BEGIN{found=0} /:OpenVmHalo2Verifier/ {found=1; next} found && /^Binary:/ {getline; print; exit}'\n",
-            inlinedCode,
-            "\nSOL\n"
-        );
-
-        bytes memory compiledVerifier = vm.ffi(commands);
-
-        assembly {
-            verifier := create(0, add(compiledVerifier, 0x20), mload(compiledVerifier))
-            if iszero(extcodesize(verifier)) { revert(0, 0) }
-        }
-    }
-
-    function _compiledOpenVmVerifierMethodIdentifiers(uint256 _publicValuesLength) private returns (bytes memory) {
-        string memory inlinedCode = _inlinedOpenVmVerifierCode(_publicValuesLength);
-
-        string[] memory commands = new string[](3);
-        commands[0] = "sh";
-        commands[1] = "-c";
-        commands[2] = string.concat(
-            "cat <<'SOL' | solc --combined-json hashes - | jq -r '.contracts[\"<stdin>:OpenVmHalo2Verifier\"].hashes | to_entries | sort_by(.key) | map(\"\\(.value): \\(.key)\") | join(\"\\n\")'\n",
-            inlinedCode,
-            "\nSOL\n"
-        );
-
-        return vm.ffi(commands);
-    }
-
-    function _inlinedOpenVmVerifierCode(uint256 _publicValuesLength) private view returns (string memory) {
         string memory code = LibString.replace(_code, "{PUBLIC_VALUES_LENGTH}", LibString.toString(_publicValuesLength));
 
         // `code` will look like this:
@@ -224,16 +132,30 @@ contract TemplateTest is Test {
         //
         // We want to replace the `import` statements with inlined deps for JIT
         // compilation.
-        return LibString.replace(
+        string memory inlinedCode = LibString.replace(
             code,
             "import { Halo2Verifier } from \"./Halo2Verifier.sol\";\nimport { IOpenVmHalo2Verifier } from \"./interfaces/IOpenVmHalo2Verifier.sol\";",
             deps
         );
-    }
 
-    function _ecMul(uint256 x, uint256 y, uint256 scalar) private view returns (uint256 rx, uint256 ry) {
-        (bool success, bytes memory result) = address(0x07).staticcall(abi.encode(x, y, scalar));
-        require(success, "ecmul precompile failed");
-        (rx, ry) = abi.decode(result, (uint256, uint256));
+        // Must use solc 0.8.19
+        string[] memory commands = new string[](3);
+        commands[0] = "sh";
+        commands[1] = "-c";
+        commands[2] = string.concat(
+            "echo ",
+            "'",
+            inlinedCode,
+            "'",
+            " | solc --no-optimize-yul --bin --optimize --optimize-runs 100000 - ",
+            " | awk 'BEGIN{found=0} /:OpenVmHalo2Verifier/ {found=1; next} found && /^Binary:/ {getline; print; exit}'"
+        );
+
+        bytes memory compiledVerifier = vm.ffi(commands);
+
+        assembly {
+            verifier := create(0, add(compiledVerifier, 0x20), mload(compiledVerifier))
+            if iszero(extcodesize(verifier)) { revert(0, 0) }
+        }
     }
 }

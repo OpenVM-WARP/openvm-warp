@@ -1,10 +1,8 @@
 [package]
 name = "openvm-instructions"
-description = "OpenVM instruction, opcode, program, and executable types."
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 homepage.workspace = true
 repository.workspace = true
 license.workspace = true

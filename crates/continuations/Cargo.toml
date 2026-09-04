@@ -1,19 +1,16 @@
 [package]
 name = "openvm-continuations"
-description = "Continuation AIRs and utilities"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
-rust-version.workspace = true
-homepage.workspace = true
-repository.workspace = true
-license.workspace = true
+description = "Continuation AIRs and utilities"
 
 [dependencies]
 p3-air = { workspace = true }
 p3-bn254 = { workspace = true, optional = true }
 p3-field = { workspace = true }
 p3-matrix = { workspace = true }
+p3-maybe-rayon = { workspace = true }
 openvm-recursion-circuit = { workspace = true }
 openvm-recursion-circuit-derive = { workspace = true }
 openvm-verify-stark-host = { workspace = true }
@@ -27,24 +24,23 @@ openvm-poseidon2-air = { workspace = true }
 itertools.workspace = true
 tracing.workspace = true
 eyre.workspace = true
+serde.workspace = true
 derive-new.workspace = true
-derivative.workspace = true
 cfg-if.workspace = true
 num-bigint.workspace = true
-hex.workspace = true
-serde.workspace = true
-thiserror.workspace = true
 
 openvm-cuda-common = { workspace = true, optional = true }
 openvm-cuda-backend = { workspace = true, optional = true }
 
 [dev-dependencies]
-openvm-rv32im-circuit = { path = "../../extensions/rv32im/circuit", default-features = false, features = ["test-utils"] }
-openvm-rv32im-transpiler = { path = "../../extensions/rv32im/transpiler", default-features = false }
-openvm-deferral-circuit = { path = "../../extensions/deferral/circuit", default-features = false }
-openvm-deferral-transpiler = { path = "../../extensions/deferral/transpiler", default-features = false }
-openvm-transpiler = { path = "../toolchain/transpiler", default-features = false }
+openvm-stark-backend = { workspace = true, features = ["test-utils"] }
+openvm-riscv-circuit = { workspace = true, features = ["test-utils"] }
+openvm-riscv-transpiler = { workspace = true }
+openvm-deferral-circuit = { workspace = true }
+openvm-deferral-transpiler = { workspace = true }
+openvm-transpiler = { workspace = true }
 test-case = { workspace = true }
+serde_json = { workspace = true }
 
 [features]
 default = ["parallel"]
@@ -53,7 +49,11 @@ root-prover = [
     "openvm-stark-sdk/baby-bear-bn254-poseidon2",
     "openvm-cuda-backend?/baby-bear-bn254-poseidon2",
 ]
-parallel = ["openvm-circuit/parallel", "openvm-recursion-circuit/parallel"]
+parallel = [
+    "p3-maybe-rayon/parallel",
+    "openvm-circuit/parallel",
+    "openvm-recursion-circuit/parallel",
+]
 metrics = ["openvm-circuit/metrics"]
 
 cuda = [
@@ -61,7 +61,7 @@ cuda = [
     "dep:openvm-cuda-backend",
     "openvm-circuit-primitives/cuda",
     "openvm-circuit/cuda",
-    "openvm-rv32im-circuit/cuda",
+    "openvm-riscv-circuit/cuda",
     "openvm-deferral-circuit/cuda",
     "openvm-recursion-circuit/cuda",
 ]

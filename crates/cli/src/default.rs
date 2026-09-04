@@ -1,6 +1,6 @@
 use std::env;
 
-use openvm_sdk::{config::AppConfig, OPENVM_VERSION};
+use openvm_sdk::config::AppConfig;
 use openvm_sdk_config::SdkVmConfig;
 use openvm_stark_sdk::config::{app_params_with_100_bits_security, MAX_APP_LOG_STACKED_HEIGHT};
 
@@ -20,44 +20,36 @@ pub const EVM_PROOF_EXT: &str = "evm.proof";
 pub const COMMIT_JSON_EXT: &str = "commit.json";
 pub const BASELINE_JSON_EXT: &str = "baseline.json";
 
-fn versioned_openvm_dir(home: &str) -> String {
-    format!("{home}/.openvm/v{OPENVM_VERSION}/")
-}
-
-fn default_versioned_openvm_dir() -> String {
-    versioned_openvm_dir(&env::var("HOME").unwrap())
-}
-
 pub fn default_params_dir() -> String {
     env::var("HOME").unwrap() + "/.openvm/params/"
 }
 
 pub fn default_internal_recursive_pk_path() -> String {
-    default_versioned_openvm_dir() + "internal_recursive.pk"
+    env::var("HOME").unwrap() + "/.openvm/internal_recursive.pk"
 }
 
 pub fn default_internal_recursive_vk_path() -> String {
-    default_versioned_openvm_dir() + "internal_recursive.vk"
+    env::var("HOME").unwrap() + "/.openvm/internal_recursive.vk"
 }
 
 pub fn default_root_pk_path() -> String {
-    default_versioned_openvm_dir() + "root.pk"
+    env::var("HOME").unwrap() + "/.openvm/root.pk"
 }
 
 pub fn default_halo2_pk_path() -> String {
-    default_versioned_openvm_dir() + "halo2.pk"
+    env::var("HOME").unwrap() + "/.openvm/halo2.pk"
 }
 
 pub fn default_evm_halo2_verifier_path() -> String {
-    default_versioned_openvm_dir() + "halo2/"
+    env::var("HOME").unwrap() + "/.openvm/halo2/"
 }
 
 pub fn default_app_config() -> AppConfig<SdkVmConfig> {
     AppConfig {
         app_vm_config: SdkVmConfig::builder()
             .system(Default::default())
-            .rv32i(Default::default())
-            .rv32m(Default::default())
+            .rv64i(Default::default())
+            .rv64m(Default::default())
             .io(Default::default())
             .build(),
         system_params: app_params_with_100_bits_security(MAX_APP_LOG_STACKED_HEIGHT),

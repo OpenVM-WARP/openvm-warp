@@ -1,24 +1,23 @@
 #!/bin/bash
 
 # Download ~/.openvm setup artifacts
-FULL_VERSION="2.1.0"
-OPENVM_VERSION="${FULL_VERSION%.*}"
-CACHE_DIR="$HOME/.openvm/v$OPENVM_VERSION"
-HALO2_DIR="halo2/src/v$OPENVM_VERSION-base"
-mkdir -p "$CACHE_DIR/$HALO2_DIR/interfaces"
+HALO2_DIR="halo2/src/v2.0"
+mkdir -p ~/.openvm
+mkdir -p ~/.openvm/$HALO2_DIR
+mkdir -p ~/.openvm/$HALO2_DIR/interfaces
 mkdir -p ~/.openvm/params
 
-BASE_URL="https://openvm-public-artifacts-us-east-1.s3.us-east-1.amazonaws.com/v$FULL_VERSION"
+BASE_URL="https://openvm-public-artifacts-us-east-1.s3.us-east-1.amazonaws.com/v2.0.0-beta.2"
 
-for file in "internal_recursive.pk" "internal_recursive.vk" "root.pk" "halo2.pk"; do
+for file in "agg_stark.pk" "agg_stark.vk" "agg_halo2.pk" "root.asm"; do
     URL="$BASE_URL/$file"
-    LOCAL="$CACHE_DIR/$file"
+    LOCAL=~/.openvm/$file
     wget "$URL" -O "$LOCAL" || curl -L "$URL" -o "$LOCAL"
 done
 
 for file in "Halo2Verifier.sol" "interfaces/IOpenVmHalo2Verifier.sol" "OpenVmHalo2Verifier.sol" "verifier.bytecode.json"; do
     URL="$BASE_URL/$HALO2_DIR/$file"
-    LOCAL="$CACHE_DIR/$HALO2_DIR/$file"
+    LOCAL=~/.openvm/$HALO2_DIR/$file
     wget "$URL" -O "$LOCAL" || curl -L "$URL" -o "$LOCAL"
 done
 

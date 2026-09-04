@@ -60,6 +60,24 @@ pub struct ExpBitsLenCpuTraceGenerator {
 }
 
 impl ExpBitsLenCpuTraceGenerator {
+    /// Append an independently generated request stream in its original order.
+    ///
+    /// Row offsets are local witness bookkeeping, not lookup values. Rebuild
+    /// them while appending so the merged trace is byte-for-byte identical to
+    /// registering the two streams sequentially.
+    pub fn merge_from(&self, other: Self) {
+        let requests = other.requests.into_inner().unwrap();
+        self.add_requests_with_shift(requests.into_iter().map(|request| {
+            (
+                request.base,
+                request.bit_src,
+                usize::from(request.num_bits),
+                usize::from(request.shift_bits),
+                request.shift_mult,
+            )
+        }));
+    }
+
     pub fn add_request(&self, base: F, bit_src: F, num_bits: usize) {
         self.add_requests([(base, bit_src, num_bits)]);
     }

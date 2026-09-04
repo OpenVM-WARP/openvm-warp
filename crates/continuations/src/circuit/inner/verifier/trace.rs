@@ -33,6 +33,7 @@ pub fn generate_proving_ctx(
     child_is_app: bool,
     child_vk_commit: VkCommit<F>,
     deferral_enabled: bool,
+    required_height: Option<usize>,
 ) -> SingleAirTraceData<CpuBackend<BabyBearPoseidon2Config>> {
     let num_proofs = proofs.len();
     debug_assert!(num_proofs > 0);
@@ -56,7 +57,12 @@ pub fn generate_proving_ctx(
         };
     }
 
-    let height = num_proofs.next_power_of_two();
+    let natural_height = num_proofs.next_power_of_two();
+    let height = required_height.unwrap_or(natural_height);
+    assert!(
+        height.is_power_of_two() && height >= natural_height,
+        "fixed verifier-PVS height must be a power of two at least the natural height"
+    );
     let base_width = VerifierPvsCols::<u8>::width();
     let def_width = if deferral_enabled {
         VerifierDeferralCols::<u8>::width()

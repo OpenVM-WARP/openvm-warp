@@ -49,6 +49,35 @@ __global__ void public_values_tracegen(
     }
 }
 
+__global__ void public_values_tracegen_dynamic(
+    Fp *trace,
+    size_t height,
+    PublicValueData *const *__restrict__ pvs_data,
+    size_t *const *__restrict__ pvs_tidx,
+    size_t num_proofs,
+    size_t num_pvs
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    RowSlice row(trace + idx, height);
+    if (idx < num_proofs * num_pvs) {
+        size_t proof_idx = idx / num_pvs;
+        size_t record_idx = idx % num_pvs;
+        PublicValueData pv_data = pvs_data[proof_idx][record_idx];
+        size_t starting_tidx = pvs_tidx[proof_idx][pv_data.air_idx];
+
+        COL_WRITE_VALUE(row, PublicValuesCols, is_valid, Fp::one());
+        COL_WRITE_VALUE(row, PublicValuesCols, proof_idx, proof_idx);
+        COL_WRITE_VALUE(row, PublicValuesCols, air_idx, pv_data.air_idx);
+        COL_WRITE_VALUE(row, PublicValuesCols, pv_idx, pv_data.pv_idx);
+        COL_WRITE_VALUE(row, PublicValuesCols, is_first_in_proof, record_idx == 0);
+        COL_WRITE_VALUE(row, PublicValuesCols, is_first_in_air, pv_data.pv_idx == 0);
+        COL_WRITE_VALUE(row, PublicValuesCols, tidx, starting_tidx + pv_data.pv_idx);
+        COL_WRITE_VALUE(row, PublicValuesCols, value, pv_data.value);
+    } else {
+        row.fill_zero(0, sizeof(PublicValuesCols<uint8_t>));
+    }
+}
+
 extern "C" int _public_values_recursion_tracegen(
     Fp *d_trace,
     size_t height,
@@ -60,24 +89,36 @@ extern "C" int _public_values_recursion_tracegen(
 ) {
     assert((height & (height - 1)) == 0);
     auto [grid, block] = kernel_launch_params(height);
-    SWITCH_BLOCK(
-        num_proofs,
-        NUM_PROOFS,
-        (public_values_tracegen<NUM_PROOFS><<<grid, block, 0, stream>>>(
-             d_trace,
-             height,
-             PtrArray<PublicValueData, NUM_PROOFS>(d_pvs_data),
-             PtrArray<size_t, NUM_PROOFS>(d_pvs_tidx),
-             num_pvs
-        );),
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-        8
-    )
+    if (num_proofs <= 8) {
+        SWITCH_BLOCK(
+            num_proofs,
+            NUM_PROOFS,
+            (public_values_tracegen<NUM_PROOFS><<<grid, block, 0, stream>>>(
+                 d_trace,
+                 height,
+                 PtrArray<PublicValueData, NUM_PROOFS>(d_pvs_data),
+                 PtrArray<size_t, NUM_PROOFS>(d_pvs_tidx),
+                 num_pvs
+            );),
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8
+        )
+    } else {
+        DeviceArrayCopy<PublicValueData *> pvs_data(d_pvs_data, num_proofs, stream);
+        DeviceArrayCopy<size_t *> pvs_tidx(d_pvs_tidx, num_proofs, stream);
+        if (pvs_data.status() != cudaSuccess) return pvs_data.status();
+        if (pvs_tidx.status() != cudaSuccess) return pvs_tidx.status();
+        int ret = cudaStreamSynchronize(stream);
+        if (ret) return ret;
+        public_values_tracegen_dynamic<<<grid, block, 0, stream>>>(
+            d_trace, height, pvs_data.get(), pvs_tidx.get(), num_proofs, num_pvs
+        );
+    }
     return CHECK_KERNEL();
 }

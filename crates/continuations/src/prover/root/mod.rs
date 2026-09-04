@@ -22,7 +22,7 @@ use crate::{
         root::{RootCircuit, RootTraceGen},
         Circuit,
     },
-    prover::{assert_all_airs_required, keygen_all_required, trace_heights_tracing_info},
+    prover::trace_heights_tracing_info,
     CommitBytes, RootSC, VkCommitBytes, SC,
 };
 
@@ -44,19 +44,8 @@ pub struct RootProver<S: AggregationSubCircuit, T> {
 }
 
 impl<S: AggregationSubCircuit, T> RootProver<S, T> {
-    pub fn create_engine<E>(&self) -> E
-    where
-        E: StarkEngine<SC = RootSC>,
-    {
-        E::new(self.pk.params.clone())
-    }
-
     #[instrument(name = "total_proof", skip_all)]
-    pub fn root_prove_from_ctx<E>(
-        &self,
-        ctx: ProvingContext<E::PB>,
-        engine: &E,
-    ) -> Result<Proof<RootSC>>
+    pub fn root_prove_from_ctx<E>(&self, ctx: ProvingContext<E::PB>) -> Result<Proof<RootSC>>
     where
         E: StarkEngine<SC = RootSC>,
         E::PB: ProverBackend<Val = F, Challenge = EF, Commitment = [Bn254; 1]>,
@@ -67,9 +56,10 @@ impl<S: AggregationSubCircuit, T> RootProver<S, T> {
         if tracing::enabled!(tracing::Level::DEBUG) {
             trace_heights_tracing_info::<_, RootSC>(&ctx.per_trace, &self.circuit.airs());
         }
+        let engine = E::new(self.pk.params.clone());
         #[cfg(debug_assertions)]
         if crate::prover::debug_checks_enabled() {
-            crate::prover::debug_constraints(&self.circuit, &ctx, engine);
+            crate::prover::debug_constraints(&self.circuit, &ctx, &engine);
         }
         let d_pk = engine.device().transport_pk_to_device(self.pk.as_ref());
         let proof = engine.prove(&d_pk, ctx)?;
@@ -121,7 +111,7 @@ impl<S: AggregationSubCircuit, T> RootProver<S, T> {
             memory_dimensions,
             num_user_pvs,
         ));
-        let (pk, vk) = keygen_all_required(&engine, &circuit.airs());
+        let (pk, vk) = engine.keygen(&circuit.airs());
         Self {
             pk: Arc::new(pk),
             vk: Arc::new(vk),
@@ -150,7 +140,6 @@ impl<S: AggregationSubCircuit, T> RootProver<S, T> {
         <E::PB as ProverBackend>::Val: Field + PrimeField32,
         <E::PB as ProverBackend>::Matrix: Clone,
     {
-        assert_all_airs_required(&pk);
         let verifier_circuit = S::new(
             child_vk.clone(),
             VerifierConfig {

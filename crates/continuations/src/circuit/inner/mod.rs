@@ -8,7 +8,7 @@ use openvm_verify_stark_host::pvs::{DeferralPvs, VmPvs, DEF_PVS_AIR_ID, VM_PVS_A
 use crate::{
     circuit::{
         inner::{
-            bus::PvsAirConsistencyBus,
+            bus::{PvsAirConsistencyBus, VerifierExecutionIdentityBus, VerifierLayerIdentityBus},
             def_pvs::DeferralPvsAir,
             unset::UnsetPvsAir,
             verifier::{VerifierDeferralConfig, VerifierPvsAir},
@@ -34,19 +34,10 @@ pub mod vm_pvs;
 mod trace;
 pub use trace::*;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub enum VerifierCircuitType {
-    Leaf = 0,
-    InternalForLeaf = 1,
-    InternalRecursive = 2,
-}
-
 #[derive(derive_new::new, Clone)]
 pub struct InnerCircuit<S: AggregationSubCircuit> {
     pub verifier_circuit: Arc<S>,
     pub def_hook_cached_commit: Option<CommitBytes>,
-    pub verifier_type: VerifierCircuitType,
 }
 
 impl<SC: StarkProtocolConfig<F = F>, S: AggregationSubCircuit> Circuit<SC> for InnerCircuit<S> {
@@ -80,14 +71,25 @@ impl<SC: StarkProtocolConfig<F = F>, S: AggregationSubCircuit> Circuit<SC> for I
             pre_hash_bus,
             range_bus,
             pvs_air_consistency_bus,
+            verifier_layer_identity_bus: self
+                .verifier_circuit
+                .verifier_layer_identity_bus_idx()
+                .map(VerifierLayerIdentityBus::new),
             deferral_config,
-            verifier_type: self.verifier_type,
         });
 
         let vm_pvs_air = Arc::new(vm_pvs::VmPvsAir {
             public_values_bus,
             cached_commit_bus,
             pvs_air_consistency_bus,
+            verifier_execution_identity_bus: self
+                .verifier_circuit
+                .verifier_execution_identity_bus_idx()
+                .map(VerifierExecutionIdentityBus::new),
+            receive_leaf_program_cached_commit: self
+                .verifier_circuit
+                .verifier_execution_identity_bus_idx()
+                .is_none(),
             deferral_enabled,
         });
 

@@ -4,13 +4,14 @@ description = "OpenVM guest library for keccak256"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 homepage.workspace = true
 repository.workspace = true
-license.workspace = true
 
 [dependencies]
 openvm-platform = { workspace = true }
 
 [features]
 default = []
+
+[lints]
+workspace = true

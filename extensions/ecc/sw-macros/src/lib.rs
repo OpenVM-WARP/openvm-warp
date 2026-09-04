@@ -21,10 +21,6 @@ use syn::{
 /// `moduli_declare!`). The curve coefficients `a` (optional, defaults to zero) and `b` are
 /// constants of the coordinate type.
 ///
-/// The generated point type stores raw affine coordinates. Deserializing these points does not
-/// check that they are on the curve. Validate points from untrusted input before using group
-/// operations, scalar multiplication, or MSM.
-///
 /// For this macro to work, you must import the `elliptic_curve` crate and the `openvm_ecc_guest`
 /// crate.
 #[proc_macro]
@@ -115,7 +111,7 @@ pub fn sw_declare(input: TokenStream) -> TokenStream {
                 // Should not be called directly.
                 #[inline(always)]
                 unsafe fn add_ne<const CHECK_SETUP: bool>(p1: &#struct_name, p2: &#struct_name) -> #struct_name {
-                    #[cfg(not(target_os = "zkvm"))]
+                    #[cfg(not(any(openvm_intrinsics, target_os = "openvm")))]
                     {
                         use openvm_algebra_guest::DivUnsafe;
                         let lambda = (&p2.y - &p1.y).div_unsafe(&p2.x - &p1.x);
@@ -123,7 +119,7 @@ pub fn sw_declare(input: TokenStream) -> TokenStream {
                         let y3 = &lambda * &(&p1.x - &x3) - &p1.y;
                         #struct_name { x: x3, y: y3 }
                     }
-                    #[cfg(target_os = "zkvm")]
+                    #[cfg(any(openvm_intrinsics, target_os = "openvm"))]
                     {
                         if CHECK_SETUP {
                             Self::set_up_once();
@@ -140,7 +136,7 @@ pub fn sw_declare(input: TokenStream) -> TokenStream {
 
                 #[inline(always)]
                 unsafe fn add_ne_assign<const CHECK_SETUP: bool>(&mut self, p2: &#struct_name) {
-                    #[cfg(not(target_os = "zkvm"))]
+                    #[cfg(not(any(openvm_intrinsics, target_os = "openvm")))]
                     {
                         use openvm_algebra_guest::DivUnsafe;
                         let lambda = (&p2.y - &self.y).div_unsafe(&p2.x - &self.x);
@@ -149,7 +145,7 @@ pub fn sw_declare(input: TokenStream) -> TokenStream {
                         self.x = x3;
                         self.y = y3;
                     }
-                    #[cfg(target_os = "zkvm")]
+                    #[cfg(any(openvm_intrinsics, target_os = "openvm"))]
                     {
                         if CHECK_SETUP {
                             Self::set_up_once();
@@ -165,7 +161,7 @@ pub fn sw_declare(input: TokenStream) -> TokenStream {
                 /// Assumes that `p` is not identity.
                 #[inline(always)]
                 unsafe fn double_impl<const CHECK_SETUP: bool>(p: &#struct_name) -> #struct_name {
-                    #[cfg(not(target_os = "zkvm"))]
+                    #[cfg(not(any(openvm_intrinsics, target_os = "openvm")))]
                     {
                         use openvm_algebra_guest::DivUnsafe;
                         let curve_a: #intmod_type = #const_a;
@@ -175,7 +171,7 @@ pub fn sw_declare(input: TokenStream) -> TokenStream {
                         let y3 = &lambda * &(&p.x - &x3) - &p.y;
                         #struct_name { x: x3, y: y3 }
                     }
-                    #[cfg(target_os = "zkvm")]
+                    #[cfg(any(openvm_intrinsics, target_os = "openvm"))]
                     {
                         if CHECK_SETUP {
                             Self::set_up_once();
@@ -191,7 +187,7 @@ pub fn sw_declare(input: TokenStream) -> TokenStream {
 
                 // Helper function to call the setup instruction on first use
                 #[inline(always)]
-                #[cfg(target_os = "zkvm")]
+                #[cfg(any(openvm_intrinsics, target_os = "openvm"))]
                 fn set_up_once() {
                     static is_setup: ::openvm_ecc_guest::once_cell::race::OnceBool = ::openvm_ecc_guest::once_cell::race::OnceBool::new();
 
@@ -215,7 +211,7 @@ pub fn sw_declare(input: TokenStream) -> TokenStream {
                 }
 
                 #[inline(always)]
-                #[cfg(not(target_os = "zkvm"))]
+                #[cfg(not(any(openvm_intrinsics, target_os = "openvm")))]
                 fn set_up_once() {
                     // No-op for non-ZKVM targets
                 }
@@ -344,11 +340,11 @@ pub fn sw_declare(input: TokenStream) -> TokenStream {
 
                 #[inline(always)]
                 unsafe fn double_assign_nonidentity<const CHECK_SETUP: bool>(&mut self) {
-                    #[cfg(not(target_os = "zkvm"))]
+                    #[cfg(not(any(openvm_intrinsics, target_os = "openvm")))]
                     {
                         *self = Self::double_impl::<CHECK_SETUP>(self);
                     }
-                    #[cfg(target_os = "zkvm")]
+                    #[cfg(any(openvm_intrinsics, target_os = "openvm"))]
                     {
                         if CHECK_SETUP {
                             Self::set_up_once();
@@ -480,7 +476,7 @@ pub fn sw_init(input: TokenStream) -> TokenStream {
 
             #[no_mangle]
             extern "C" fn #setup_extern_func(uninit: *mut core::ffi::c_void, p1: *const u8, p2: *const u8) {
-                #[cfg(target_os = "zkvm")]
+                #[cfg(any(openvm_intrinsics, target_os = "openvm"))]
                 {
                     openvm::platform::custom_insn_r!(
                         opcode = ::openvm_ecc_guest::OPCODE,
@@ -511,7 +507,7 @@ pub fn sw_init(input: TokenStream) -> TokenStream {
 
     TokenStream::from(quote::quote_spanned! { span.into() =>
         #[allow(non_snake_case)]
-        #[cfg(target_os = "zkvm")]
+        #[cfg(any(openvm_intrinsics, target_os = "openvm"))]
         mod openvm_intrinsics_ffi_2 {
             use ::openvm_ecc_guest::{OPCODE, SW_FUNCT3, SwBaseFunct7};
 

@@ -13,6 +13,101 @@ use crate::{
     transcript::merkle_verify::air::{compute_cum_sum, MerkleVerifyCols, MerkleVerifyLog},
 };
 
+/// One initial WHIR commitment supplied by a direct carrier.
+///
+/// The position in the enclosing slice is the canonical `commit_minor`.
+/// Keeping the width next to the root lets trace generation reject a direct
+/// carrier whose retained-root schedule does not match the opened rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MerkleInitialCommitment {
+    pub commitment: [F; DIGEST_SIZE],
+    pub width: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MerkleVerifyTraceError {
+    ProofPreflightCount {
+        proofs: usize,
+        preflights: usize,
+    },
+    DirectCommitmentBatchCount {
+        actual: usize,
+        expected: usize,
+    },
+    InitialCommitmentCount {
+        proof_idx: usize,
+        actual: usize,
+        expected: usize,
+    },
+    InitialStateCount {
+        proof_idx: usize,
+        actual: usize,
+        expected: usize,
+    },
+    InitialCommitmentWidth {
+        proof_idx: usize,
+        commit_minor: usize,
+        actual: usize,
+        expected: usize,
+    },
+    EmptyInitialOpening {
+        proof_idx: usize,
+        commit_minor: usize,
+    },
+}
+
+impl core::fmt::Display for MerkleVerifyTraceError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::ProofPreflightCount {
+                proofs,
+                preflights,
+            } => write!(
+                f,
+                "Merkle proof count {proofs} differs from preflight count {preflights}"
+            ),
+            Self::DirectCommitmentBatchCount { actual, expected } => write!(
+                f,
+                "direct initial-commitment batch count {actual}, expected {expected}"
+            ),
+            Self::InitialCommitmentCount {
+                proof_idx,
+                actual,
+                expected,
+            } => write!(
+                f,
+                "proof {proof_idx} has {actual} direct initial commitments, expected {expected}"
+            ),
+            Self::InitialStateCount {
+                proof_idx,
+                actual,
+                expected,
+            } => write!(
+                f,
+                "proof {proof_idx} has {actual} initial row-state groups, expected {expected}"
+            ),
+            Self::InitialCommitmentWidth {
+                proof_idx,
+                commit_minor,
+                actual,
+                expected,
+            } => write!(
+                f,
+                "proof {proof_idx} initial commitment {commit_minor} has width {actual}, expected {expected}"
+            ),
+            Self::EmptyInitialOpening {
+                proof_idx,
+                commit_minor,
+            } => write!(
+                f,
+                "proof {proof_idx} initial commitment {commit_minor} has no opened row"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MerkleVerifyTraceError {}
+
 #[tracing::instrument(level = "trace", skip_all)]
 pub fn generate_trace(
     mvk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
@@ -21,6 +116,47 @@ pub fn generate_trace(
     params: &SystemParams,
     required_height: Option<usize>,
 ) -> Option<(Vec<F>, Vec<[F; POSEIDON2_WIDTH]>)> {
+    generate_trace_inner(mvk, proofs, preflights, params, None, required_height)
+        .ok()
+        .flatten()
+}
+
+/// Generate a Merkle-verification trace for direct carriers.
+///
+/// Unlike the legacy [`generate_trace`] path, initial roots come from the
+/// caller's explicit retained-root schedule. Later-round roots and all Merkle
+/// siblings continue to come from the ordinary WHIR proof. The schedule is
+/// validated before trace generation and indexed positionally by
+/// `commit_minor`; no root is inferred from `Proof::common_main_commit`.
+#[tracing::instrument(level = "trace", skip_all)]
+pub fn generate_trace_with_initial_commitments(
+    mvk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
+    proofs: &[Proof<BabyBearPoseidon2Config>],
+    preflights: &[Preflight],
+    params: &SystemParams,
+    initial_commitments: &[Vec<MerkleInitialCommitment>],
+    required_height: Option<usize>,
+) -> Result<Option<(Vec<F>, Vec<[F; POSEIDON2_WIDTH]>)>, MerkleVerifyTraceError> {
+    generate_trace_inner(
+        mvk,
+        proofs,
+        preflights,
+        params,
+        Some(initial_commitments),
+        required_height,
+    )
+}
+
+fn generate_trace_inner(
+    mvk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
+    proofs: &[Proof<BabyBearPoseidon2Config>],
+    preflights: &[Preflight],
+    params: &SystemParams,
+    direct_initial_commitments: Option<&[Vec<MerkleInitialCommitment>]>,
+    required_height: Option<usize>,
+) -> Result<Option<(Vec<F>, Vec<[F; POSEIDON2_WIDTH]>)>, MerkleVerifyTraceError> {
+    let initial_commitment_roots =
+        resolve_initial_commitment_roots(mvk, proofs, preflights, direct_initial_commitments)?;
     let k = params.k_whir();
     let width = MerkleVerifyCols::<F>::width();
     let num_leaves: usize = 1 << k;
@@ -51,7 +187,7 @@ pub fn generate_trace(
     let num_valid_rows = *num_rows_cum_sums.last().unwrap();
     let height = if let Some(height) = required_height {
         if num_valid_rows > height {
-            return None;
+            return Ok(None);
         }
         height
     } else {
@@ -112,18 +248,6 @@ pub fn generate_trace(
             }
         }
 
-        let mut stacking_commits = vec![proof.common_main_commit];
-        for (air_id, data) in &preflight.proof_shape.sorted_trace_vdata {
-            stacking_commits.extend(
-                mvk.inner.per_air[*air_id]
-                    .preprocessed_data
-                    .as_ref()
-                    .into_iter()
-                    .map(|pdata| pdata.commit)
-                    .chain(data.cached_commitments.iter().cloned()),
-            );
-        }
-
         let cols: &mut MerkleVerifyCols<F> = row.borrow_mut();
         // determine the layer and offset in the leaf_tree
         // 0th layer: [0, num_leaves / 2)
@@ -133,7 +257,6 @@ pub fn generate_trace(
 
         cols.is_valid = F::ONE;
         cols.proof_idx = F::from_usize(proof_idx);
-        cols.query_idx = F::from_usize(query_idx);
         cols.commit_major = F::from_usize(commit_major);
         cols.commit_minor = F::from_usize(commit_minor);
         cols.total_depth = F::from_usize(depth + k + 1);
@@ -177,7 +300,7 @@ pub fn generate_trace(
             let is_last = pos == depth;
             let whir_proof = &proof.whir_proof;
             let sibling = match (commit_major, is_last) {
-                (0, true) => stacking_commits[commit_minor],
+                (0, true) => initial_commitment_roots[proof_idx][commit_minor],
                 (0, false) => whir_proof.initial_round_merkle_proofs[commit_minor][query_idx][pos],
                 (idx, true) => whir_proof.codeword_commits[idx - 1],
                 (idx, false) => whir_proof.codeword_merkle_proofs[idx - 1][query_idx][pos],
@@ -210,7 +333,117 @@ pub fn generate_trace(
         }
     }
 
-    Some((trace, poseidon2_compress_inputs))
+    Ok(Some((trace, poseidon2_compress_inputs)))
+}
+
+fn resolve_initial_commitment_roots(
+    mvk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
+    proofs: &[Proof<BabyBearPoseidon2Config>],
+    preflights: &[Preflight],
+    direct: Option<&[Vec<MerkleInitialCommitment>]>,
+) -> Result<Vec<Vec<[F; DIGEST_SIZE]>>, MerkleVerifyTraceError> {
+    if proofs.len() != preflights.len() {
+        return Err(MerkleVerifyTraceError::ProofPreflightCount {
+            proofs: proofs.len(),
+            preflights: preflights.len(),
+        });
+    }
+    if let Some(direct) = direct {
+        if direct.len() != proofs.len() {
+            return Err(MerkleVerifyTraceError::DirectCommitmentBatchCount {
+                actual: direct.len(),
+                expected: proofs.len(),
+            });
+        }
+    }
+
+    proofs
+        .iter()
+        .zip(preflights)
+        .enumerate()
+        .map(|(proof_idx, (proof, preflight))| {
+            let expected = proof.whir_proof.initial_round_opened_rows.len();
+            if preflight.initial_row_states.len() != expected {
+                return Err(MerkleVerifyTraceError::InitialStateCount {
+                    proof_idx,
+                    actual: preflight.initial_row_states.len(),
+                    expected,
+                });
+            }
+
+            if let Some(direct) = direct {
+                let commitments = &direct[proof_idx];
+                validate_direct_initial_commitments(proof_idx, proof, preflight, commitments)
+            } else {
+                Ok(build_legacy_initial_commitments(mvk, proof, preflight))
+            }
+        })
+        .collect()
+}
+
+fn validate_direct_initial_commitments(
+    proof_idx: usize,
+    proof: &Proof<BabyBearPoseidon2Config>,
+    preflight: &Preflight,
+    commitments: &[MerkleInitialCommitment],
+) -> Result<Vec<[F; DIGEST_SIZE]>, MerkleVerifyTraceError> {
+    let expected = proof.whir_proof.initial_round_opened_rows.len();
+    if preflight.initial_row_states.len() != expected {
+        return Err(MerkleVerifyTraceError::InitialStateCount {
+            proof_idx,
+            actual: preflight.initial_row_states.len(),
+            expected,
+        });
+    }
+    if commitments.len() != expected {
+        return Err(MerkleVerifyTraceError::InitialCommitmentCount {
+            proof_idx,
+            actual: commitments.len(),
+            expected,
+        });
+    }
+    commitments
+        .iter()
+        .enumerate()
+        .map(|(commit_minor, commitment)| {
+            let expected_width = proof.whir_proof.initial_round_opened_rows[commit_minor]
+                .first()
+                .and_then(|query| query.first())
+                .map(Vec::len)
+                .ok_or(MerkleVerifyTraceError::EmptyInitialOpening {
+                    proof_idx,
+                    commit_minor,
+                })?;
+            if commitment.width != expected_width {
+                return Err(MerkleVerifyTraceError::InitialCommitmentWidth {
+                    proof_idx,
+                    commit_minor,
+                    actual: commitment.width,
+                    expected: expected_width,
+                });
+            }
+            Ok(commitment.commitment)
+        })
+        .collect()
+}
+
+fn build_legacy_initial_commitments(
+    mvk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
+    proof: &Proof<BabyBearPoseidon2Config>,
+    preflight: &Preflight,
+) -> Vec<[F; DIGEST_SIZE]> {
+    let mut commitments = vec![proof.common_main_commit];
+    for (air_id, data) in &preflight.proof_shape.sorted_trace_vdata {
+        commitments.extend(
+            mvk.inner.per_air[*air_id]
+                .preprocessed_data
+                .as_ref()
+                .into_iter()
+                .map(|pdata| pdata.commit)
+                .chain(data.cached_commitments.iter().copied()),
+        );
+    }
+    commitments
 }
 
 fn build_merkle_logs(preflight: &Preflight, params: &SystemParams) -> Vec<MerkleVerifyLog> {
@@ -333,7 +566,6 @@ pub fn compute_combination_indices(k: usize, i: usize) -> Option<CombinationIndi
 
 #[cfg(feature = "cuda")]
 pub mod cuda {
-    use itertools::Itertools;
     use openvm_cuda_backend::{base::DeviceMatrix, prelude::F};
     use openvm_cuda_common::{copy::MemCopyH2D, d_buffer::DeviceBuffer, stream::GpuDeviceCtx};
 
@@ -361,13 +593,64 @@ pub mod cuda {
     }
 
     impl MerkleVerifyBlob {
+        /// Empty CUDA payload used by partial verifiers that deliberately
+        /// defer every terminal PCS opening. The Merkle AIR still receives a
+        /// one-row zero trace so the fixed MultiSTARK layout is preserved.
+        pub(crate) fn empty(poseidon2_buffer_offset: usize, num_proofs: usize) -> Self {
+            Self {
+                records: Vec::new(),
+                leaf_hashes: Vec::new(),
+                sibling_hashes: Vec::new(),
+                proof_row_starts: vec![0; num_proofs],
+                total_rows: 0,
+                num_leaves: 1,
+                k: 0,
+                num_proofs,
+                poseidon2_buffer_offset,
+            }
+        }
+
         pub fn new(
             child_vk: &VerifyingKeyGpu,
             proofs: &[ProofGpu],
             preflights: &[PreflightGpu],
             poseidon2_buffer_offset: usize,
         ) -> Self {
-            assert_eq!(proofs.len(), preflights.len());
+            Self::new_with_initial_commitments(
+                child_vk,
+                proofs,
+                preflights,
+                poseidon2_buffer_offset,
+                None,
+            )
+            .expect("legacy Merkle inputs must match verifier preflight")
+        }
+
+        /// CUDA-compatible direct-carrier constructor. The host-side blob
+        /// records the explicit retained roots in exactly the same sibling
+        /// stream consumed by the CUDA kernel; the kernel ABI and legacy path
+        /// remain unchanged.
+        pub(crate) fn new_with_initial_commitments(
+            child_vk: &VerifyingKeyGpu,
+            proofs: &[ProofGpu],
+            preflights: &[PreflightGpu],
+            poseidon2_buffer_offset: usize,
+            direct_initial_commitments: Option<&[Vec<MerkleInitialCommitment>]>,
+        ) -> Result<Self, MerkleVerifyTraceError> {
+            if proofs.len() != preflights.len() {
+                return Err(MerkleVerifyTraceError::ProofPreflightCount {
+                    proofs: proofs.len(),
+                    preflights: preflights.len(),
+                });
+            }
+            if let Some(direct) = direct_initial_commitments {
+                if direct.len() != proofs.len() {
+                    return Err(MerkleVerifyTraceError::DirectCommitmentBatchCount {
+                        actual: direct.len(),
+                        expected: proofs.len(),
+                    });
+                }
+            }
             let k = child_vk.system_params.k_whir();
             assert!(
                 k <= MAX_SUPPORTED_K,
@@ -382,13 +665,27 @@ pub mod cuda {
             let mut sibling_hashes = Vec::new();
             let mut proof_row_starts = Vec::with_capacity(proofs.len());
 
-            let stacking_commits_per_proof = proofs
+            let initial_commitment_roots = proofs
                 .iter()
                 .zip(preflights)
-                .map(|(proof, preflight)| {
-                    build_stacking_commits(&child_vk.cpu, &proof.cpu, &preflight.cpu)
+                .enumerate()
+                .map(|(proof_idx, (proof, preflight))| {
+                    if let Some(direct) = direct_initial_commitments {
+                        validate_direct_initial_commitments(
+                            proof_idx,
+                            &proof.cpu,
+                            &preflight.cpu,
+                            &direct[proof_idx],
+                        )
+                    } else {
+                        Ok(build_legacy_initial_commitments(
+                            &child_vk.cpu,
+                            &proof.cpu,
+                            &preflight.cpu,
+                        ))
+                    }
                 })
-                .collect_vec();
+                .collect::<Result<Vec<_>, _>>()?;
 
             let logs_per_proof: Vec<_> = preflights
                 .iter()
@@ -415,7 +712,7 @@ pub mod cuda {
                         }
                     }
                     let path =
-                        build_merkle_path(log, &proof.cpu, &stacking_commits_per_proof[proof_idx]);
+                        build_merkle_path(log, &proof.cpu, &initial_commitment_roots[proof_idx]);
                     let sibling_offset = sibling_hashes.len();
                     for sibling in path {
                         sibling_hashes.extend_from_slice(&sibling);
@@ -426,7 +723,6 @@ pub mod cuda {
                         start_row: total_rows as u32,
                         num_rows: num_rows as u32,
                         depth: log.depth as u16,
-                        query_idx: log.query_idx as u16,
                         merkle_idx: log.merkle_idx as u32,
                         commit_major: log.commit_major as u16,
                         commit_minor: log.commit_minor as u16,
@@ -437,7 +733,7 @@ pub mod cuda {
                 }
             }
 
-            Self {
+            Ok(Self {
                 records,
                 leaf_hashes,
                 sibling_hashes,
@@ -447,7 +743,7 @@ pub mod cuda {
                 k,
                 num_proofs: proofs.len(),
                 poseidon2_buffer_offset,
-            }
+            })
         }
     }
 
@@ -507,32 +803,17 @@ pub mod cuda {
         Some(trace)
     }
 
-    fn build_stacking_commits(
-        mvk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
-        proof: &Proof<BabyBearPoseidon2Config>,
-        preflight: &Preflight,
-    ) -> Vec<[F; DIGEST_SIZE]> {
-        let mut commits = vec![proof.common_main_commit];
-        for (air_id, data) in &preflight.proof_shape.sorted_trace_vdata {
-            if let Some(pdata) = mvk.inner.per_air[*air_id].preprocessed_data.as_ref() {
-                commits.push(pdata.commit);
-            }
-            commits.extend(data.cached_commitments.iter());
-        }
-        commits
-    }
-
     fn build_merkle_path(
         log: &MerkleVerifyLog,
         proof: &Proof<BabyBearPoseidon2Config>,
-        stacking_commits: &[[F; DIGEST_SIZE]],
+        initial_commitments: &[[F; DIGEST_SIZE]],
     ) -> Vec<[F; DIGEST_SIZE]> {
         let whir_proof = &proof.whir_proof;
         (0..=log.depth)
             .map(|pos| {
                 let is_last = pos == log.depth;
                 match (log.commit_major, is_last) {
-                    (0, true) => stacking_commits[log.commit_minor],
+                    (0, true) => initial_commitments[log.commit_minor],
                     (0, false) => {
                         whir_proof.initial_round_merkle_proofs[log.commit_minor][log.query_idx][pos]
                     }

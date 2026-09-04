@@ -1,36 +1,10 @@
 use openvm_recursion_circuit::prelude::F;
 use openvm_stark_backend::{
-    keygen::{
-        types::{MultiStarkProvingKey, MultiStarkVerifyingKey},
-        MultiStarkKeygenBuilder,
-    },
     prover::{AirProvingContext, MatrixDimensions, ProverBackend, ProverDevice, ProvingContext},
     AirRef, EngineDeviceCtx, StarkEngine, StarkProtocolConfig,
 };
 
 use crate::circuit::Circuit;
-
-/// Panics if any AIR in the proving key is not marked as required.
-pub fn assert_all_airs_required<SC: StarkProtocolConfig>(pk: &MultiStarkProvingKey<SC>) {
-    assert!(
-        pk.per_air.iter().all(|air_pk| air_pk.vk.is_required),
-        "cached proving key must have all AIRs marked as required"
-    );
-}
-
-/// Generates keys with every AIR marked as required.
-pub fn keygen_all_required<E: StarkEngine>(
-    engine: &E,
-    airs: &[AirRef<E::SC>],
-) -> (MultiStarkProvingKey<E::SC>, MultiStarkVerifyingKey<E::SC>) {
-    let mut keygen_builder = MultiStarkKeygenBuilder::new(engine.config().clone());
-    for air in airs {
-        keygen_builder.add_required_air(air.clone());
-    }
-    let pk = keygen_builder.generate_pk().unwrap();
-    let vk = pk.get_vk();
-    (pk, vk)
-}
 
 #[cfg(debug_assertions)]
 pub(crate) fn debug_checks_enabled() -> bool {

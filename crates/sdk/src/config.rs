@@ -19,9 +19,7 @@ use serde::{Deserialize, Serialize};
 pub const MAX_NUM_CHILDREN_LEAF: usize = 4;
 pub const MAX_NUM_CHILDREN_INTERNAL: usize = 3;
 
-/// The default app [SystemParams], used when the `system_params` field of an [AppConfig] is not
-/// specified.
-pub fn default_system_params() -> SystemParams {
+fn default_system_params() -> SystemParams {
     app_params_with_100_bits_security(MAX_APP_LOG_STACKED_HEIGHT)
 }
 
@@ -37,12 +35,12 @@ impl AppConfig<SdkVmConfig> {
         Self::new(SdkVmConfig::standard(), params)
     }
 
-    pub fn riscv32(params: SystemParams) -> Self {
-        Self::new(SdkVmConfig::riscv32(), params)
+    pub fn riscv64(params: SystemParams) -> Self {
+        Self::new(SdkVmConfig::riscv64(), params)
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AggregationConfig {
     pub params: AggregationSystemParams,
 }

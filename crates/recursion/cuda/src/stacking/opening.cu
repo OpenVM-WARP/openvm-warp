@@ -8,6 +8,7 @@
 #include "stacking_blob.cuh"
 #include "switch_macro.h"
 #include "types.h"
+#include "util.cuh"
 
 #include <algorithm>
 #include <cassert>
@@ -180,6 +181,103 @@ __global__ void opening_claims_tracegen(
     COL_WRITE_ARRAY(row, OpeningClaimsCols, s_0, s_0.elems);
 }
 
+
+__global__ void opening_claims_tracegen_dynamic(
+    Fp *trace,
+    size_t height,
+    const uint32_t *__restrict__ row_bounds,
+    ColumnOpeningClaims *const *__restrict__ claims,
+    StackedSliceData *const *__restrict__ slice_data,
+    PolyPrecomputation *const *__restrict__ precomps,
+    FpExt *const *__restrict__ lambda_pows,
+    const OpeningRecordsPerProof *__restrict__ records,
+    uint32_t l_skip,
+    uint32_t num_proofs
+) {
+    uint32_t global_row_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    RowSlice row(trace + global_row_idx, height);
+
+    uint32_t proof_idx = partition_point_leq(row_bounds, num_proofs, global_row_idx);
+    if (proof_idx >= num_proofs) {
+        row.fill_zero(0, sizeof(OpeningClaimsCols<uint8_t>));
+        COL_WRITE_VALUE(row, OpeningClaimsCols, proof_idx, num_proofs);
+        COL_WRITE_VALUE(row, OpeningClaimsCols, is_last, global_row_idx + 1 == height);
+        return;
+    }
+    uint32_t proof_row_start = proof_idx == 0 ? 0 : row_bounds[proof_idx - 1];
+    uint32_t row_idx = global_row_idx - proof_row_start;
+    uint32_t num_rows = row_bounds[proof_idx] - proof_row_start;
+
+    COL_WRITE_VALUE(row, OpeningClaimsCols, proof_idx, proof_idx);
+    COL_WRITE_VALUE(row, OpeningClaimsCols, is_valid, Fp::one());
+    COL_WRITE_VALUE(row, OpeningClaimsCols, is_first, row_idx == 0);
+    COL_WRITE_VALUE(row, OpeningClaimsCols, is_last, row_idx + 1 == num_rows);
+
+    ColumnOpeningClaims claim = claims[proof_idx][row_idx];
+    StackedSliceData slice = slice_data[proof_idx][row_idx];
+    FpExt lambda_pow = lambda_pows[proof_idx][row_idx];
+    auto [eq_in, k_rot_in, eq_bits] = precomps[proof_idx][row_idx];
+    auto [tidx_before_column_openings, last_main_idx, lambda] = records[proof_idx];
+
+    COL_WRITE_VALUE(row, OpeningClaimsCols, sort_idx, claim.sort_idx);
+    COL_WRITE_VALUE(row, OpeningClaimsCols, part_idx, claim.part_idx);
+    COL_WRITE_VALUE(row, OpeningClaimsCols, col_idx, claim.col_idx);
+    COL_WRITE_ARRAY(row, OpeningClaimsCols, col_claim, claim.col_claim.elems);
+    COL_WRITE_ARRAY(row, OpeningClaimsCols, rot_claim, claim.rot_claim.elems);
+    COL_WRITE_VALUE(row, OpeningClaimsCols, need_rot, slice.need_rot);
+
+    COL_WRITE_VALUE(row, OpeningClaimsCols, is_main, claim.part_idx == 0);
+    COL_WRITE_VALUE(
+        row,
+        OpeningClaimsCols,
+        is_transition_main,
+        row_idx + 1 != num_rows && row_idx != last_main_idx
+    );
+
+    uint32_t n_lift = (uint32_t)max(slice.n, 0);
+    uint32_t log_lifted_height = n_lift + l_skip;
+    uint32_t n_abs = abs(slice.n);
+    Fp lifted_height = Fp(1 << log_lifted_height);
+    COL_WRITE_VALUE(row, OpeningClaimsCols, hypercube_dim, slice.n >= 0 ? Fp(n_lift) : -Fp(n_abs));
+    COL_WRITE_VALUE(row, OpeningClaimsCols, log_lifted_height, log_lifted_height);
+    COL_WRITE_VALUE(row, OpeningClaimsCols, lifted_height, lifted_height);
+    COL_WRITE_VALUE(row, OpeningClaimsCols, lifted_height_inv, inv(lifted_height));
+
+    COL_WRITE_VALUE(
+        row, OpeningClaimsCols, tidx, tidx_before_column_openings + (row_idx << 1) * D_EF
+    );
+    COL_WRITE_ARRAY(row, OpeningClaimsCols, lambda, lambda.elems);
+    COL_WRITE_ARRAY(row, OpeningClaimsCols, lambda_pow, lambda_pow.elems);
+
+    COL_WRITE_VALUE(row, OpeningClaimsCols, commit_idx, slice.commit_idx);
+    COL_WRITE_VALUE(row, OpeningClaimsCols, stacked_col_idx, slice.col_idx);
+    COL_WRITE_VALUE(row, OpeningClaimsCols, row_idx, slice.row_idx);
+    COL_WRITE_VALUE(row, OpeningClaimsCols, is_last_for_claim, slice.is_last_for_claim);
+
+    COL_WRITE_ARRAY(row, OpeningClaimsCols, eq_in, eq_in.elems);
+    COL_WRITE_ARRAY(row, OpeningClaimsCols, k_rot_in, k_rot_in.elems);
+    if (slice.need_rot) {
+        COL_WRITE_ARRAY(row, OpeningClaimsCols, k_rot_in_when_needed, k_rot_in.elems);
+    } else {
+        row.fill_zero(COL_INDEX(OpeningClaimsCols, k_rot_in_when_needed), D_EF);
+    }
+    COL_WRITE_ARRAY(row, OpeningClaimsCols, eq_bits, eq_bits.elems);
+
+    FpExt lambda_pow_eq_bits = lambda_pow * eq_bits;
+    COL_WRITE_ARRAY(row, OpeningClaimsCols, lambda_pow_eq_bits, lambda_pow_eq_bits.elems);
+
+    // Needs to be accumulated via prefix scan by key (commit_idx)
+    FpExt k_rot_term = slice.need_rot ? k_rot_in : FpExt(Fp::zero());
+    FpExt stacking_claim_coefficient = lambda_pow_eq_bits * (eq_in + lambda * k_rot_term);
+    COL_WRITE_ARRAY(
+        row, OpeningClaimsCols, stacking_claim_coefficient, stacking_claim_coefficient.elems
+    );
+
+    // Needs to be accumulated via prefix scan
+    FpExt s_0 = lambda_pow * (claim.col_claim + lambda * claim.rot_claim);
+    COL_WRITE_ARRAY(row, OpeningClaimsCols, s_0, s_0.elems);
+}
+
 // ============================================================================
 // LAUNCHERS
 // ============================================================================
@@ -250,29 +348,56 @@ extern "C" int _opening_claims_tracegen(
     assert(width == sizeof(OpeningClaimsCols<uint8_t>));
     auto [grid, block] = kernel_launch_params(height, 256);
 
-    SWITCH_BLOCK(
-        num_proofs,
-        NUM_PROOFS,
-        (opening_claims_tracegen<NUM_PROOFS><<<grid, block, 0, stream>>>(
-             d_trace,
-             height,
-             Array<uint32_t, NUM_PROOFS>(h_row_bounds),
-             PtrArray<ColumnOpeningClaims, NUM_PROOFS>(d_claims),
-             PtrArray<StackedSliceData, NUM_PROOFS>(d_slice_data),
-             PtrArray<PolyPrecomputation, NUM_PROOFS>(d_precomps),
-             PtrArray<FpExt, NUM_PROOFS>(d_lambda_pows),
-             d_records,
-             l_skip
-        );),
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-        8
-    )
+    if (num_proofs <= 8) {
+        SWITCH_BLOCK(
+            num_proofs,
+            NUM_PROOFS,
+            (opening_claims_tracegen<NUM_PROOFS><<<grid, block, 0, stream>>>(
+                 d_trace,
+                 height,
+                 Array<uint32_t, NUM_PROOFS>(h_row_bounds),
+                 PtrArray<ColumnOpeningClaims, NUM_PROOFS>(d_claims),
+                 PtrArray<StackedSliceData, NUM_PROOFS>(d_slice_data),
+                 PtrArray<PolyPrecomputation, NUM_PROOFS>(d_precomps),
+                 PtrArray<FpExt, NUM_PROOFS>(d_lambda_pows),
+                 d_records,
+                 l_skip
+            );),
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8
+        )
+    } else {
+        DeviceArrayCopy<uint32_t> row_bounds(h_row_bounds, num_proofs, stream);
+        DeviceArrayCopy<ColumnOpeningClaims *> claims(d_claims, num_proofs, stream);
+        DeviceArrayCopy<StackedSliceData *> slice_data(d_slice_data, num_proofs, stream);
+        DeviceArrayCopy<PolyPrecomputation *> precomps(d_precomps, num_proofs, stream);
+        DeviceArrayCopy<FpExt *> lambda_pows(d_lambda_pows, num_proofs, stream);
+        if (row_bounds.status() != cudaSuccess) return row_bounds.status();
+        if (claims.status() != cudaSuccess) return claims.status();
+        if (slice_data.status() != cudaSuccess) return slice_data.status();
+        if (precomps.status() != cudaSuccess) return precomps.status();
+        if (lambda_pows.status() != cudaSuccess) return lambda_pows.status();
+        int ret = cudaStreamSynchronize(stream);
+        if (ret) return ret;
+        opening_claims_tracegen_dynamic<<<grid, block, 0, stream>>>(
+            d_trace,
+            height,
+            row_bounds.get(),
+            claims.get(),
+            slice_data.get(),
+            precomps.get(),
+            lambda_pows.get(),
+            d_records,
+            l_skip,
+            num_proofs
+        );
+    }
 
     int ret = CHECK_KERNEL();
     if (ret) {

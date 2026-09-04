@@ -2,12 +2,10 @@
 name = "openvm-algebra-moduli-macros"
 description = "OpenVM algebra macros for modular arithmetic"
 version.workspace = true
-authors.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+authors.workspace = true
 homepage.workspace = true
 repository.workspace = true
-license.workspace = true
 
 [dependencies]
 syn = { version = "2.0", features = ["full"] }
@@ -18,3 +16,6 @@ num-bigint = { workspace = true }
 
 [lib]
 proc-macro = true
+
+[lints]
+workspace = true

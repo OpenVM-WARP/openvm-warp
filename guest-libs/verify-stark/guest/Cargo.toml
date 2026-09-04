@@ -2,12 +2,19 @@
 name = "openvm-verify-stark-guest"
 description = "OpenVM guest library for verifying STARKs"
 version.workspace = true
-authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+authors.workspace = true
 homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 
 [dependencies]
 openvm-deferral-guest = { workspace = true }
+
+[lints]
+workspace = true
+
+[features]
+default = []
+std = []

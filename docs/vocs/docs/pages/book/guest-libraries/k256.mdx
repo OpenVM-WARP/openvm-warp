@@ -2,9 +2,6 @@
 
 The K256 guest library uses [`openvm-ecc-guest`](/book/acceleration-using-extensions/elliptic-curve-cryptography) to provide elliptic curve operations over the Secp256k1 curve. It is intended as a patch for the [`k256`](https://crates.io/crates/k256) rust crate and can be swapped in for accelerated signature verification usage. Note that signing from a private key is not supported.
 
-:::warning
-`VerifyingKey::from_affine` does not check that raw coordinates are on the secp256k1 curve. Use it only with points that have already been checked. For public keys from untrusted bytes, use `VerifyingKey::from_sec1_bytes` or `VerifyingKey::from_encoded_point`.
-:::
 
 ## Example program
 
@@ -13,16 +10,12 @@ See a working example [here](https://github.com/openvm-org/openvm/blob/main/exam
 To use the K256 guest library, add the following dependencies to `Cargo.toml`:
 
 ```toml
-openvm-algebra-guest = { git = "https://github.com/openvm-org/openvm.git", tag = "v2.1.0" }
-openvm-ecc-guest = { git = "https://github.com/openvm-org/openvm.git", tag = "v2.1.0" }
-openvm-k256 = { git = "https://github.com/openvm-org/openvm.git", tag = "v2.1.0", package = "k256" }
+openvm-algebra-guest = { git = "https://github.com/openvm-org/openvm.git", tag = "v2.0.0-beta.2" }
+openvm-ecc-guest = { git = "https://github.com/openvm-org/openvm.git", tag = "v2.0.0-beta.2" }
+openvm-k256 = { git = "https://github.com/openvm-org/openvm.git", tag = "v2.0.0-beta.2", package = "k256" }
 ```
 
 The guest library provides a `Secp256k1Coord`, which represents a field element on the coordinate field of Secp256k1, and a `Secp256k1Point`, which represents an Secp256k1 elliptic curve point.
-
-:::warning
-`Secp256k1Point` stores raw affine coordinates. Deserializing a `Secp256k1Point` does not check that the point is on the secp256k1 curve. Validate points from untrusted input before using point addition, scalar multiplication, or MSM. For public keys, use `VerifyingKey::from_sec1_bytes`.
-:::
 
 The K256 guest library handles the "Declare" phase described in [Optimizing Modular Arithmetic](/book/acceleration-using-extensions/overview#optimizing-modular-arithmetic). The consuming guest program is responsible for running the "Init" phase via `openvm::init!()`.
 

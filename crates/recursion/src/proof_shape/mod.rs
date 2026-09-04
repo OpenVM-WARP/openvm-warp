@@ -22,9 +22,17 @@ use crate::{
         range::{RangeCheckerAir, RangeCheckerCpuTraceGenerator},
     },
     proof_shape::{
-        bus::{NumPublicValuesBus, ProofShapePermutationBus, StartingTidxBus},
-        proof_shape::ProofShapeAir,
+        bus::{
+            NumPublicValuesBus, ProofShapeMetadataBus, ProofShapePermutationBus,
+            RebasedTranscriptStartBus, StartingTidxBus,
+        },
+        proof_shape::{generate_metadata_dummy_trace, ProofShapeAir, ProofShapeMetadataAir},
         pvs::PublicValuesAir,
+        rebased::{
+            RebasedProofShapeStartAir, RebasedProofShapeStartTraceGenerator,
+            BATCH_CONSTRAINT_LOGUP_ONLY_MODE, BATCH_CONSTRAINT_MODE_SEPARATOR_LEN,
+            BATCH_CONSTRAINT_MODE_TAG, BATCH_CONSTRAINT_MODE_VERSION,
+        },
     },
     system::{
         frame::MultiStarkVkeyFrame, AirModule, BusIndexManager, BusInventory, GlobalCtxCpu,
@@ -37,20 +45,28 @@ pub mod bus;
 #[allow(clippy::module_inception)]
 pub mod proof_shape;
 pub mod pvs;
+pub mod rebased;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProofShapeTranscriptMode {
+    #[default]
+    Standard,
+    RebasedLogUpOnly,
+}
 
 #[cfg(feature = "cuda")]
 mod cuda_abi;
 
 #[derive(Clone)]
 pub struct AirMetadata {
-    is_required: bool,
-    need_rot: bool,
-    num_public_values: usize,
-    num_interactions: usize,
-    main_width: usize,
-    cached_widths: Vec<usize>,
-    preprocessed_width: Option<usize>,
-    preprocessed_data: Option<VerifierSinglePreprocessedData<Digest>>,
+    pub(crate) is_required: bool,
+    pub(crate) need_rot: bool,
+    pub(crate) num_public_values: usize,
+    pub(crate) num_interactions: usize,
+    pub(crate) main_width: usize,
+    pub(crate) cached_widths: Vec<usize>,
+    pub(crate) preprocessed_width: Option<usize>,
+    pub(crate) preprocessed_data: Option<VerifierSinglePreprocessedData<Digest>>,
 }
 
 pub struct ProofShapeModule {
@@ -61,12 +77,14 @@ pub struct ProofShapeModule {
     /// `sum_i(num_interactions[i] * lifted_height[i]) < max_interaction_count`,
     /// with `lifted_height[i] = max(trace_height[i], 2^l_skip)`.
     max_interaction_count: u32,
+    air_idx_gap_bits: usize,
 
     // Buses (inventory for external, others are internal)
     bus_inventory: BusInventory,
     range_bus: RangeCheckerBus,
     pow_bus: PowerCheckerBus,
     permutation_bus: ProofShapePermutationBus,
+    metadata_bus: Option<ProofShapeMetadataBus>,
     starting_tidx_bus: StartingTidxBus,
     num_pvs_bus: NumPublicValuesBus,
 
@@ -75,11 +93,62 @@ pub struct ProofShapeModule {
     min_cached_idx: usize,
     max_cached: usize,
     commit_mult: usize,
+    /// Additional setup-fixed consumer of `(AIR id, presence, height)` used
+    /// by the ordered deferred-SWIRL source receipt.
+    layout_export_lookups: usize,
 
     // Module sends extra public values message for use outside of verifier
     // sub-circuit if true
     continuations_enabled: bool,
+    /// See [`ProofShapeAir::export_stacking_shape`]; true for the full
+    /// assembly, false for a partial assembly without the stacking module.
+    export_stacking_shape: bool,
+    transcript_mode: ProofShapeTranscriptMode,
+    rebased_start_bus: Option<RebasedTranscriptStartBus>,
 }
+
+/// Above this child-AIR count, a one-proof verifier with no cached child mains
+/// authenticates VK metadata through a committed lookup table.  Smaller and
+/// multi-proof recursive circuits retain the existing degree-two encoder: for
+/// those keys its lower interaction arity is cheaper than another AIR.
+pub const PROOF_SHAPE_METADATA_LOOKUP_THRESHOLD: usize = 256;
+
+/// Largest child verifying key the verifier sub-circuit can read.
+///
+/// [`ProofShapeAir`] sorts rows by descending height then ascending AIR index, and range-checks
+/// the *gap* between consecutive equal-height indices against the selected 10- or 12-bit bus.
+/// The 4096-AIR cap is a conservative sufficient condition for the widest bus; keys whose
+/// equal-height runs are dense can have much smaller actual gaps.
+///
+/// Raised to 4096 for the native WARP bounded history span. The heavy Reth profile keys roughly
+/// 3256 AIR instances; fitting them in one MultiSTARK removes the repeated recursive history
+/// verifier. Large one-proof keys do not pay a 4096-way symbolic selector: they use the
+/// VK-committed metadata table selected by [`PROOF_SHAPE_METADATA_LOOKUP_THRESHOLD`].
+///
+/// The gap bound is the real constraint and it does *not* come for free at this size: a 737-AIR
+/// span child can produce a gap close to the full child-AIR range, so
+/// [`RECURSION_AIR_IDX_GAP_BITS`] went to twelve alongside this. `air_idx_gap` in
+/// `proof_shape/trace.rs` enforces it explicitly, so exceeding it names
+/// the offending indices rather than producing an unprovable circuit.
+///
+/// Callers that assemble a child circuit check their AIR count against this before keying, so
+/// overflowing it is a reported fallback rather than a panic.
+pub const RECURSION_MAX_CHILD_AIRS: usize = 1 << 12;
+
+/// Bit width of [`ProofShapeAir`]'s AIR-index gap range check.
+///
+/// Eight before native WARP history spans, ten for the first 1024-AIR bounded profile, and twelve
+/// for the single-proof 4096-AIR heavy-block profile. Sparse equal-height runs can span almost
+/// the complete child key, so the gap width must track the accepted key envelope.
+///
+/// This width has its own [`RangeCheckerAir`] because the range bus is keyed `(value, max_bits)`
+/// and a table publishes only its own width: the existing `<8>` table serves the `LIMB_BITS`
+/// decompositions and cannot also answer the larger-width query. `PowerCheckerAir` is the same
+/// bus's third provider, at width 5.
+pub const RECURSION_AIR_IDX_GAP_BITS: usize = 12;
+
+/// Widest AIR-index gap [`ProofShapeAir`]'s range check can carry.
+pub const RECURSION_MAX_AIR_IDX_GAP: usize = (1 << RECURSION_AIR_IDX_GAP_BITS) - 1;
 
 impl ProofShapeModule {
     pub fn new(
@@ -87,12 +156,48 @@ impl ProofShapeModule {
         b: &mut BusIndexManager,
         bus_inventory: BusInventory,
         continuations_enabled: bool,
+        max_num_proofs: usize,
     ) -> Self {
         assert!(
-            mvk.per_air.len() <= 1 << 8,
-            "recursion circuit only supports child verifying keys with at most 256 AIRs"
+            mvk.per_air.len() <= RECURSION_MAX_CHILD_AIRS,
+            "recursion circuit only supports child verifying keys with at most {RECURSION_MAX_CHILD_AIRS} AIRs"
         );
 
+        Self::new_with_transcript_mode(
+            mvk,
+            b,
+            bus_inventory,
+            continuations_enabled,
+            max_num_proofs,
+            ProofShapeTranscriptMode::Standard,
+        )
+    }
+
+    pub fn new_rebased_logup_only(
+        mvk: &MultiStarkVkeyFrame,
+        b: &mut BusIndexManager,
+        bus_inventory: BusInventory,
+        continuations_enabled: bool,
+        max_num_proofs: usize,
+    ) -> Self {
+        Self::new_with_transcript_mode(
+            mvk,
+            b,
+            bus_inventory,
+            continuations_enabled,
+            max_num_proofs,
+            ProofShapeTranscriptMode::RebasedLogUpOnly,
+        )
+    }
+
+    fn new_with_transcript_mode(
+        mvk: &MultiStarkVkeyFrame,
+        b: &mut BusIndexManager,
+        bus_inventory: BusInventory,
+        continuations_enabled: bool,
+        max_num_proofs: usize,
+        transcript_mode: ProofShapeTranscriptMode,
+    ) -> Self {
         let idx_encoder = Arc::new(Encoder::new(mvk.per_air.len(), 2, true));
 
         let (min_cached_idx, min_cached) = mvk
@@ -127,24 +232,79 @@ impl ProofShapeModule {
             })
             .collect_vec();
 
+        // One table row is consumed exactly once, so this representation is
+        // intentionally limited to verifier circuits that prove exactly one
+        // child.  Cached mains require a variable-width tuple and remain on
+        // the established encoder path until a concrete large-key user needs
+        // them.  The WARP normalization child has no cached mains.
+        let metadata_lookup_enabled = max_num_proofs == 1
+            && per_air.len() >= PROOF_SHAPE_METADATA_LOOKUP_THRESHOLD
+            && per_air
+                .iter()
+                .all(|metadata| metadata.cached_widths.is_empty());
+        let air_idx_gap_bits = if per_air.len() <= 1 << 10 { 10 } else { 12 };
+
         let range_bus = bus_inventory.range_checker_bus;
         let pow_bus = bus_inventory.power_checker_bus;
         Self {
             per_air,
             l_skip: mvk.params.l_skip,
             max_interaction_count: mvk.params.logup.max_interaction_count,
+            air_idx_gap_bits,
             bus_inventory,
             range_bus,
             pow_bus,
             permutation_bus: ProofShapePermutationBus::new(b.new_bus_idx()),
+            metadata_bus: metadata_lookup_enabled
+                .then(|| ProofShapeMetadataBus::new(b.new_bus_idx())),
             starting_tidx_bus: StartingTidxBus::new(b.new_bus_idx()),
             num_pvs_bus: NumPublicValuesBus::new(b.new_bus_idx()),
             idx_encoder,
             min_cached_idx,
             max_cached,
             commit_mult: mvk.params.whir.rounds.first().unwrap().num_queries,
+            layout_export_lookups: 0,
             continuations_enabled,
+            export_stacking_shape: true,
+            transcript_mode,
+            rebased_start_bus: matches!(
+                transcript_mode,
+                ProofShapeTranscriptMode::RebasedLogUpOnly
+            )
+            .then(|| RebasedTranscriptStartBus::new(b.new_bus_idx())),
         }
+    }
+
+    #[must_use]
+    pub fn rebased_start_bus(&self) -> Option<RebasedTranscriptStartBus> {
+        self.rebased_start_bus
+    }
+
+    /// Configure the module for a partial assembly without the stacking and
+    /// WHIR modules (the pre-v29 native WARP history certificate): the
+    /// stacked-column shape tables have no consumer and every commitment
+    /// observation is bound exactly once by the enclosing circuit's
+    /// authenticated-root bridge instead of `commit_mult` Merkle queries.
+    pub fn set_partial_assembly_exports(&mut self, commit_mult: usize) {
+        self.export_stacking_shape = false;
+        self.commit_mult = commit_mult;
+    }
+
+    /// Configure the module for a partial assembly that keeps the stacking
+    /// module but drops WHIR (the v29 native WARP history certificate): the
+    /// stacked-column shape tables keep their consumer (`OpeningClaimsAir`),
+    /// while commitment observations are bound `commit_mult` times by the
+    /// enclosing circuit instead of WHIR's Merkle queries.
+    pub fn set_partial_assembly_exports_with_stacking(&mut self, commit_mult: usize) {
+        self.export_stacking_shape = true;
+        self.commit_mult = commit_mult;
+    }
+
+    /// Publish one additional authenticated proof-shape view to an enclosing
+    /// receipt AIR. This changes only lookup multiplicities; trace generation
+    /// and the child transcript remain byte-for-byte unchanged.
+    pub fn set_layout_export_lookups(&mut self, lookups: usize) {
+        self.layout_export_lookups = lookups;
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -157,7 +317,7 @@ impl ProofShapeModule {
     ) where
         TS: FiatShamirTranscript<BabyBearPoseidon2Config> + TranscriptHistory,
     {
-        let l_skip = child_vk.inner.params.l_skip;
+        assert_eq!(self.transcript_mode, ProofShapeTranscriptMode::Standard);
         ts.observe_commit(child_vk.pre_hash);
         ts.observe_commit(proof.common_main_commit);
 
@@ -195,6 +355,77 @@ impl ProofShapeModule {
             }
         }
 
+        self.finish_preflight(
+            child_vk,
+            proof,
+            preflight,
+            starting_tidx,
+            pvs_tidx,
+            ts.len(),
+            None,
+        );
+    }
+
+    /// Begin the verifier after a caller-certified source-manifest checkpoint.
+    /// The local transcript must contain only the retained suffix. Its AIR
+    /// representation is resumed at `start.start_tidx` from `start.state`.
+    pub fn run_preflight_rebased_logup_only<TS>(
+        &self,
+        child_vk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
+        proof: &Proof<BabyBearPoseidon2Config>,
+        preflight: &mut Preflight,
+        ts: &mut TS,
+        start: crate::system::RebasedTranscriptPreflight,
+    ) where
+        TS: FiatShamirTranscript<BabyBearPoseidon2Config> + TranscriptHistory,
+    {
+        assert_eq!(
+            self.transcript_mode,
+            ProofShapeTranscriptMode::RebasedLogUpOnly
+        );
+        assert_eq!(
+            ts.len(),
+            start.start_tidx,
+            "rebased verifier must start at the certified absolute cursor"
+        );
+        ts.observe(F::from_u64(BATCH_CONSTRAINT_MODE_TAG));
+        ts.observe(F::from_u32(BATCH_CONSTRAINT_MODE_VERSION));
+        ts.observe(F::from_u32(BATCH_CONSTRAINT_LOGUP_ONLY_MODE));
+        debug_assert_eq!(
+            ts.len(),
+            start.start_tidx + BATCH_CONSTRAINT_MODE_SEPARATOR_LEN
+        );
+
+        let gkr_start = ts.len();
+        let pvs_tidx = proof
+            .public_values
+            .iter()
+            .filter(|values| !values.is_empty())
+            .map(|_| gkr_start)
+            .collect();
+        self.finish_preflight(
+            child_vk,
+            proof,
+            preflight,
+            vec![gkr_start; child_vk.inner.per_air.len()],
+            pvs_tidx,
+            gkr_start,
+            Some(start),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_preflight(
+        &self,
+        child_vk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
+        proof: &Proof<BabyBearPoseidon2Config>,
+        preflight: &mut Preflight,
+        starting_tidx: Vec<usize>,
+        pvs_tidx: Vec<usize>,
+        post_tidx: usize,
+        rebased_start: Option<crate::system::RebasedTranscriptPreflight>,
+    ) {
+        let l_skip = child_vk.inner.params.l_skip;
         let mut sorted_trace_vdata: Vec<_> = proof
             .trace_vdata
             .iter()
@@ -217,11 +448,12 @@ impl ProofShapeModule {
         let num_layers = proof.gkr_proof.claims_per_layer.len();
         let n_logup = num_layers.saturating_sub(l_skip);
 
+        preflight.rebased_transcript = rebased_start;
         preflight.proof_shape = ProofShapePreflight {
             sorted_trace_vdata,
             starting_tidx,
             pvs_tidx,
-            post_tidx: ts.len(),
+            post_tidx,
             n_max,
             n_logup,
             l_skip: child_vk.inner.params.l_skip,
@@ -231,7 +463,9 @@ impl ProofShapeModule {
 
 impl AirModule for ProofShapeModule {
     fn num_airs(&self) -> usize {
-        3
+        // ProofShape, PublicValues, and one RangeChecker per width the AIR queries: `<8>` for the
+        // `LIMB_BITS` decompositions and `<RECURSION_AIR_IDX_GAP_BITS>` for the AIR-index gap.
+        4 + usize::from(self.metadata_bus.is_some()) + usize::from(self.rebased_start_bus.is_some())
     }
 
     fn airs<SC: StarkProtocolConfig<F = F>>(&self) -> Vec<AirRef<SC>> {
@@ -242,7 +476,9 @@ impl AirModule for ProofShapeModule {
             max_cached: self.max_cached,
             commit_mult: self.commit_mult,
             max_interaction_count: self.max_interaction_count,
+            air_idx_gap_bits: self.air_idx_gap_bits,
             idx_encoder: self.idx_encoder.clone(),
+            metadata_bus: self.metadata_bus,
             range_bus: self.range_bus,
             pow_bus: self.pow_bus,
             permutation_bus: self.permutation_bus,
@@ -263,21 +499,54 @@ impl AirModule for ProofShapeModule {
             cached_commit_bus: self.bus_inventory.cached_commit_bus,
             pre_hash_bus: self.bus_inventory.pre_hash_bus,
             continuations_enabled: self.continuations_enabled,
+            layout_export_lookups: self.layout_export_lookups,
+            export_stacking_shape: self.export_stacking_shape,
+            transcript_shape_enabled: matches!(
+                self.transcript_mode,
+                ProofShapeTranscriptMode::Standard
+            ),
         };
         let pvs_air = PublicValuesAir {
             public_values_bus: self.bus_inventory.public_values_bus,
             num_pvs_bus: self.num_pvs_bus,
             transcript_bus: self.bus_inventory.transcript_bus,
             continuations_enabled: self.continuations_enabled,
+            transcript_enabled: matches!(self.transcript_mode, ProofShapeTranscriptMode::Standard),
         };
         let range_checker = RangeCheckerAir::<8> {
             bus: self.range_bus,
         };
-        vec![
+        let mut airs = vec![
             Arc::new(proof_shape_air) as AirRef<_>,
             Arc::new(pvs_air) as AirRef<_>,
             Arc::new(range_checker) as AirRef<_>,
-        ]
+        ];
+        match self.air_idx_gap_bits {
+            10 => airs.push(Arc::new(RangeCheckerAir::<10> {
+                bus: self.range_bus,
+            }) as AirRef<_>),
+            12 => airs.push(Arc::new(RangeCheckerAir::<12> {
+                bus: self.range_bus,
+            }) as AirRef<_>),
+            bits => panic!("unsupported proof-shape AIR-index gap width {bits}"),
+        }
+        if let Some(bus) = self.metadata_bus {
+            airs.push(Arc::new(ProofShapeMetadataAir {
+                per_air: self.per_air.clone(),
+                l_skip: self.l_skip,
+                min_cached_idx: self.min_cached_idx,
+                bus,
+            }) as AirRef<_>);
+        }
+        if let Some(start_bus) = self.rebased_start_bus {
+            airs.push(Arc::new(RebasedProofShapeStartAir {
+                start_bus,
+                resume_state_bus: self.bus_inventory.resume_state_bus,
+                starting_tidx_bus: self.starting_tidx_bus,
+                transcript_bus: self.bus_inventory.transcript_bus,
+            }) as AirRef<_>);
+        }
+        airs
     }
 }
 
@@ -303,11 +572,16 @@ impl<SC: StarkProtocolConfig<F = F>> TraceGenModule<GlobalCtxCpu, CpuBackend<SC>
         let external_range_checks = ctx.1;
 
         let range_checker = Arc::new(RangeCheckerCpuTraceGenerator::<8>::default());
+        let gap_range_checker =
+            proof_shape::ProofShapeGapRangeCheckerCpu::new(self.air_idx_gap_bits);
         let proof_shape = proof_shape::ProofShapeChip::<4, 8>::new(
             self.idx_encoder.clone(),
+            self.metadata_bus
+                .map(|_| Arc::<[AirMetadata]>::from(self.per_air.clone())),
             self.min_cached_idx,
             self.max_cached,
             range_checker.clone(),
+            gap_range_checker.clone(),
             pow_checker.clone(),
         );
         let ctx = (child_vk, proofs, preflights);
@@ -334,7 +608,29 @@ impl<SC: StarkProtocolConfig<F = F>> TraceGenModule<GlobalCtxCpu, CpuBackend<SC>
             ctxs.push(AirProvingContext::simple_no_pis(
                 range_checker.generate_trace_row_major(),
             ));
+            ctxs.push(AirProvingContext::simple_no_pis(
+                gap_range_checker.generate_trace_row_major(),
+            ));
         });
+        if self.metadata_bus.is_some() {
+            let required_height = required_heights.map(|heights| heights[4]);
+            let height = required_height.unwrap_or_else(|| self.per_air.len().next_power_of_two());
+            if height < self.per_air.len() {
+                return None;
+            }
+            ctxs.push(AirProvingContext::simple_no_pis(
+                generate_metadata_dummy_trace(height),
+            ));
+        }
+        if self.rebased_start_bus.is_some() {
+            let local_idx = 4 + usize::from(self.metadata_bus.is_some());
+            ctxs.push(AirProvingContext::simple_no_pis(
+                RebasedProofShapeStartTraceGenerator.generate_trace(
+                    &preflights,
+                    required_heights.map(|heights| heights[local_idx]),
+                )?,
+            ));
+        }
         Some(ctxs)
     }
 }
@@ -418,14 +714,20 @@ mod cuda_tracegen {
                 external_range_checks,
                 device_ctx.clone(),
             ));
+            let gap_range_checker_gpu = proof_shape::cuda::ProofShapeGapRangeCheckerGpu::new(
+                self.air_idx_gap_bits,
+                device_ctx.clone(),
+            );
             let proof_shape_chip = proof_shape::cuda::ProofShapeChipGpu::<4, 8>::new(
                 self.idx_encoder.width(),
+                self.metadata_bus.is_some(),
                 self.min_cached_idx,
                 self.max_cached,
                 range_checker_gpu.clone(),
+                gap_range_checker_gpu.clone(),
                 pow_checker_gpu.clone(),
             );
-            let mut ctxs = Vec::with_capacity(3);
+            let mut ctxs = Vec::with_capacity(4);
             // PERF[jpw]: we avoid par_iter so that kernel launches occur on the same stream.
             // This can be parallelized to separate streams for more CUDA stream parallelism, but it
             // will require recording events so streams properly sync for cudaMemcpyAsync and kernel
@@ -463,7 +765,26 @@ mod cuda_tracegen {
                         .expect("range checker still shared")
                         .generate_trace(),
                 ));
+                ctxs.push(AirProvingContext::simple_no_pis(
+                    gap_range_checker_gpu
+                        .into_trace()
+                        .expect("gap range checker still shared"),
+                ));
             });
+
+            if self.metadata_bus.is_some() {
+                let required_height = required_heights.map(|heights| heights[4]);
+                let height = required_height
+                    .unwrap_or_else(|| self.per_air.len().max(1).next_power_of_two());
+                if height < self.per_air.len() {
+                    return None;
+                }
+                let trace = openvm_cuda_backend::base::DeviceMatrix::<F>::with_capacity_on(
+                    height, 1, device_ctx,
+                );
+                trace.buffer().fill_zero_on(device_ctx).ok()?;
+                ctxs.push(AirProvingContext::simple_no_pis(trace));
+            }
 
             Some(ctxs)
         }

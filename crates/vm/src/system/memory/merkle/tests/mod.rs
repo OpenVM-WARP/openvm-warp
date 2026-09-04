@@ -5,7 +5,6 @@ use std::{
     sync::Arc,
 };
 
-use openvm_circuit_primitives::Chip;
 use openvm_stark_backend::{
     interaction::{PermutationCheckBus, PermutationInteractionType},
     p3_field::{Field, PrimeCharacteristicRing, PrimeField32},
@@ -19,28 +18,22 @@ use rand::RngCore;
 
 use crate::{
     arch::{
-        hasher::{Hasher, HasherChip},
         testing::{MEMORY_MERKLE_BUS, POSEIDON2_DIRECT_BUS},
-        vm_poseidon2_config, AddressSpaceHostConfig, MemoryCellType, MemoryConfig,
-        ADDR_SPACE_OFFSET,
+        AddressSpaceHostConfig, MemoryCellType, MemoryConfig, ADDR_SPACE_OFFSET,
     },
-    system::{
-        memory::{
-            merkle::{
-                memory_to_vec_partition, tests::util::HashTestChip, MemoryDimensions,
-                MemoryMerkleChip, MemoryMerkleCols, MerkleTree,
-            },
-            online::{GuestMemory, LinearMemory},
-            AddressMap, MemoryImage,
+    system::memory::{
+        merkle::{
+            memory_to_vec_partition, tests::util::HashTestChip, MemoryDimensions, MemoryMerkleChip,
+            MemoryMerkleCols, MerkleTree,
         },
-        poseidon2::Poseidon2PeripheryChip,
+        online::{GuestMemory, LinearMemory},
+        ptr_bits_from_address_height, AddressMap, MemoryImage, DIGEST_WIDTH,
     },
     utils::test_cpu_engine,
 };
 
 mod util;
 
-const CHUNK: usize = 8;
 const COMPRESSION_BUS: PermutationCheckBus = PermutationCheckBus::new(POSEIDON2_DIRECT_BUS);
 type F = BabyBear;
 
@@ -63,9 +56,9 @@ fn test(
                 initial_memory.get_f::<F>(address_space as u32, pointer as u32)
                     != final_memory.get_f(address_space as u32, pointer as u32)
             } {
-                let label = (pointer / CHUNK) as u32;
+                let label = (pointer / DIGEST_WIDTH) as u32;
                 assert!(address_space - (ADDR_SPACE_OFFSET as usize) < (1 << addr_space_height));
-                assert!(pointer < (CHUNK << address_height));
+                assert!(pointer < (DIGEST_WIDTH << address_height));
                 assert!(touched_labels.contains(&(address_space as u32, label)));
             }
         }
@@ -77,21 +70,21 @@ fn test(
         MerkleTree::from_memory(final_memory, &memory_dimensions, &hash_test_chip);
 
     let mut chip =
-        MemoryMerkleChip::<CHUNK, _>::new(memory_dimensions, merkle_bus, COMPRESSION_BUS);
-    let final_partition: BTreeMap<_, [F; CHUNK]> =
-        memory_to_vec_partition::<F, CHUNK>(final_memory, &memory_dimensions)
+        MemoryMerkleChip::<DIGEST_WIDTH, _>::new(memory_dimensions, merkle_bus, COMPRESSION_BUS);
+    let final_partition: BTreeMap<_, [F; DIGEST_WIDTH]> =
+        memory_to_vec_partition::<F, DIGEST_WIDTH>(final_memory, &memory_dimensions)
             .into_iter()
             .map(|(idx, values)| {
                 let address_space =
                     (idx >> memory_dimensions.address_height) as u32 + ADDR_SPACE_OFFSET;
                 let label = (idx & ((1 << memory_dimensions.address_height) - 1)) as u32;
-                ((address_space, label * (CHUNK as u32)), values)
+                ((address_space, label * (DIGEST_WIDTH as u32)), values)
             })
             .collect();
     let final_partition = final_partition
         .into_iter()
         .filter(|((address_space, pointer), _)| {
-            touched_labels.contains(&(*address_space, pointer / CHUNK as u32))
+            touched_labels.contains(&(*address_space, pointer / DIGEST_WIDTH as u32))
         })
         .collect();
     chip.finalize(initial_memory, &final_partition, &hash_test_chip);
@@ -102,14 +95,14 @@ fn test(
     );
     let chip_api = chip.generate_proving_ctx();
 
-    let dummy_interaction_air = DummyInteractionAir::new(4 + CHUNK, true, merkle_bus.index);
+    let dummy_interaction_air = DummyInteractionAir::new(4 + DIGEST_WIDTH, true, merkle_bus.index);
     let mut dummy_interaction_trace_rows = vec![];
     let mut interaction = |interaction_type: PermutationInteractionType,
                            is_compress: bool,
                            height: usize,
                            as_label: u32,
                            address_label: u32,
-                           hash: [BabyBear; CHUNK]| {
+                           hash: [BabyBear; DIGEST_WIDTH]| {
         let expand_direction = if is_compress {
             BabyBear::NEG_ONE
         } else {
@@ -131,7 +124,10 @@ fn test(
     for (address_space, address_label) in touched_labels {
         let initial_values = unsafe {
             array::from_fn(|i| {
-                initial_memory.get((address_space, address_label * CHUNK as u32 + i as u32))
+                initial_memory.get((
+                    address_space,
+                    address_label * DIGEST_WIDTH as u32 + i as u32,
+                ))
             })
         };
         let as_label = address_space - ADDR_SPACE_OFFSET;
@@ -144,7 +140,7 @@ fn test(
             initial_values,
         );
         let final_values = *final_partition
-            .get(&(address_space, address_label * (CHUNK as u32)))
+            .get(&(address_space, address_label * (DIGEST_WIDTH as u32)))
             .unwrap();
         interaction(
             PermutationInteractionType::Send,
@@ -200,15 +196,15 @@ fn random_test(
                 layout: MemoryCellType::Null,
             },
             AddressSpaceHostConfig {
-                num_cells: CHUNK << height,
+                num_cells: DIGEST_WIDTH << height,
                 layout: MemoryCellType::F { size: 4 },
             },
             AddressSpaceHostConfig {
-                num_cells: CHUNK << height,
+                num_cells: DIGEST_WIDTH << height,
                 layout: MemoryCellType::F { size: 4 },
             },
         ],
-        height + 3,
+        ptr_bits_from_address_height(height),
         20,
         17,
     );
@@ -222,7 +218,7 @@ fn random_test(
     while num_initial_addresses != 0 || num_touched_addresses != 0 {
         let address_space = (next_u32() & 1) + 1;
         let label = next_u32() % (1 << height);
-        let pointer = label * CHUNK as u32 + (next_u32() % CHUNK as u32);
+        let pointer = label * DIGEST_WIDTH as u32 + (next_u32() % DIGEST_WIDTH as u32);
 
         if seen.insert(pointer) {
             let is_initial = next_u32() & 1 == 0;
@@ -289,15 +285,15 @@ fn expand_test_no_accesses() {
                 layout: MemoryCellType::Null,
             },
             AddressSpaceHostConfig {
-                num_cells: CHUNK << height,
+                num_cells: DIGEST_WIDTH << height,
                 layout: MemoryCellType::F { size: 4 },
             },
             AddressSpaceHostConfig {
-                num_cells: CHUNK << height,
+                num_cells: DIGEST_WIDTH << height,
                 layout: MemoryCellType::F { size: 4 },
             },
         ],
-        height + 3,
+        ptr_bits_from_address_height(height),
         20,
         17,
     );
@@ -305,7 +301,7 @@ fn expand_test_no_accesses() {
 
     let memory = AddressMap::from_mem_config(&mem_config);
 
-    let mut chip: MemoryMerkleChip<CHUNK, _> = MemoryMerkleChip::new(
+    let mut chip: MemoryMerkleChip<DIGEST_WIDTH, _> = MemoryMerkleChip::new(
         md,
         PermutationCheckBus::new(MEMORY_MERKLE_BUS),
         COMPRESSION_BUS,
@@ -334,15 +330,15 @@ fn expand_test_negative() {
                 layout: MemoryCellType::Null,
             },
             AddressSpaceHostConfig {
-                num_cells: CHUNK << height,
+                num_cells: DIGEST_WIDTH << height,
                 layout: MemoryCellType::F { size: 4 },
             },
             AddressSpaceHostConfig {
-                num_cells: CHUNK << height,
+                num_cells: DIGEST_WIDTH << height,
                 layout: MemoryCellType::F { size: 4 },
             },
         ],
-        height + 3,
+        ptr_bits_from_address_height(height),
         20,
         17,
     );
@@ -350,7 +346,7 @@ fn expand_test_negative() {
 
     let memory = AddressMap::from_mem_config(&mem_config);
 
-    let mut chip: MemoryMerkleChip<CHUNK, _> = MemoryMerkleChip::new(
+    let mut chip: MemoryMerkleChip<DIGEST_WIDTH, _> = MemoryMerkleChip::new(
         md,
         PermutationCheckBus::new(MEMORY_MERKLE_BUS),
         COMPRESSION_BUS,
@@ -360,7 +356,7 @@ fn expand_test_negative() {
     let mut chip_ctx = chip.generate_proving_ctx();
     {
         for row in chip_ctx.common_main.rows_mut() {
-            let row: &mut MemoryMerkleCols<_, CHUNK> = row.borrow_mut();
+            let row: &mut MemoryMerkleCols<_, DIGEST_WIDTH> = row.borrow_mut();
             if row.expand_direction == BabyBear::NEG_ONE {
                 row.left_direction_different = BabyBear::ZERO;
                 row.right_direction_different = BabyBear::ZERO;
@@ -374,570 +370,6 @@ fn expand_test_negative() {
             vec![chip_ctx, hash_test_chip.generate_proving_ctx()],
         )
         .is_err());
-}
-
-const BELOW_LEAF_PATH_LEN: usize = 31;
-const COUNTEREXAMPLE_ADDRESS_HEIGHT: usize = 26;
-const COUNTEREXAMPLE_OVERALL_HEIGHT: usize = 29;
-const COUNTEREXAMPLE_TRACE_HEIGHT: usize = 256;
-
-fn counterexample_digest(seed: u32) -> [BabyBear; CHUNK] {
-    array::from_fn(|i| BabyBear::from_u32(seed.wrapping_add(17 * i as u32)))
-}
-
-fn below_path_has_prefix(path: u32, depth: usize, prefix: u32) -> bool {
-    if depth == 0 {
-        prefix == 0
-    } else {
-        path >> (BELOW_LEAF_PATH_LEN - depth) == prefix
-    }
-}
-
-fn final_direction_different(direction: BabyBear, child_has_expansion: bool) -> BabyBear {
-    if direction == BabyBear::NEG_ONE && !child_has_expansion {
-        BabyBear::ONE
-    } else {
-        BabyBear::ZERO
-    }
-}
-
-fn build_below_leaf_swap_subtree(
-    hasher: &Poseidon2PeripheryChip<BabyBear>,
-    direction: BabyBear,
-    alpha_digest: [BabyBear; CHUNK],
-    beta_digest: [BabyBear; CHUNK],
-    swap_digests: bool,
-) -> ([BabyBear; CHUNK], Vec<MemoryMerkleCols<BabyBear, CHUNK>>) {
-    #[allow(clippy::too_many_arguments)]
-    fn rec(
-        hasher: &Poseidon2PeripheryChip<BabyBear>,
-        rows: &mut Vec<MemoryMerkleCols<BabyBear, CHUNK>>,
-        direction: BabyBear,
-        alpha_digest: [BabyBear; CHUNK],
-        beta_digest: [BabyBear; CHUNK],
-        swap_digests: bool,
-        depth: usize,
-        prefix: u32,
-    ) -> [BabyBear; CHUNK] {
-        let alpha_path = 0;
-        let beta_path = BabyBear::ORDER_U32;
-
-        if depth == BELOW_LEAF_PATH_LEN {
-            if prefix == alpha_path {
-                return if swap_digests {
-                    beta_digest
-                } else {
-                    alpha_digest
-                };
-            }
-            if prefix == beta_path {
-                return if swap_digests {
-                    alpha_digest
-                } else {
-                    beta_digest
-                };
-            }
-            unreachable!("recursive subtree only follows the two selected paths")
-        }
-
-        let child_depth = depth + 1;
-        let left_prefix = prefix << 1;
-        let right_prefix = left_prefix | 1;
-        let left_has_path = below_path_has_prefix(alpha_path, child_depth, left_prefix)
-            || below_path_has_prefix(beta_path, child_depth, left_prefix);
-        let right_has_path = below_path_has_prefix(alpha_path, child_depth, right_prefix)
-            || below_path_has_prefix(beta_path, child_depth, right_prefix);
-
-        let left_child_hash = if left_has_path {
-            rec(
-                hasher,
-                rows,
-                direction,
-                alpha_digest,
-                beta_digest,
-                swap_digests,
-                child_depth,
-                left_prefix,
-            )
-        } else {
-            counterexample_digest(
-                10_000u32
-                    .wrapping_add(child_depth as u32)
-                    .wrapping_add(left_prefix),
-            )
-        };
-        let right_child_hash = if right_has_path {
-            rec(
-                hasher,
-                rows,
-                direction,
-                alpha_digest,
-                beta_digest,
-                swap_digests,
-                child_depth,
-                right_prefix,
-            )
-        } else {
-            counterexample_digest(
-                20_000u32
-                    .wrapping_add(child_depth as u32)
-                    .wrapping_add(right_prefix),
-            )
-        };
-        let parent_hash = hasher.compress_and_record(&left_child_hash, &right_child_hash);
-
-        rows.push(MemoryMerkleCols {
-            expand_direction: direction,
-            height_section: BabyBear::ZERO,
-            parent_height: -BabyBear::from_usize(depth + 1),
-            parent_height_inv: (-BabyBear::from_usize(depth + 1)).inverse(),
-            is_root: BabyBear::ZERO,
-            parent_as_label: BabyBear::ZERO,
-            parent_address_label: BabyBear::from_u32(prefix),
-            parent_hash,
-            left_child_hash,
-            right_child_hash,
-            left_direction_different: final_direction_different(
-                direction,
-                left_has_path && child_depth < BELOW_LEAF_PATH_LEN,
-            ),
-            right_direction_different: final_direction_different(
-                direction,
-                right_has_path && child_depth < BELOW_LEAF_PATH_LEN,
-            ),
-        });
-
-        parent_hash
-    }
-
-    let mut rows = vec![];
-    let root = rec(
-        hasher,
-        &mut rows,
-        direction,
-        alpha_digest,
-        beta_digest,
-        swap_digests,
-        0,
-        0,
-    );
-    (root, rows)
-}
-
-fn counterexample_zero_node_hash(
-    hasher: &impl Hasher<CHUNK, BabyBear>,
-    height: usize,
-) -> [BabyBear; CHUNK] {
-    let mut hash = hasher.hash(&[BabyBear::ZERO; CHUNK]);
-    for _ in 0..height {
-        hash = hasher.compress(&hash, &hash);
-    }
-    hash
-}
-
-fn counterexample_parent_labels(
-    memory_dimensions: MemoryDimensions,
-    height: usize,
-    prefix: u64,
-) -> (u32, u32) {
-    if height > memory_dimensions.address_height {
-        (prefix as u32, 0)
-    } else {
-        let address_prefix_bits = memory_dimensions.address_height - height;
-        let address_mask = (1u64 << address_prefix_bits) - 1;
-        (
-            (prefix >> address_prefix_bits) as u32,
-            (prefix & address_mask) as u32,
-        )
-    }
-}
-
-#[derive(Clone, Copy)]
-struct CounterexampleLeafUpdate {
-    index: u64,
-    initial_hash: [BabyBear; CHUNK],
-    final_hash: [BabyBear; CHUNK],
-}
-
-fn build_counterexample_canonical_rows(
-    hasher: &Poseidon2PeripheryChip<BabyBear>,
-    memory_dimensions: MemoryDimensions,
-    leaf_updates: &[CounterexampleLeafUpdate],
-) -> (
-    [BabyBear; CHUNK],
-    [BabyBear; CHUNK],
-    Vec<MemoryMerkleCols<BabyBear, CHUNK>>,
-) {
-    let mut current = BTreeMap::new();
-    for update in leaf_updates {
-        assert!(
-            current
-                .insert(update.index, (update.initial_hash, update.final_hash))
-                .is_none(),
-            "duplicate leaf update"
-        );
-    }
-
-    let overall_height = memory_dimensions.overall_height();
-    let mut rows_by_height = (0..=overall_height).map(|_| Vec::new()).collect::<Vec<_>>();
-
-    #[allow(clippy::needless_range_loop)]
-    for height in 1..=overall_height {
-        let parent_prefixes = current
-            .keys()
-            .map(|index| index >> 1)
-            .collect::<BTreeSet<_>>();
-        let mut next = BTreeMap::new();
-
-        for parent_prefix in parent_prefixes {
-            let left_prefix = parent_prefix << 1;
-            let right_prefix = left_prefix | 1;
-            let (left_initial_hash, left_final_hash, left_changed) =
-                if let Some(&(initial_hash, final_hash)) = current.get(&left_prefix) {
-                    (initial_hash, final_hash, true)
-                } else {
-                    let hash = counterexample_zero_node_hash(hasher, height - 1);
-                    (hash, hash, false)
-                };
-            let (right_initial_hash, right_final_hash, right_changed) =
-                if let Some(&(initial_hash, final_hash)) = current.get(&right_prefix) {
-                    (initial_hash, final_hash, true)
-                } else {
-                    let hash = counterexample_zero_node_hash(hasher, height - 1);
-                    (hash, hash, false)
-                };
-
-            let initial_hash = hasher.compress_and_record(&left_initial_hash, &right_initial_hash);
-            let final_hash = hasher.compress_and_record(&left_final_hash, &right_final_hash);
-            let (parent_as_label, parent_address_label) =
-                counterexample_parent_labels(memory_dimensions, height, parent_prefix);
-            let height_section = BabyBear::from_bool(height > memory_dimensions.address_height);
-            let is_root = BabyBear::from_bool(height == overall_height);
-
-            rows_by_height[height].push(MemoryMerkleCols {
-                expand_direction: BabyBear::ONE,
-                height_section,
-                parent_height: BabyBear::from_usize(height),
-                parent_height_inv: BabyBear::from_usize(height).inverse(),
-                is_root,
-                parent_as_label: BabyBear::from_u32(parent_as_label),
-                parent_address_label: BabyBear::from_u32(parent_address_label),
-                parent_hash: initial_hash,
-                left_child_hash: left_initial_hash,
-                right_child_hash: right_initial_hash,
-                left_direction_different: BabyBear::ZERO,
-                right_direction_different: BabyBear::ZERO,
-            });
-            rows_by_height[height].push(MemoryMerkleCols {
-                expand_direction: BabyBear::NEG_ONE,
-                height_section,
-                parent_height: BabyBear::from_usize(height),
-                parent_height_inv: BabyBear::from_usize(height).inverse(),
-                is_root,
-                parent_as_label: BabyBear::from_u32(parent_as_label),
-                parent_address_label: BabyBear::from_u32(parent_address_label),
-                parent_hash: final_hash,
-                left_child_hash: left_final_hash,
-                right_child_hash: right_final_hash,
-                left_direction_different: BabyBear::from_bool(!left_changed),
-                right_direction_different: BabyBear::from_bool(!right_changed),
-            });
-
-            next.insert(parent_prefix, (initial_hash, final_hash));
-        }
-
-        current = next;
-    }
-
-    let (root_index, (initial_root, final_root)) =
-        current.into_iter().next().expect("missing root");
-    assert_eq!(root_index, 0);
-
-    let mut rows = vec![];
-    for height in (1..=overall_height).rev() {
-        rows.append(&mut rows_by_height[height]);
-    }
-
-    (initial_root, final_root, rows)
-}
-
-fn build_hidden_leaf_expansion_row(
-    hasher: &Poseidon2PeripheryChip<BabyBear>,
-    direction: BabyBear,
-    address_space_label: u32,
-    leaf_label: u32,
-    below_leaf_root: [BabyBear; CHUNK],
-    unchanged_sibling_hash: [BabyBear; CHUNK],
-) -> ([BabyBear; CHUNK], MemoryMerkleCols<BabyBear, CHUNK>) {
-    let parent_hash = hasher.compress_and_record(&below_leaf_root, &unchanged_sibling_hash);
-    (
-        parent_hash,
-        MemoryMerkleCols {
-            expand_direction: direction,
-            height_section: BabyBear::ZERO,
-            parent_height: BabyBear::ZERO,
-            parent_height_inv: BabyBear::ZERO,
-            is_root: BabyBear::ZERO,
-            parent_as_label: BabyBear::from_u32(address_space_label),
-            parent_address_label: BabyBear::from_u32(leaf_label),
-            parent_hash,
-            left_child_hash: below_leaf_root,
-            right_child_hash: unchanged_sibling_hash,
-            left_direction_different: final_direction_different(direction, true),
-            right_direction_different: final_direction_different(direction, false),
-        },
-    )
-}
-
-/// Builds the fraudulent below-leaf-swap merkle trace and recording
-/// [`Poseidon2PeripheryChip`], with no boundary leaf and no memory-bus
-/// interaction.
-///
-/// A "hidden" leaf's hash is silently changed by swapping two digests in a
-/// fabricated subtree *below* it. Since the leaf comes from a merkle expansion
-/// row (at `parent_height = 0`) rather than the boundary chip, the fraud records
-/// no memory write yet changes the Merkle root. Everything balances on the
-/// merkle and compression buses alone, so only {merkle, poseidon2} need
-/// replacing in the real VM key.
-///
-/// Returns the trace, its public values (`initial_root || final_root`), and the
-/// Poseidon2 chip.
-fn build_below_leaf_swap_fraud_merkle(
-    memory_dimensions: MemoryDimensions,
-    poseidon2_max_constraint_degree: usize,
-) -> (
-    RowMajorMatrix<BabyBear>,
-    Vec<BabyBear>,
-    Poseidon2PeripheryChip<BabyBear>,
-) {
-    assert_eq!(BabyBear::ORDER_U32, 0b1111000000000000000000000000001);
-
-    let poseidon2_chip = Poseidon2PeripheryChip::<BabyBear>::new(
-        vm_poseidon2_config(),
-        poseidon2_max_constraint_degree,
-    );
-
-    let alpha_digest = counterexample_digest(1);
-    let beta_digest = counterexample_digest(2);
-    let (initial_below_root, initial_below_rows) = build_below_leaf_swap_subtree(
-        &poseidon2_chip,
-        BabyBear::ONE,
-        alpha_digest,
-        beta_digest,
-        false,
-    );
-    let (final_below_root, final_below_rows) = build_below_leaf_swap_subtree(
-        &poseidon2_chip,
-        BabyBear::NEG_ONE,
-        alpha_digest,
-        beta_digest,
-        true,
-    );
-    assert_ne!(initial_below_root, final_below_root);
-
-    let hidden_address_space_label = 0;
-    let hidden_leaf_label = 0;
-    let hidden_leaf_index = memory_dimensions.label_to_index((
-        ADDR_SPACE_OFFSET + hidden_address_space_label,
-        hidden_leaf_label,
-    ));
-    let hidden_unchanged_sibling_hash = [BabyBear::ZERO; CHUNK];
-    let (initial_hidden_leaf_hash, initial_hidden_leaf_row) = build_hidden_leaf_expansion_row(
-        &poseidon2_chip,
-        BabyBear::ONE,
-        hidden_address_space_label,
-        hidden_leaf_label,
-        initial_below_root,
-        hidden_unchanged_sibling_hash,
-    );
-    let (final_hidden_leaf_hash, final_hidden_leaf_row) = build_hidden_leaf_expansion_row(
-        &poseidon2_chip,
-        BabyBear::NEG_ONE,
-        hidden_address_space_label,
-        hidden_leaf_label,
-        final_below_root,
-        hidden_unchanged_sibling_hash,
-    );
-    assert_ne!(initial_hidden_leaf_hash, final_hidden_leaf_hash);
-
-    let (initial_root, final_root, mut rows) = build_counterexample_canonical_rows(
-        &poseidon2_chip,
-        memory_dimensions,
-        &[CounterexampleLeafUpdate {
-            index: hidden_leaf_index,
-            initial_hash: initial_hidden_leaf_hash,
-            final_hash: final_hidden_leaf_hash,
-        }],
-    );
-    assert_ne!(initial_root, final_root);
-
-    rows.push(initial_hidden_leaf_row);
-    rows.push(final_hidden_leaf_row);
-
-    let mut initial_below_by_depth = (0..BELOW_LEAF_PATH_LEN)
-        .map(|_| Vec::new())
-        .collect::<Vec<_>>();
-    let mut final_below_by_depth = (0..BELOW_LEAF_PATH_LEN)
-        .map(|_| Vec::new())
-        .collect::<Vec<_>>();
-    for row in initial_below_rows {
-        let depth = (BabyBear::ORDER_U32 - row.parent_height.as_canonical_u32()) as usize;
-        initial_below_by_depth[depth - 1].push(row);
-    }
-    for row in final_below_rows {
-        let depth = (BabyBear::ORDER_U32 - row.parent_height.as_canonical_u32()) as usize;
-        final_below_by_depth[depth - 1].push(row);
-    }
-    for depth in 0..BELOW_LEAF_PATH_LEN {
-        rows.append(&mut initial_below_by_depth[depth]);
-        rows.append(&mut final_below_by_depth[depth]);
-    }
-
-    let trace_height = rows
-        .len()
-        .next_power_of_two()
-        .max(COUNTEREXAMPLE_TRACE_HEIGHT);
-    // Pad with inert rows: `parent_height` must match the last real row so the
-    // descending-`parent_height` constraint holds; all else is zero.
-    let padding_height = rows.last().unwrap().parent_height;
-    while rows.len() < trace_height {
-        rows.push(MemoryMerkleCols {
-            expand_direction: BabyBear::ZERO,
-            height_section: BabyBear::ZERO,
-            parent_height: padding_height,
-            parent_height_inv: padding_height.inverse(),
-            is_root: BabyBear::ZERO,
-            parent_as_label: BabyBear::ZERO,
-            parent_address_label: BabyBear::ZERO,
-            parent_hash: [BabyBear::ZERO; CHUNK],
-            left_child_hash: [BabyBear::ZERO; CHUNK],
-            right_child_hash: [BabyBear::ZERO; CHUNK],
-            left_direction_different: BabyBear::ZERO,
-            right_direction_different: BabyBear::ZERO,
-        });
-    }
-
-    let merkle_width = MemoryMerkleCols::<BabyBear, CHUNK>::width();
-    let mut merkle_trace = BabyBear::zero_vec(merkle_width * trace_height);
-    for (trace_row, row) in merkle_trace.chunks_exact_mut(merkle_width).zip(rows) {
-        *trace_row.borrow_mut() = row;
-    }
-
-    let public_values = initial_root.into_iter().chain(final_root).collect();
-    (
-        RowMajorMatrix::new(merkle_trace, merkle_width),
-        public_values,
-        poseidon2_chip,
-    )
-}
-
-/// Regression test for the below-leaf-swap counterexample against the **real**
-/// OpenVM verifying key (the production persistent-memory `SystemConfig`), not a
-/// hand-picked subset of AIRs.
-///
-/// We key-gen the real config, run a trivial program to obtain a fully
-/// bus-balanced proving context, then overwrite only the merkle and poseidon2
-/// contexts with the fraudulent ones and run the real prover + verifier. The
-/// merkle, compression and memory buses balance among only {boundary (empty),
-/// merkle, poseidon2} -- exactly the chips a real persistent-memory VM uses
-/// there -- so no permissive dummy chip is involved.
-///
-/// The fraud hides a Merkle root change inside a leaf-expansion row at
-/// `parent_height = 0` (plus a fabricated subtree below it), backed by zero
-/// memory operations. The fixed `MemoryMerkleAir` forbids `parent_height = 0`
-/// whenever `expand_direction != 0`, so the production verifier must now
-/// **reject** this proof.
-#[test]
-fn real_vm_keygen_verifier_rejects_below_leaf_swap_counterexample() {
-    use openvm_instructions::{
-        exe::VmExe, instruction::Instruction, program::Program, LocalOpcode,
-        SystemOpcode::TERMINATE,
-    };
-
-    use crate::{
-        arch::{PreflightExecutionOutput, Streams, SystemConfig, VirtualMachine, VmState},
-        system::{
-            memory::{online::GuestMemory, AddressMap},
-            SystemCpuBuilder,
-        },
-    };
-
-    let vm_config = SystemConfig::default();
-    // The default config has exactly the Merkle dimensions the counterexample
-    // is built for.
-    let memory_dimensions = vm_config.memory_config.memory_dimensions();
-    assert_eq!(
-        memory_dimensions.address_height,
-        COUNTEREXAMPLE_ADDRESS_HEIGHT
-    );
-    assert_eq!(
-        memory_dimensions.overall_height(),
-        COUNTEREXAMPLE_OVERALL_HEIGHT
-    );
-
-    let engine = test_cpu_engine();
-    let (mut vm, pk) =
-        VirtualMachine::new_with_keygen(engine, SystemCpuBuilder, vm_config.clone()).unwrap();
-    let vk = pk.get_vk();
-
-    let merkle_air_id = vm_config.memory_merkle_air_id();
-
-    // The poseidon2 periphery AIR index isn't a fixed constant, so find it by name.
-    let poseidon2_air_id = vm
-        .air_names()
-        .position(|name| name.contains("Poseidon2Periphery"))
-        .unwrap();
-
-    // Run a trivial program (single TERMINATE) for a valid, bus-balanced proving
-    // context. It touches no memory, so the boundary AIR is empty and the
-    // merkle/compression/memory buses are left to {merkle, poseidon2}, which we
-    // overwrite below.
-    let program = Program::from_instructions(&[Instruction::<BabyBear>::from_isize(
-        TERMINATE.global_opcode(),
-        0,
-        0,
-        0,
-        0,
-        0,
-    )]);
-    let vm_exe: VmExe<BabyBear> = program.into();
-    let max_trace_heights = vec![0; vk.inner.per_air.len()];
-    let memory = GuestMemory::new(AddressMap::from_mem_config(&vm_config.memory_config));
-    vm.transport_init_memory_to_device(&memory);
-    vm.load_program(vm.commit_program_on_device(&vm_exe.program));
-    let from_state = VmState::new_with_defaults(0, memory, Streams::default(), 0);
-    let mut interpreter = vm.preflight_interpreter(&vm_exe).unwrap();
-    let PreflightExecutionOutput {
-        system_records,
-        record_arenas,
-        ..
-    } = vm
-        .execute_preflight(&mut interpreter, from_state, None, &max_trace_heights)
-        .unwrap();
-    let mut ctx = vm
-        .generate_proving_ctx(system_records, record_arenas)
-        .unwrap();
-
-    // Overwrite the merkle + poseidon2 contexts with the fraudulent ones.
-    // `prove` requires `per_air` to be sorted by AIR id, so we re-sort after
-    // swapping the entries in.
-    let (merkle_trace, merkle_pvs, poseidon2_chip) =
-        build_below_leaf_swap_fraud_merkle(memory_dimensions, vm_config.max_constraint_degree);
-    ctx.per_trace
-        .retain(|(id, _)| *id != merkle_air_id && *id != poseidon2_air_id);
-    ctx.per_trace.push((
-        merkle_air_id,
-        AirProvingContext::simple(merkle_trace, merkle_pvs),
-    ));
-    ctx.per_trace
-        .push((poseidon2_air_id, poseidon2_chip.generate_proving_ctx(())));
-    ctx.per_trace.sort_by_key(|(id, _)| *id);
-
-    let proof = vm.engine.prove(vm.pk(), ctx).unwrap();
-    assert!(
-        vm.engine.verify(&vk, &proof).is_err(),
-        "fixed OpenVM verifier must reject the fraudulent below-leaf-swap proof"
-    );
 }
 
 #[test]
@@ -956,11 +388,11 @@ fn expand_test_label_rebinding_attack() {
                 layout: MemoryCellType::Null,
             },
             AddressSpaceHostConfig {
-                num_cells: CHUNK << height,
+                num_cells: DIGEST_WIDTH << height,
                 layout: MemoryCellType::field32(),
             },
             AddressSpaceHostConfig {
-                num_cells: CHUNK << height,
+                num_cells: DIGEST_WIDTH << height,
                 layout: MemoryCellType::field32(),
             },
         ],
@@ -972,27 +404,27 @@ fn expand_test_label_rebinding_attack() {
 
     let mut memory = GuestMemory::new(AddressMap::from_mem_config(&mem_config));
     unsafe {
-        memory.write(1, fake_label * CHUNK as u32, [BabyBear::from_u8(69)]);
+        memory.write(1, fake_label * DIGEST_WIDTH as u32, [BabyBear::from_u8(69)]);
     }
 
     let touched_labels_for_chip = BTreeSet::from([(1u32, fake_label)]);
     let touched_labels_for_dummy = BTreeSet::from([(1u32, claimed_label)]);
 
-    let final_partition_for_chip: BTreeMap<_, [BabyBear; CHUNK]> =
-        memory_to_vec_partition::<BabyBear, CHUNK>(&memory.memory, &md)
+    let final_partition_for_chip: BTreeMap<_, [BabyBear; DIGEST_WIDTH]> =
+        memory_to_vec_partition::<BabyBear, DIGEST_WIDTH>(&memory.memory, &md)
             .into_iter()
             .map(|(idx, values)| {
                 let address_space = (idx >> md.address_height) as u32 + ADDR_SPACE_OFFSET;
                 let label = (idx & ((1 << md.address_height) - 1)) as u32;
-                ((address_space, label * (CHUNK as u32)), values)
+                ((address_space, label * (DIGEST_WIDTH as u32)), values)
             })
             .filter(|((address_space, pointer), _)| {
-                touched_labels_for_chip.contains(&(*address_space, pointer / CHUNK as u32))
+                touched_labels_for_chip.contains(&(*address_space, pointer / DIGEST_WIDTH as u32))
             })
             .collect();
 
     let merkle_bus = PermutationCheckBus::new(MEMORY_MERKLE_BUS);
-    let mut chip = MemoryMerkleChip::<CHUNK, _>::new(md, merkle_bus, COMPRESSION_BUS);
+    let mut chip = MemoryMerkleChip::<DIGEST_WIDTH, _>::new(md, merkle_bus, COMPRESSION_BUS);
     chip.finalize(&memory.memory, &final_partition_for_chip, &hash_test_chip);
     let mut chip_ctx = chip.generate_proving_ctx();
 
@@ -1018,7 +450,7 @@ fn expand_test_label_rebinding_attack() {
         }
 
         for row in chip_ctx.common_main.rows_mut() {
-            let row: &mut MemoryMerkleCols<BabyBear, CHUNK> = row.borrow_mut();
+            let row: &mut MemoryMerkleCols<BabyBear, DIGEST_WIDTH> = row.borrow_mut();
             if row.expand_direction == BabyBear::ZERO {
                 continue;
             }
@@ -1027,14 +459,14 @@ fn expand_test_label_rebinding_attack() {
         }
     }
 
-    let dummy_interaction_air = DummyInteractionAir::new(4 + CHUNK, true, merkle_bus.index);
+    let dummy_interaction_air = DummyInteractionAir::new(4 + DIGEST_WIDTH, true, merkle_bus.index);
     let mut dummy_interaction_trace_rows = vec![];
     let mut interaction = |interaction_type: PermutationInteractionType,
                            is_compress: bool,
                            height: usize,
                            as_label: u32,
                            address_label: u32,
-                           hash: [BabyBear; CHUNK]| {
+                           hash: [BabyBear; DIGEST_WIDTH]| {
         let expand_direction = if is_compress {
             BabyBear::NEG_ONE
         } else {
@@ -1058,7 +490,7 @@ fn expand_test_label_rebinding_attack() {
             array::from_fn(|i| {
                 memory
                     .memory
-                    .get((address_space, fake_label * CHUNK as u32 + i as u32))
+                    .get((address_space, fake_label * DIGEST_WIDTH as u32 + i as u32))
             })
         };
         let as_label = address_space - ADDR_SPACE_OFFSET;

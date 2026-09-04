@@ -15,6 +15,10 @@ use p3_matrix::Matrix;
 
 use crate::{
     bus::{TranscriptBus, TranscriptBusMessage},
+    native_warp::{
+        NativeReductionEndpointInputBus, NativeReductionEndpointInputMessage,
+        NATIVE_REDUCTION_ENDPOINT_STACKING_POINT,
+    },
     stacking::bus::{
         EqKernelLookupBus, EqRandValuesLookupBus, EqRandValuesLookupMessage, StackingModuleTidxBus,
         StackingModuleTidxMessage, SumcheckClaimsBus, SumcheckClaimsMessage,
@@ -63,6 +67,13 @@ pub struct UnivariateRoundAir {
 
     // Other fields
     pub l_skip: usize,
+    /// Verifier-owned global transcript key for ordered setup authority.
+    /// Internal buses continue to use the reduction-local `proof_idx`.
+    pub authority_transcript_proof_idx: Option<usize>,
+    /// Partial-assembly export: re-publish the sampled u_0 as the native
+    /// reduction endpoint input (`STACKING_POINT`, index 0) with the given
+    /// consumer count.
+    pub native_point_export: Option<(NativeReductionEndpointInputBus, usize)>,
 }
 
 impl BaseAirWithPublicValues<F> for UnivariateRoundAir {}
@@ -224,6 +235,19 @@ where
             and(local.is_last, local.is_valid) * AB::F::TWO,
         );
 
+        if let Some((endpoint_input_bus, point_lookups)) = self.native_point_export {
+            endpoint_input_bus.add_key_with_lookups(
+                builder,
+                NativeReductionEndpointInputMessage {
+                    reduction: local.proof_idx.into(),
+                    kind: AB::Expr::from_usize(NATIVE_REDUCTION_ENDPOINT_STACKING_POINT),
+                    index: AB::Expr::ZERO,
+                    value: local.u_0.map(Into::into),
+                },
+                and(local.is_last, local.is_valid) * AB::Expr::from_usize(point_lookups),
+            );
+        }
+
         /*
          * Constrain transcript operations and send the final tidx to SumcheckRoundsAir.
          */
@@ -242,9 +266,13 @@ where
         );
 
         for i in 0..D_EF {
+            let transcript_proof_idx = self
+                .authority_transcript_proof_idx
+                .map(AB::Expr::from_usize)
+                .unwrap_or_else(|| local.proof_idx.into());
             self.transcript_bus.receive(
                 builder,
-                local.proof_idx,
+                transcript_proof_idx.clone(),
                 TranscriptBusMessage {
                     tidx: AB::Expr::from_usize(i) + local.tidx,
                     value: local.coeff[i].into(),
@@ -255,7 +283,7 @@ where
 
             self.transcript_bus.receive(
                 builder,
-                local.proof_idx,
+                transcript_proof_idx,
                 TranscriptBusMessage {
                     tidx: AB::Expr::from_usize(i + D_EF) + local.tidx,
                     value: local.u_0[i].into(),

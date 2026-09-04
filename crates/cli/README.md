@@ -15,7 +15,7 @@ cargo run --bin cargo-openvm -- --help
 You can install the CLI locally from source by running the following command:
 
 ```bash
-cd crates/cli
+cd cli
 cargo install --force --locked --path .
 ```
 

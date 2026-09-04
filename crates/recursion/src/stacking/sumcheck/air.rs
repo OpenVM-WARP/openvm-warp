@@ -18,9 +18,14 @@ use crate::{
         ConstraintSumcheckRandomness, ConstraintSumcheckRandomnessBus, TranscriptBus,
         TranscriptBusMessage, WhirOpeningPointBus, WhirOpeningPointMessage,
     },
+    native_warp::{
+        NativeReductionEndpointInputBus, NativeReductionEndpointInputMessage,
+        NATIVE_REDUCTION_ENDPOINT_STACKING_POINT,
+    },
     stacking::bus::{
         EqBaseBus, EqBaseMessage, EqKernelLookupBus, EqKernelLookupMessage, EqRandValuesLookupBus,
-        EqRandValuesLookupMessage, StackingModuleTidxBus, StackingModuleTidxMessage,
+        EqRandValuesLookupMessage, OrderedStackingSourcePointBus,
+        OrderedStackingSourcePointMessage, StackingModuleTidxBus, StackingModuleTidxMessage,
         SumcheckClaimsBus, SumcheckClaimsMessage,
     },
     subairs::nested_for_loop::{NestedForLoopIoCols, NestedForLoopSubAir},
@@ -78,6 +83,9 @@ pub struct SumcheckRoundsCols<F> {
 pub struct SumcheckRoundsAir {
     // External buses
     pub constraint_randomness_bus: ConstraintSumcheckRandomnessBus,
+    /// Setup-authority source point in ordered mode. Legacy mode continues to
+    /// consume positive coordinates from `constraint_randomness_bus`.
+    pub ordered_source_point_bus: Option<OrderedStackingSourcePointBus>,
     pub whir_opening_point_bus: WhirOpeningPointBus,
     pub transcript_bus: TranscriptBus,
 
@@ -89,6 +97,16 @@ pub struct SumcheckRoundsAir {
     pub eq_kernel_lookup_bus: EqKernelLookupBus,
 
     pub l_skip: usize,
+    /// Verifier-owned global transcript key for ordered setup authority.
+    /// Internal buses continue to use the reduction-local `proof_idx`.
+    pub authority_transcript_proof_idx: Option<usize>,
+    /// False in a partial assembly without the WHIR module: gates off the
+    /// opening-point sends.
+    pub emit_whir_point: bool,
+    /// Partial-assembly export: re-publish each sampled round challenge as a
+    /// native reduction endpoint input (`STACKING_POINT`, indexed by the
+    /// 1-based round) with the given consumer count.
+    pub native_point_export: Option<(NativeReductionEndpointInputBus, usize)>,
 }
 
 impl BaseAirWithPublicValues<F> for SumcheckRoundsAir {}
@@ -334,25 +352,56 @@ where
          * Because we sample u_round and r_round from the transcript here, we send
          * them to other AIRs that need to use it.
          */
-        self.constraint_randomness_bus.receive(
-            builder,
-            local.proof_idx,
-            ConstraintSumcheckRandomness {
-                idx: local.round,
-                challenge: local.r_round,
-            },
-            and(local.is_valid, local.has_r),
-        );
+        let source_point_enabled = and(local.is_valid, local.has_r);
+        if let Some(source_point_bus) = self.ordered_source_point_bus {
+            source_point_bus.receive(
+                builder,
+                local.proof_idx,
+                OrderedStackingSourcePointMessage {
+                    coordinate_idx: local.round.into(),
+                    value: local.r_round.map(Into::into),
+                },
+                source_point_enabled,
+            );
+        } else {
+            self.constraint_randomness_bus.receive(
+                builder,
+                local.proof_idx,
+                ConstraintSumcheckRandomness {
+                    idx: local.round,
+                    challenge: local.r_round,
+                },
+                source_point_enabled,
+            );
+        }
 
-        self.whir_opening_point_bus.send(
-            builder,
-            local.proof_idx,
-            WhirOpeningPointMessage {
-                idx: local.round + AB::Expr::from_usize(self.l_skip - 1),
-                value: local.u_round.map(Into::into),
-            },
-            local.is_valid,
-        );
+        if self.emit_whir_point {
+            self.whir_opening_point_bus.send(
+                builder,
+                local.proof_idx,
+                WhirOpeningPointMessage {
+                    idx: local.round + AB::Expr::from_usize(self.l_skip - 1),
+                    value: local.u_round.map(Into::into),
+                },
+                local.is_valid,
+            );
+        }
+
+        if let Some((endpoint_input_bus, point_lookups)) = self.native_point_export {
+            endpoint_input_bus.add_key_with_lookups(
+                builder,
+                NativeReductionEndpointInputMessage {
+                    reduction: local.proof_idx.into(),
+                    kind: AB::Expr::from_usize(NATIVE_REDUCTION_ENDPOINT_STACKING_POINT),
+                    // Match the ordinary WHIR point exactly: EqBase owns
+                    // coordinates `0..l_skip`, and Boolean-cube sumcheck
+                    // rounds follow immediately afterward.
+                    index: (local.round + AB::Expr::from_usize(self.l_skip - 1)).into(),
+                    value: local.u_round.map(Into::into),
+                },
+                local.is_valid * AB::Expr::from_usize(point_lookups),
+            );
+        }
 
         self.eq_rand_values_bus.add_key_with_lookups(
             builder,
@@ -383,9 +432,13 @@ where
             .assert_eq(local.tidx + AB::F::from_usize(3 * D_EF), next.tidx);
 
         for i in 0..D_EF {
+            let transcript_proof_idx = self
+                .authority_transcript_proof_idx
+                .map(AB::Expr::from_usize)
+                .unwrap_or_else(|| local.proof_idx.into());
             self.transcript_bus.receive(
                 builder,
-                local.proof_idx,
+                transcript_proof_idx.clone(),
                 TranscriptBusMessage {
                     tidx: AB::Expr::from_usize(i) + local.tidx,
                     value: local.s_eval_at_1[i].into(),
@@ -396,7 +449,7 @@ where
 
             self.transcript_bus.receive(
                 builder,
-                local.proof_idx,
+                transcript_proof_idx.clone(),
                 TranscriptBusMessage {
                     tidx: AB::Expr::from_usize(i + D_EF) + local.tidx,
                     value: local.s_eval_at_2[i].into(),
@@ -407,7 +460,7 @@ where
 
             self.transcript_bus.receive(
                 builder,
-                local.proof_idx,
+                transcript_proof_idx,
                 TranscriptBusMessage {
                     tidx: AB::Expr::from_usize(i + 2 * D_EF) + local.tidx,
                     value: local.u_round[i].into(),

@@ -7,46 +7,6 @@ and this project follows a versioning principles documented in [VERSIONING.md](.
 
 ## Unreleased
 
-## v2.1.0 (2026-08-25)
-
-### Added
-- Added optional STARK proof verification with the certified Swirl verifier extracted from its Lean formalization to the SDK and CLI.
-
-### Changed
-- Updated recursion and continuation circuit interactions and constraints for formal verification.
-- Marked all verifier circuit AIRs as required during key generation.
-
-## v2.0.2 (2026-08-07)
-
-### Changed
-- Improved the Halo2 GPU prover to achieve sub-5-second SNARK proving.
-
-## v2.0.1 (2026-07-15)
-
-### Changed
-- Updated Cargo manifests and yanked dependencies.
-
-## v2.0.0 (2026-07-06)
-
-### Added
-- (Recursion) Add the recursive verifier circuit for the SWIRL proof system.
-- (Continuations/Deferrals) Add the continuation aggregation pipeline and deferral framework, including the `verify-stark` deferral path for guest programs.
-- (Guest Library/SHA-2) Add guest library support for SHA-256, SHA-384, and SHA-512 incremental hashers.
-- (Guest Library/Keccak) Add Keccak-256 guest library support with incremental hashing.
-
-### Changed
-- (Prover) Use the SWIRL proof system through STARK Backend v2.0.0.
-- (Circuits/Memory) Remove memory access adapters from the VM memory system.
-- (Circuits/SHA-2) Replace the SHA-256-specific AIR with SHA-2 family AIRs for SHA-256, SHA-384, and SHA-512.
-- (Circuits/Keccak) Redesign the Keccak-256 AIRs, splitting Keccak-f into operation and permutation AIRs.
-
-## v1.7.0
-
-### Changed
-- (Circuits/Memory) Fix a soundness issue in `MemoryMerkleAir` by rejecting Merkle expansion rows below the leaf layer, preventing malformed traces from changing the committed memory root without a corresponding memory operation.
-- (Verifier) Fix a selector-clash issue in the Solidity verifier wrapper to ensure proof verification runs through the generated Halo2 fallback.
-- (Verifier) Reject non-canonical BN254 scalar encodings for `appExeCommit` and `appVmCommit` in the Solidity verifier wrapper.
-
 ## v1.6.0
 
 ### Changed

@@ -8,9 +8,24 @@ use openvm_stark_backend::{
 };
 
 pub mod deferral;
+pub mod finite_warp_v3;
 pub mod inner;
+pub mod native_warp_accumulator;
+pub mod native_warp_history_v19;
+pub mod reduced_swirl_recursive_prefix;
+pub mod reduced_swirl_source_leaf;
+pub mod reduced_swirl_source_receipt;
+pub mod reduced_swirl_source_tree_bridge;
+pub mod reduced_swirl_transition_finalizer;
+pub mod reduced_swirl_transition_leaf;
+pub mod reduced_swirl_warp;
 pub mod root;
 pub mod subair;
+// The reduced-VACC verifier currently shares typed source/provenance buses
+// with this module. Keep it compiled until those common buses move into the
+// reduced-SWIRL namespace.
+pub mod verifier_warp_history_chunk_v3;
+pub mod verifier_warp_history_v2;
 
 pub struct SubCircuitTraceData<PB: ProverBackend> {
     pub air_proving_ctxs: Vec<AirProvingContext<PB>>,

@@ -17,13 +17,11 @@ use crate::{
     wrapper::Halo2WrapperProvingKey,
 };
 
-// The default graph program is currently about 143 MiB when serialized as JSON.
-const MAX_JSON_SECTION_LEN: usize = 256 * 1024 * 1024;
+const MAX_JSON_SECTION_LEN: usize = 64 * 1024 * 1024;
 
 impl Encode for StaticVerifierProvingKey {
     fn encode<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         write_json_section(writer, &(&self.circuit, &self.shape))?;
-        write_json_section(writer, &self.graph_program)?;
         self.pinning.encode(writer)
     }
 }
@@ -31,13 +29,11 @@ impl Encode for StaticVerifierProvingKey {
 impl Decode for StaticVerifierProvingKey {
     fn decode<R: Read>(reader: &mut R) -> io::Result<Self> {
         let (circuit, shape) = read_json_section(reader)?;
-        let graph_program = read_json_section(reader)?;
         let pinning = Halo2ProvingPinning::decode(reader)?;
         Ok(Self {
             circuit,
             pinning,
             shape,
-            graph_program,
         })
     }
 }

@@ -8,15 +8,15 @@ on:
   push:
     branches:
       - main
+      - develop-v2.0.0-beta
 
 permissions:
   contents: write
 
 jobs:
   rebase:
-    name: Rebase branches
     runs-on:
-      - runs-on=${{ github.run_id }}/runner=1cpu-linux-x64/volume=40gb
+      - runs-on=${{ github.run_id }}/runner=1cpu-linux-x64
     steps:
       # This step exchanges your app credentials for a temporary token
       - name: Generate GitHub App Token
@@ -27,11 +27,6 @@ jobs:
           private-key: ${{ secrets.REBASE_APP_PRIVATE_KEY }}
 
       # Use the generated token for git operations
-      - name: Load SSH key
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: |
-            ${{ secrets.GH_ACTIONS_DEPLOY_PRIVATE_KEY }}
       - uses: actions/checkout@v6.0.1
         with:
           fetch-depth: 0
@@ -45,7 +40,7 @@ jobs:
       - name: Rebase Feature Branches
         run: |
           # List of feature branches to maintain
-          FEATURE_BRANCHES=()
+          FEATURE_BRANCHES=("develop-v2.0.0-rc.2")
 
           FAILED_BRANCHES=()
           SUCCEEDED_BRANCHES=()

@@ -9,9 +9,9 @@ use openvm_circuit::{
     system::memory::merkle::public_values::UserPublicValuesProof,
     utils::test_utils::test_system_config,
 };
-use openvm_rv32im_circuit::{Rv32IConfig, Rv32ImBuilder, Rv32ImConfig};
-use openvm_rv32im_transpiler::{
-    Rv32ITranspilerExtension, Rv32IoTranspilerExtension, Rv32MTranspilerExtension,
+use openvm_riscv_circuit::{Rv64IConfig, Rv64ImBuilder, Rv64ImConfig};
+use openvm_riscv_transpiler::{
+    Rv64ITranspilerExtension, Rv64IoTranspilerExtension, Rv64MTranspilerExtension,
 };
 use openvm_stark_backend::{
     keygen::types::MultiStarkVerifyingKey, proof::Proof, AirRef, StarkEngine, SystemParams,
@@ -31,12 +31,13 @@ use p3_field::PrimeCharacteristicRing;
 use test_case::test_case;
 use tracing::Level;
 
-use crate::{circuit::inner::VerifierCircuitType, prover::ChildVkKind, SC};
+use crate::{prover::ChildVkKind, SC};
 
 #[cfg(feature = "cuda")]
 mod dummy;
 #[cfg(all(feature = "cuda", feature = "root-prover"))]
 mod e2e;
+mod verifier_batch_context;
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "cuda")] {
@@ -111,9 +112,9 @@ pub(in crate::tests) fn hook_system_params() -> SystemParams {
     hook_params_with_100_bits_security()
 }
 
-pub(in crate::tests) fn test_rv32im_config() -> Rv32ImConfig {
-    Rv32ImConfig {
-        rv32i: Rv32IConfig {
+pub(in crate::tests) fn test_rv64im_config() -> Rv64ImConfig {
+    Rv64ImConfig {
+        rv64i: Rv64IConfig {
             system: test_system_config(),
             ..Default::default()
         },
@@ -129,7 +130,7 @@ pub(in crate::tests) fn run_leaf_aggregation(
     Proof<SC>,
     UserPublicValuesProof<DIGEST_SIZE, F>,
 )> {
-    let config = test_rv32im_config();
+    let config = test_rv64im_config();
     let elf = Elf::decode(
         include_bytes!("../../programs/examples/fibonacci.elf"),
         MEM_SIZE as u32,
@@ -137,9 +138,9 @@ pub(in crate::tests) fn run_leaf_aggregation(
     let exe = VmExe::from_elf(
         elf,
         Transpiler::<F>::default()
-            .with_extension(Rv32ITranspilerExtension)
-            .with_extension(Rv32MTranspilerExtension)
-            .with_extension(Rv32IoTranspilerExtension),
+            .with_extension(Rv64ITranspilerExtension)
+            .with_extension(Rv64MTranspilerExtension)
+            .with_extension(Rv64IoTranspilerExtension),
     )?;
     let input = (1u64 << log_fib_input)
         .to_le_bytes()
@@ -147,7 +148,7 @@ pub(in crate::tests) fn run_leaf_aggregation(
         .to_vec();
 
     let engine = Engine::new(app_system_params());
-    let (vm, app_pk) = VirtualMachine::new_with_keygen(engine, Rv32ImBuilder, config)?;
+    let (vm, app_pk) = VirtualMachine::new_with_keygen(engine, Rv64ImBuilder, config)?;
     let cached_program_trace = vm.commit_program_on_device(&exe.program);
     let mut instance = VmInstance::new(vm, exe.into(), cached_program_trace)?;
     let app_proof = instance.prove(vec![input])?;
@@ -155,7 +156,7 @@ pub(in crate::tests) fn run_leaf_aggregation(
     let leaf_prover = InnerProver::<DEFAULT_MAX_NUM_PROOFS>::new::<Engine>(
         Arc::new(app_pk.get_vk()),
         leaf_system_params(),
-        VerifierCircuitType::Leaf,
+        false,
         None,
     );
     let leaf_proof =
@@ -185,7 +186,7 @@ fn run_full_aggregation(
     let internal_for_leaf_prover = InnerProver::<DEFAULT_MAX_NUM_PROOFS>::new::<Engine>(
         leaf_vk,
         internal_system_params(),
-        VerifierCircuitType::InternalForLeaf,
+        false,
         None,
     );
     let internal_for_leaf_proof = internal_for_leaf_prover
@@ -194,7 +195,7 @@ fn run_full_aggregation(
     let internal_recursive_prover = InnerProver::<DEFAULT_MAX_NUM_PROOFS>::new::<Engine>(
         internal_for_leaf_prover.get_vk(),
         internal_system_params(),
-        VerifierCircuitType::InternalRecursive,
+        true,
         None,
     );
     let mut internal_recursive_proof = internal_recursive_prover
@@ -231,7 +232,7 @@ fn test_two_segments_leaf_aggregation() -> Result<()> {
 #[test_case(true ; "def_hook_cached_commit set")]
 fn test_internal_recursive_vk_stabilization(def_hook_cached_commit_set: bool) -> Result<()> {
     setup_tracing_with_log_level(Level::INFO);
-    let config = test_rv32im_config();
+    let config = test_rv64im_config();
 
     let engine = Engine::new(app_system_params());
     let (_, app_vk) = engine.keygen(
@@ -247,19 +248,19 @@ fn test_internal_recursive_vk_stabilization(def_hook_cached_commit_set: bool) ->
     let leaf_prover = InnerProver::<MAX_LEAF_NUM_PROOFS>::new::<Engine>(
         Arc::new(app_vk),
         leaf_system_params(),
-        VerifierCircuitType::Leaf,
+        false,
         def_hook_cached_commit,
     );
     let internal_0_prover = InnerProver::<DEFAULT_MAX_NUM_PROOFS>::new::<Engine>(
         leaf_prover.get_vk(),
         internal_system_params(),
-        VerifierCircuitType::InternalForLeaf,
+        false,
         def_hook_cached_commit,
     );
     let internal_1_prover = InnerProver::<DEFAULT_MAX_NUM_PROOFS>::new::<Engine>(
         internal_0_prover.get_vk(),
         internal_system_params(),
-        VerifierCircuitType::InternalRecursive,
+        false,
         def_hook_cached_commit,
     );
 
@@ -267,7 +268,7 @@ fn test_internal_recursive_vk_stabilization(def_hook_cached_commit_set: bool) ->
     let test_prover = InnerProver::<DEFAULT_MAX_NUM_PROOFS>::new::<Engine>(
         internal_1_prover.get_vk(),
         internal_system_params(),
-        VerifierCircuitType::InternalRecursive,
+        true,
         def_hook_cached_commit,
     );
     assert_eq!(
@@ -300,7 +301,7 @@ fn test_root_prover(extra_recursive_layers: usize) -> Result<()> {
         user_pvs_proof,
     ) = run_full_aggregation(10, extra_recursive_layers)?;
 
-    let system_config = test_rv32im_config().rv32i.system;
+    let system_config = test_rv64im_config().rv64i.system;
 
     let root_prover = RootProver::new::<RootEngine>(
         internal_recursive_vk,
@@ -311,13 +312,13 @@ fn test_root_prover(extra_recursive_layers: usize) -> Result<()> {
         None,
         None,
     );
-    let engine = root_prover.create_engine::<RootEngine>();
+    let engine = RootEngine::new(root_prover.get_vk().inner.params.clone());
     let ctx = root_prover.generate_proving_ctx_no_def::<<RootEngine as StarkEngine>::PB, _>(
         internal_recursive_proof,
         &user_pvs_proof,
         &engine.device().device_ctx,
     );
-    let root_proof = root_prover.root_prove_from_ctx::<RootEngine>(ctx.unwrap(), &engine)?;
+    let root_proof = root_prover.root_prove_from_ctx::<RootEngine>(ctx.unwrap())?;
 
     let vk = root_prover.get_vk();
     engine.verify(&vk, &root_proof)?;
@@ -335,7 +336,7 @@ fn test_root_prover_trace_heights() -> Result<()> {
         user_pvs_proof,
     ) = run_full_aggregation(10, 1)?;
 
-    let system_config = test_rv32im_config().rv32i.system;
+    let system_config = test_rv64im_config().rv64i.system;
 
     let root_base_prover = RootProver::new::<RootEngine>(
         internal_recursive_vk.clone(),
@@ -347,7 +348,7 @@ fn test_root_prover_trace_heights() -> Result<()> {
         None,
     );
     let root_pk = root_base_prover.get_pk();
-    let engine = root_base_prover.create_engine::<RootEngine>();
+    let engine = RootEngine::new(root_pk.params.clone());
     let ctx = root_base_prover
         .generate_proving_ctx_no_def::<<RootEngine as StarkEngine>::PB, _>(
             internal_recursive_proof.clone(),
@@ -373,7 +374,7 @@ fn test_root_prover_trace_heights() -> Result<()> {
         None,
         Some(trace_heights.clone()),
     );
-    let engine2 = root_prover.create_engine::<RootEngine>();
+    let engine2 = RootEngine::new(root_prover.get_pk().params.clone());
     let ctx = root_prover
         .generate_proving_ctx_no_def::<<RootEngine as StarkEngine>::PB, _>(
             internal_recursive_proof,
@@ -385,7 +386,7 @@ fn test_root_prover_trace_heights() -> Result<()> {
     for ((air_idx, air_ctx), expected_height) in ctx.per_trace.iter().zip(trace_heights) {
         assert_eq!(air_ctx.height(), expected_height, "air_idx {air_idx}");
     }
-    let root_proof = root_prover.root_prove_from_ctx::<RootEngine>(ctx, &engine2)?;
+    let root_proof = root_prover.root_prove_from_ctx::<RootEngine>(ctx)?;
 
     let vk = root_prover.get_vk();
     let engine = RootEngine::new(vk.inner.params.clone());
@@ -443,20 +444,13 @@ pub(in crate::tests) fn generate_deferral_internal_recursive_proof_from_copies(
     let mut current_proofs = vec![def_proof.clone(); num_copies];
     let mut child_merkle_depth = 0usize;
 
-    let leaf_prover = DeferralInnerProver::new::<Engine>(
-        deferral_vk,
-        leaf_system_params(),
-        VerifierCircuitType::Leaf,
-    );
+    let leaf_prover = DeferralInnerProver::new::<Engine>(deferral_vk, leaf_system_params(), false);
     current_proofs =
         aggregate_deferral_layer(&leaf_prover, &current_proofs, false, child_merkle_depth)?;
     child_merkle_depth += 1;
 
-    let internal_for_leaf_prover = DeferralInnerProver::new::<Engine>(
-        leaf_prover.get_vk(),
-        internal_system_params(),
-        VerifierCircuitType::InternalForLeaf,
-    );
+    let internal_for_leaf_prover =
+        DeferralInnerProver::new::<Engine>(leaf_prover.get_vk(), internal_system_params(), false);
     current_proofs = aggregate_deferral_layer(
         &internal_for_leaf_prover,
         &current_proofs,
@@ -466,11 +460,8 @@ pub(in crate::tests) fn generate_deferral_internal_recursive_proof_from_copies(
     child_merkle_depth += 1;
 
     let child_vk = internal_for_leaf_prover.get_vk();
-    let internal_recursive_prover = DeferralInnerProver::new::<Engine>(
-        child_vk,
-        internal_system_params(),
-        VerifierCircuitType::InternalRecursive,
-    );
+    let internal_recursive_prover =
+        DeferralInnerProver::new::<Engine>(child_vk, internal_system_params(), true);
     loop {
         current_proofs = aggregate_deferral_layer(
             &internal_recursive_prover,
@@ -565,11 +556,8 @@ fn test_deferral_leaf_prover(num_children: usize) -> Result<()> {
     setup_tracing_with_log_level(Level::INFO);
     let (deferral_vk, def_proof) = dummy::generate_single_dummy_def_proof()?;
 
-    let deferral_inner_prover = DeferralInnerProver::new::<Engine>(
-        deferral_vk,
-        leaf_system_params(),
-        VerifierCircuitType::Leaf,
-    );
+    let deferral_inner_prover =
+        DeferralInnerProver::new::<Engine>(deferral_vk, leaf_system_params(), false);
     let wrapped_proof = deferral_inner_prover.agg_prove::<Engine>(
         &vec![def_proof.clone(); num_children],
         DeferralChildVkKind::DeferralCircuit,
@@ -644,25 +632,18 @@ fn test_deferral_internal_recursive_vk_stabilization() -> Result<()> {
     setup_tracing_with_log_level(Level::INFO);
     let (deferral_vk, _) = dummy::generate_single_dummy_def_proof()?;
 
-    let leaf_prover = DeferralInnerProver::new::<Engine>(
-        deferral_vk,
-        leaf_system_params(),
-        VerifierCircuitType::Leaf,
-    );
-    let internal_0_prover = DeferralInnerProver::new::<Engine>(
-        leaf_prover.get_vk(),
-        internal_system_params(),
-        VerifierCircuitType::InternalForLeaf,
-    );
+    let leaf_prover = DeferralInnerProver::new::<Engine>(deferral_vk, leaf_system_params(), false);
+    let internal_0_prover =
+        DeferralInnerProver::new::<Engine>(leaf_prover.get_vk(), internal_system_params(), false);
     let internal_1_prover = DeferralInnerProver::new::<Engine>(
         internal_0_prover.get_vk(),
         internal_system_params(),
-        VerifierCircuitType::InternalRecursive,
+        false,
     );
     let test_prover = DeferralInnerProver::new::<Engine>(
         internal_1_prover.get_vk(),
         internal_system_params(),
-        VerifierCircuitType::InternalRecursive,
+        true,
     );
 
     assert_eq!(

@@ -25,7 +25,6 @@ use p3_matrix::Matrix;
 
 use crate::circuit::{
     deferral::inner::bus::{DefPvsConsistencyBus, DefPvsConsistencyMessage},
-    inner::VerifierCircuitType,
     utils::{assert_vk_commit_eq, assert_vk_commit_unset},
 };
 
@@ -57,7 +56,6 @@ pub struct DeferralVerifierPvsAir {
     pub pre_hash_bus: PreHashBus,
     pub range_bus: RangeCheckerBus,
     pub def_pvs_consistency_bus: DefPvsConsistencyBus,
-    pub verifier_type: VerifierCircuitType,
 }
 
 impl<F> BaseAir<F> for DeferralVerifierPvsAir {
@@ -267,8 +265,6 @@ impl<AB: AirBuilder + InteractionBuilder + AirBuilderWithPublicValues> Air<AB>
             recursion_depth,
             internal_recursive_vk_commit,
         } = builder.public_values().borrow();
-
-        builder.assert_eq(internal_flag, AB::Expr::from_u8(self.verifier_type as u8));
 
         // constrain internal_flag is 0 at the leaf level
         builder

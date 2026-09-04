@@ -1,12 +1,9 @@
 [package]
 name = "openvm-circuit-derive"
-description = "Procedural macros for OpenVM circuits."
 version.workspace = true
-authors.workspace = true
 edition.workspace = true
-rust-version.workspace = true
-homepage.workspace = true
-repository.workspace = true
+authors.workspace = true
+description = "Procedural macros for OpenVM circuits."
 license.workspace = true
 
 [lib]
@@ -20,4 +17,5 @@ itertools = { workspace = true }
 
 [features]
 aot = []
+rvr = []
 tco = []

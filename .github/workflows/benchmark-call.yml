@@ -1,4 +1,4 @@
-name: Run Individual Benchmark
+name: "Benchmark: running individual benchmarks"
 
 on:
   workflow_dispatch:
@@ -10,8 +10,8 @@ on:
       instance_type:
         type: string
         required: false
-        description: The AWS instance type or family (e.g., m8g.16xlarge)
-        default: g7.4xlarge
+        description: The AWS instance type or family (e.g., m7g.16xlarge)
+        default: g6.2xlarge
       memory_allocator:
         type: string
         required: false
@@ -43,8 +43,8 @@ on:
       instance_type:
         type: string
         required: false
-        description: The AWS instance type or family (e.g., m8g.16xlarge)
-        default: g7.4xlarge
+        description: The AWS instance type or family (e.g., m7g.16xlarge)
+        default: g6.2xlarge
       memory_allocator:
         type: string
         required: false
@@ -86,9 +86,9 @@ permissions:
 
 jobs:
   bench-new:
-    name: Run benchmark
+    name: Run benchmark on workflow ref/branch
     runs-on:
-      - runs-on=${{ github.run_id }}-benchcall-${{ github.run_attempt }}-${{ inputs.job_index || inputs.benchmark_id || inputs.benchmark_name || github.event.inputs.benchmark_name }}/family=${{ inputs.instance_type || github.event.inputs.instance_type }}/image=${{ startsWith(inputs.instance_type || github.event.inputs.instance_type, 'g') && 'ubuntu24-gpu-x64' || contains(inputs.instance_type || github.event.inputs.instance_type, 'g.') && 'ubuntu24-full-arm64' || 'ubuntu24-full-x64' }}/volume=80gb/spot=capacity-optimized/extras=s3-cache
+      - runs-on=${{ github.run_id }}-benchcall-${{ github.run_attempt }}-${{ inputs.job_index || inputs.benchmark_id || inputs.benchmark_name || github.event.inputs.benchmark_name }}/family=${{ inputs.instance_type || github.event.inputs.instance_type }}/image=${{ startsWith(inputs.instance_type || github.event.inputs.instance_type, 'g') && 'ubuntu24-gpu-x64' || contains(inputs.instance_type || github.event.inputs.instance_type, 'g.') && 'ubuntu24-full-arm64' || 'ubuntu24-full-x64' }}/spot=capacity-optimized/extras=s3-cache
     steps:
       - uses: runs-on/action@v2
         with:
@@ -96,11 +96,6 @@ jobs:
       ##########################################################################
       # Environment setup                                                      #
       ##########################################################################
-      - name: Load SSH key
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: |
-            ${{ secrets.GH_ACTIONS_DEPLOY_PRIVATE_KEY }}
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -110,7 +105,6 @@ jobs:
           rm -rf ~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu || true
       - uses: dtolnay/rust-toolchain@stable
       - uses: ./.github/actions/sccache
-
       - uses: ./.github/actions/rust-cache-cuda
         with:
           cache-on-failure: true
@@ -144,10 +138,6 @@ jobs:
 
           if [[ "${E2E_BENCH}" == "true" ]]; then
             FEATURE_FLAGS=${FEATURE_FLAGS},evm
-            # On GPU instances, prove the halo2/EVM layer on GPU too (halo2-gpu implies cuda + evm).
-            if [[ "${{ inputs.instance_type || github.event.inputs.instance_type }}" =~ ^g ]]; then
-              FEATURE_FLAGS=${FEATURE_FLAGS},halo2-gpu
-            fi
             echo "FEATURE_FLAGS=${FEATURE_FLAGS}" >> $GITHUB_ENV
             bash ./scripts/trusted_setup_s3.sh
             PARAMS_DIR=${{ inputs.kzg_params_dir || github.event.inputs.kzg_params_dir || '$HOME/.openvm/params' }}

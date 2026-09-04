@@ -9,11 +9,8 @@ on:
     branches: ["**"]
     paths:
       - "crates/circuits/**"
-      - "crates/toolchain/instructions/**"
-      - "crates/toolchain/platform/**"
       - "crates/vm/**"
       - "Cargo.toml"
-      - "Cargo.lock"
       - ".github/workflows/base-tests.cuda.yml"
 
 concurrency:
@@ -26,25 +23,18 @@ env:
 
 jobs:
   tests-cuda:
-    name: Primitives, Poseidon2, and VM
     runs-on:
-      - runs-on=${{ github.run_id }}-base-tests-cuda-${{ github.run_attempt }}/image=ubuntu24-gpu-x64/family=g7.2xlarge+g6.2xlarge+g5.2xlarge/volume=40gb/spot=price-capacity-optimized/extras=s3-cache # ensure 24G vram for async test
+      - runs-on=${{ github.run_id }}-base-tests-cuda-${{ github.run_attempt }}/image=ubuntu24-gpu-x64/family=g6.*+g5/cpu=4+32/volume=40gb/spot=capacity-optimized/extras=s3-cache # ensure 24G vram for async test
 
     steps:
       - uses: runs-on/action@v2
         with:
           sccache: s3
-      - name: Load SSH key
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: |
-            ${{ secrets.GH_ACTIONS_DEPLOY_PRIVATE_KEY }}
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         env:
           RUSTUP_PERMIT_COPY_RENAME: "1"
       - uses: ./.github/actions/sccache
-
       - uses: ./.github/actions/rust-cache-cuda
         with:
           cache-on-failure: true

@@ -21,7 +21,6 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # install nightly Rust toolchain for binary builds
 rustup install nightly-2026-01-18
-rustup component add rust-src --toolchain nightly-2026-01-18
 
 # install build tools for Ubuntu
 sudo apt update
@@ -43,7 +42,6 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # install nightly Rust toolchain for binary builds
 rustup install nightly-2026-01-18
-rustup component add rust-src --toolchain nightly-2026-01-18
 
 # install build tools for macOS
 xcode-select --install
@@ -66,7 +64,7 @@ svm use 0.8.19
 Begin the installation:
 
 ```bash
-cargo +1.91 install --locked --git https://github.com/openvm-org/openvm.git --tag v2.1.0 cargo-openvm
+cargo +1.91 install --locked --git https://github.com/openvm-org/openvm.git --tag v2.0.0-beta.2 cargo-openvm
 ```
 
 This will globally install `cargo-openvm`. You can validate a successful installation with:
@@ -80,7 +78,7 @@ cargo openvm --version
 To build from source, clone the repository and begin the installation.
 
 ```bash
-git clone --branch v2.1.0 --single-branch https://github.com/openvm-org/openvm.git
+git clone --branch v2.0.0-beta.2 --single-branch https://github.com/openvm-org/openvm.git
 cd openvm
 cargo install --locked --force --path crates/cli
 ```
@@ -95,17 +93,13 @@ cargo openvm --version
 
 It is possible to install the OpenVM CLI with support for Nvidia GPUs. This requires installation on a machine with an Nvidia GPU and associated drivers (see [Installation Prerequisites (CUDA)](#installation-prerequisites-cuda))
 
-With this version of the CLI, the `prove app` and `prove stark` commands will utilize the Nvidia GPU for hardware acceleration. To also run the EVM proof (`prove evm`) on the GPU, build with the `halo2-gpu` feature in place of `cuda`. Currently only single GPU support is available through the CLI.
+With this version of the CLI, the `prove app` and `prove stark` commands will utilize the Nvidia GPU for hardware acceleration. Currently only single GPU support is available through the CLI.
 
 ### Installation Prerequisites (CUDA)
 
 You will need all of the common prerequisites listed [above](#installation-prerequisites). In addition, you will need to have a machine with
 - Nvidia GPU drivers [installed](https://docs.nvidia.com/datacenter/tesla/driver-installation-guide/index.html#)
 - CUDA toolkit [installed](https://docs.nvidia.com/cuda/archive/12.9.0/cuda-installation-guide-linux/index.html)
-
-:::warning
-CUDA EVM proving (`prove evm` built with the `halo2-gpu` feature) is the most memory-intensive part of the proving flow, using considerably more GPU memory than `prove app` or `prove stark`. Expect peak GPU memory usage to be at least 25 GB, and we recommend using a GPU with at least 32 GB of available memory.
-:::
 
 For machines running Ubuntu 24.04, you can install Nvidia drivers using
 
@@ -145,7 +139,7 @@ To check that CUDA toolkit is installed, run
 nvcc --version
 ```
 
-The OpenVM CLI has been tested with CUDA toolkit versions 12.9, 13.0, and 13.1. OpenVM's default CI runners use CUDA toolkit version 12.9, so we regard 12.9 as the most stable target.
+The OpenVM CLI has been tested with CUDA toolkit version 12.9, and this is the version we recommend installing. The CLI is likely to also work with CUDA toolkit version 13.0, but it has not been tested as thoroughly.
 
 Post-installation, ensure that you set the proper [path variables for CUDA](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/#environment-setup):
 ```bash
@@ -157,7 +151,7 @@ export LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64${LD_LIBRARY_PATH:+:${LD_LIBRAR
 Begin the installation:
 
 ```bash
-cargo +1.91 install --locked --git https://github.com/openvm-org/openvm.git --tag v2.1.0 --features cuda cargo-openvm
+cargo +1.91 install --locked --git https://github.com/openvm-org/openvm.git --tag v2.0.0-beta.2 --features cuda cargo-openvm
 ```
 
 This will globally install `cargo-openvm`. You can validate a successful installation with:
@@ -171,7 +165,7 @@ cargo openvm --version
 To build from source, clone the repository and begin the installation.
 
 ```bash
-git clone --branch v2.1.0 --single-branch https://github.com/openvm-org/openvm.git
+git clone --branch v2.0.0-beta.2 --single-branch https://github.com/openvm-org/openvm.git
 cd openvm
 cargo install --locked --force --path crates/cli --features cuda
 ```
@@ -198,10 +192,10 @@ Begin the installation:
 
 :::code-group
 ```bash [Without GPU]
-cargo +nightly-2026-01-18 install --locked --git https://github.com/openvm-org/openvm.git --tag v2.1.0 --features tco cargo-openvm
+cargo +nightly-2026-01-18 install --locked --git https://github.com/openvm-org/openvm.git --tag v2.0.0-beta.2 --features tco cargo-openvm
 ```
 ```bash [Nvidia GPU]
-cargo +nightly-2026-01-18 install --locked --git https://github.com/openvm-org/openvm.git --tag v2.1.0 --features tco,cuda cargo-openvm
+cargo +nightly-2026-01-18 install --locked --git https://github.com/openvm-org/openvm.git --tag v2.0.0-beta.2 --features tco,cuda cargo-openvm
 ```
 :::
 
@@ -216,7 +210,7 @@ cargo openvm --version
 To build from source, first clone the repository.
 
 ```bash
-git clone --branch v2.1.0 --single-branch https://github.com/openvm-org/openvm.git
+git clone --branch v2.0.0-beta.2 --single-branch https://github.com/openvm-org/openvm.git
 cd openvm
 ```
 
@@ -249,10 +243,10 @@ Begin the installation:
 
 :::code-group
 ```bash [Without GPU]
-cargo +1.91 install --locked --git https://github.com/openvm-org/openvm.git --tag v2.1.0 --features aot cargo-openvm
+cargo +1.91 install --locked --git https://github.com/openvm-org/openvm.git --tag v2.0.0-beta.2 --features aot cargo-openvm
 ```
 ```bash [Nvidia GPU]
-cargo +1.91 install --locked --git https://github.com/openvm-org/openvm.git --tag v2.1.0 --features aot,cuda cargo-openvm
+cargo +1.91 install --locked --git https://github.com/openvm-org/openvm.git --tag v2.0.0-beta.2 --features aot,cuda cargo-openvm
 ```
 :::
 
@@ -267,7 +261,7 @@ cargo openvm --version
 To build from source, first clone the repository.
 
 ```bash
-git clone --branch v2.1.0 --single-branch https://github.com/openvm-org/openvm.git
+git clone --branch v2.0.0-beta.2 --single-branch https://github.com/openvm-org/openvm.git
 cd openvm
 ```
 
@@ -287,3 +281,15 @@ This will globally install `cargo-openvm`. You can validate a successful install
 ```bash
 cargo openvm --version
 ```
+
+## Install the OpenVM Rust Toolchain
+
+`cargo openvm build` cross-compiles guest programs with a custom Rust toolchain built from the [openvm-org/rust](https://github.com/openvm-org/rust) fork, which adds the `riscv64im-unknown-openvm-elf` tier-3 target with prebuilt `std`/`core`/`alloc`/`panic_abort` rlibs. Install it once after installing `cargo-openvm`:
+
+```bash
+cargo openvm toolchain install
+```
+
+This downloads the prebuilt tarball for your host triple from the fork's [Releases](https://github.com/openvm-org/rust/releases) page, extracts it under `~/.openvm/toolchains/`, and links it into rustup. The default toolchain is the stable OpenVM release `openvm-1.94.0`. To install another published release — including nightly variants for guest code that needs nightly Rust features — pass `--version <tag>` (e.g. `--version openvm-nightly-2026-01-18`).
+
+You can list and remove installed openvm toolchains with `cargo openvm toolchain list` and `cargo openvm toolchain uninstall`.
