@@ -31,10 +31,35 @@ struct ProofShapeTracegenInputs {
     uint32_t max_interaction_count;
     size_t max_cached;
     size_t min_cached_idx;
+    size_t selector_width;
+    uint32_t metadata_lookup;
+    size_t air_idx_gap_bits;
     Digest pre_hash;
     uint32_t *range_checker_8_ptr;
     uint32_t *range_checker_5_ptr;
+    // Table for the AIR-index gap, checked at air_idx_gap_bits rather than LIMB_BITS. Separate
+    // because the range bus is keyed (value, max_bits) and a table publishes only its own width.
+    uint32_t *range_checker_gap_ptr;
     uint32_t *pow_checker_ptr;
+};
+
+/// Must match Rust `ProofShapeMetadataCols`.  This tuple is written into the
+/// dynamic selector tail and authenticated against the VK-committed metadata
+/// table by the AIR.
+template <typename T> struct ProofShapeMetadataCols {
+    T air_idx;
+    T is_required;
+    T need_rot;
+    T num_public_values;
+    T has_public_values;
+    T num_interactions;
+    T num_interactions_limbs[NUM_LIMBS];
+    T main_width;
+    T is_min_cached;
+    T has_preprocessed;
+    T preprocessed_log_height;
+    T preprocessed_width;
+    T preprocessed_commit[DIGEST_SIZE];
 };
 
 template <typename T, size_t MAX_CACHED> struct ProofShapeCols {
@@ -75,6 +100,48 @@ __device__ __forceinline__ void decompose(Decomp decomp, size_t value) {
     for (size_t i = 0; i < NUM_LIMBS; i++) {
         decomp[i] = (value >> (i * LIMB_BITS)) & mask;
     }
+}
+
+__device__ __forceinline__ void write_metadata_row(
+    RowSlice row, AirData &air_data, size_t air_idx, size_t min_cached_idx
+) {
+    Decomp interaction_decomp;
+    decompose(interaction_decomp, air_data.num_interactions_per_row);
+    COL_WRITE_VALUE(row, ProofShapeMetadataCols, air_idx, air_idx);
+    COL_WRITE_VALUE(row, ProofShapeMetadataCols, is_required, air_data.is_required);
+    COL_WRITE_VALUE(row, ProofShapeMetadataCols, need_rot, air_data.need_rot);
+    COL_WRITE_VALUE(
+        row, ProofShapeMetadataCols, num_public_values, air_data.num_public_values
+    );
+    COL_WRITE_VALUE(
+        row, ProofShapeMetadataCols, has_public_values, air_data.num_public_values != 0
+    );
+    COL_WRITE_VALUE(
+        row,
+        ProofShapeMetadataCols,
+        num_interactions,
+        air_data.num_interactions_per_row
+    );
+    COL_WRITE_ARRAY(
+        row, ProofShapeMetadataCols, num_interactions_limbs, interaction_decomp
+    );
+    COL_WRITE_VALUE(row, ProofShapeMetadataCols, main_width, air_data.common_main_width);
+    COL_WRITE_VALUE(row, ProofShapeMetadataCols, is_min_cached, air_idx == min_cached_idx);
+    COL_WRITE_VALUE(
+        row, ProofShapeMetadataCols, has_preprocessed, air_data.has_preprocessed
+    );
+    COL_WRITE_VALUE(
+        row,
+        ProofShapeMetadataCols,
+        preprocessed_log_height,
+        air_data.preprocessed_log_height
+    );
+    COL_WRITE_VALUE(
+        row, ProofShapeMetadataCols, preprocessed_width, air_data.preprocessed_width
+    );
+    COL_WRITE_ARRAY(
+        row, ProofShapeMetadataCols, preprocessed_commit, air_data.preprocessed_commit
+    );
 }
 
 template <size_t MAX_CACHED> struct Cols {
@@ -348,11 +415,14 @@ __global__ void proof_shape_tracegen(
         COL_WRITE_VALUE(row, typename Cols<MAX_CACHED>::template Type, n_logup, proof_data.n_logup);
 
         Encoder encoder(inputs.num_airs, 2, true);
-        size_t encoder_flags_idx =
+        size_t selector_idx =
             COL_INDEX(typename Cols<MAX_CACHED>::template Type, cached_commits);
-        size_t cached_commits_idx = encoder_flags_idx + encoder.width();
+        size_t cached_commits_idx = selector_idx + inputs.selector_width;
 
         RangeChecker range_checker(inputs.range_checker_8_ptr, LIMB_BITS);
+        RangeChecker gap_range_checker(
+            inputs.range_checker_gap_ptr, inputs.air_idx_gap_bits
+        );
         PowerChecker<32> pow_checker(inputs.pow_checker_ptr, inputs.range_checker_5_ptr);
 
         if (record_idx == inputs.num_airs) {
@@ -376,7 +446,7 @@ __global__ void proof_shape_tracegen(
                 range_checker,
                 pow_checker
             );
-            row.fill_zero(encoder_flags_idx, encoder.width());
+            row.fill_zero(selector_idx, inputs.selector_width);
         } else {
             TraceHeight trace_height = sorted_trace_heights[proof_idx][record_idx];
             TraceMetadata trace_data = sorted_trace_metadata[proof_idx][record_idx];
@@ -396,7 +466,16 @@ __global__ void proof_shape_tracegen(
                 row, typename Cols<MAX_CACHED>::template Type, is_n_max_greater, Fp::zero()
             );
 
-            encoder.write_flag_pt(row.slice_from(encoder_flags_idx), trace_height.air_idx);
+            if (inputs.metadata_lookup != 0) {
+                write_metadata_row(
+                    row.slice_from(selector_idx),
+                    air_data[trace_height.air_idx],
+                    trace_height.air_idx,
+                    inputs.min_cached_idx
+                );
+            } else {
+                encoder.write_flag_pt(row.slice_from(selector_idx), trace_height.air_idx);
+            }
 
             if (record_idx + 1 < inputs.num_airs) {
                 bool is_present = record_idx < proof_data.num_present;
@@ -414,7 +493,9 @@ __global__ void proof_shape_tracegen(
                     is_height_equal_to_next
                 );
                 if (is_height_equal_to_next) {
-                    range_checker.add_count(next_trace_height.air_idx - trace_height.air_idx - 1);
+                    gap_range_checker.add_count(
+                        next_trace_height.air_idx - trace_height.air_idx - 1
+                    );
                 } else {
                     uint32_t rank = current_log_height + is_present;
                     uint32_t next_rank = next_log_height + next_is_present;
@@ -471,12 +552,187 @@ __global__ void proof_shape_tracegen(
         }
     } else {
         Encoder encoder(inputs.num_airs, 2, true);
-        size_t encoder_flags_idx =
+        size_t selector_idx =
             COL_INDEX(typename Cols<MAX_CACHED>::template Type, cached_commits);
-        size_t cached_commits_idx = encoder_flags_idx + encoder.width();
+        size_t cached_commits_idx = selector_idx + inputs.selector_width;
         size_t num_cols = cached_commits_idx + MAX_CACHED * DIGEST_SIZE;
 
         COL_WRITE_VALUE(row, typename Cols<MAX_CACHED>::template Type, proof_idx, NUM_PROOFS);
+        row.fill_zero(1, num_cols - 1);
+    }
+}
+
+
+template <size_t MAX_CACHED>
+__global__ void proof_shape_tracegen_dynamic(
+    Fp *trace,
+    size_t height,
+    AirData *air_data,
+    size_t *const *__restrict__ per_row_tidx,
+    TraceHeight *const *__restrict__ sorted_trace_heights,
+    TraceMetadata *const *__restrict__ sorted_trace_metadata,
+    Digest *const *__restrict__ cached_commits,
+    ProofShapePerProof *per_proof,
+    ProofShapeTracegenInputs inputs,
+    size_t num_proofs
+) {
+    uint32_t row_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    RowSlice row(trace + row_idx, height);
+
+    if (row_idx < num_proofs * (inputs.num_airs + 1)) {
+        size_t proof_idx = row_idx / (inputs.num_airs + 1);
+        size_t record_idx = row_idx % (inputs.num_airs + 1);
+        ProofShapePerProof proof_data = per_proof[proof_idx];
+
+        COL_WRITE_VALUE(row, typename Cols<MAX_CACHED>::template Type, proof_idx, proof_idx);
+        COL_WRITE_VALUE(row, typename Cols<MAX_CACHED>::template Type, is_first, record_idx == 0);
+        COL_WRITE_VALUE(row, typename Cols<MAX_CACHED>::template Type, n_max, proof_data.n_max);
+        COL_WRITE_VALUE(row, typename Cols<MAX_CACHED>::template Type, n_logup, proof_data.n_logup);
+
+        Encoder encoder(inputs.num_airs, 2, true);
+        size_t selector_idx =
+            COL_INDEX(typename Cols<MAX_CACHED>::template Type, cached_commits);
+        size_t cached_commits_idx = selector_idx + inputs.selector_width;
+
+        RangeChecker range_checker(inputs.range_checker_8_ptr, LIMB_BITS);
+        RangeChecker gap_range_checker(
+            inputs.range_checker_gap_ptr, inputs.air_idx_gap_bits
+        );
+        PowerChecker<32> pow_checker(inputs.pow_checker_ptr, inputs.range_checker_5_ptr);
+
+        if (record_idx == inputs.num_airs) {
+            COL_WRITE_VALUE(
+                row,
+                typename Cols<MAX_CACHED>::template Type,
+                starting_tidx,
+                per_row_tidx[proof_idx][record_idx]
+            );
+            COL_WRITE_VALUE(
+                row, typename Cols<MAX_CACHED>::template Type, num_present, proof_data.num_present
+            );
+            fill_summary_row<MAX_CACHED>(
+                row,
+                proof_data.final_total_interactions,
+                inputs.max_interaction_count,
+                cached_commits_idx,
+                proof_data.n_max,
+                proof_data.n_logup,
+                inputs.pre_hash,
+                range_checker,
+                pow_checker
+            );
+            row.fill_zero(selector_idx, inputs.selector_width);
+        } else {
+            TraceHeight trace_height = sorted_trace_heights[proof_idx][record_idx];
+            TraceMetadata trace_data = sorted_trace_metadata[proof_idx][record_idx];
+
+            COL_WRITE_VALUE(row, typename Cols<MAX_CACHED>::template Type, is_valid, Fp::one());
+            COL_WRITE_VALUE(row, typename Cols<MAX_CACHED>::template Type, is_last, Fp::zero());
+            COL_WRITE_VALUE(row, typename Cols<MAX_CACHED>::template Type, sorted_idx, record_idx);
+
+            COL_WRITE_VALUE(
+                row,
+                typename Cols<MAX_CACHED>::template Type,
+                starting_tidx,
+                per_row_tidx[proof_idx][trace_height.air_idx]
+            );
+
+            COL_WRITE_VALUE(
+                row, typename Cols<MAX_CACHED>::template Type, is_n_max_greater, Fp::zero()
+            );
+
+            if (inputs.metadata_lookup != 0) {
+                write_metadata_row(
+                    row.slice_from(selector_idx),
+                    air_data[trace_height.air_idx],
+                    trace_height.air_idx,
+                    inputs.min_cached_idx
+                );
+            } else {
+                encoder.write_flag_pt(row.slice_from(selector_idx), trace_height.air_idx);
+            }
+
+            if (record_idx + 1 < inputs.num_airs) {
+                bool is_present = record_idx < proof_data.num_present;
+                bool next_is_present = record_idx + 1 < proof_data.num_present;
+                uint8_t current_log_height = trace_height.log_height;
+                TraceHeight next_trace_height = sorted_trace_heights[proof_idx][record_idx + 1];
+                uint8_t next_log_height = next_trace_height.log_height;
+                bool is_height_equal_to_next =
+                    is_present == next_is_present &&
+                    (!is_present || current_log_height == next_log_height);
+                COL_WRITE_VALUE(
+                    row,
+                    typename Cols<MAX_CACHED>::template Type,
+                    is_height_equal_to_next,
+                    is_height_equal_to_next
+                );
+                if (is_height_equal_to_next) {
+                    gap_range_checker.add_count(
+                        next_trace_height.air_idx - trace_height.air_idx - 1
+                    );
+                } else {
+                    uint32_t rank = current_log_height + is_present;
+                    uint32_t next_rank = next_log_height + next_is_present;
+                    pow_checker.add_range_count(rank - next_rank - 1);
+                }
+            } else {
+                COL_WRITE_VALUE(
+                    row,
+                    typename Cols<MAX_CACHED>::template Type,
+                    is_height_equal_to_next,
+                    Fp::zero()
+                );
+            }
+
+            if (record_idx < proof_data.num_present) {
+                COL_WRITE_VALUE(
+                    row, typename Cols<MAX_CACHED>::template Type, num_present, record_idx + 1
+                );
+                fill_present_row<MAX_CACHED>(
+                    row,
+                    air_data[trace_height.air_idx],
+                    trace_height,
+                    trace_data,
+                    cached_commits[proof_idx],
+                    inputs.l_skip,
+                    cached_commits_idx,
+                    range_checker,
+                    pow_checker
+                );
+            } else {
+                COL_WRITE_VALUE(
+                    row,
+                    typename Cols<MAX_CACHED>::template Type,
+                    num_present,
+                    proof_data.num_present
+                );
+                fill_non_present_row<MAX_CACHED>(
+                    row,
+                    trace_data,
+                    proof_data.final_cidx,
+                    proof_data.final_total_interactions,
+                    cached_commits_idx,
+                    range_checker
+                );
+            }
+
+            if (inputs.min_cached_idx == trace_height.air_idx) {
+                row.write_array(
+                    cached_commits_idx + DIGEST_SIZE * (MAX_CACHED - 1),
+                    DIGEST_SIZE,
+                    proof_data.main_commit
+                );
+            }
+        }
+    } else {
+        Encoder encoder(inputs.num_airs, 2, true);
+        size_t selector_idx =
+            COL_INDEX(typename Cols<MAX_CACHED>::template Type, cached_commits);
+        size_t cached_commits_idx = selector_idx + inputs.selector_width;
+        size_t num_cols = cached_commits_idx + MAX_CACHED * DIGEST_SIZE;
+
+        COL_WRITE_VALUE(row, typename Cols<MAX_CACHED>::template Type, proof_idx, num_proofs);
         row.fill_zero(1, num_cols - 1);
     }
 }
@@ -496,34 +752,69 @@ extern "C" int _proof_shape_tracegen(
 ) {
     assert((height & (height - 1)) == 0);
     auto [grid, block] = kernel_launch_params(height);
-    SWITCH_BLOCK(
-        num_proofs,
-        NUM_PROOFS,
-        (SWITCH_BLOCK(
+    if (num_proofs <= 8) {
+        SWITCH_BLOCK(
+            num_proofs,
+            NUM_PROOFS,
+            (SWITCH_BLOCK(
+                inputs->max_cached,
+                MAX_CACHED,
+                (proof_shape_tracegen<NUM_PROOFS, MAX_CACHED><<<grid, block, 0, stream>>>(
+                     d_trace,
+                     height,
+                     d_air_data,
+                     PtrArray<size_t, NUM_PROOFS>(d_per_row_tidx),
+                     PtrArray<TraceHeight, NUM_PROOFS>(d_sorted_trace_heights),
+                     PtrArray<TraceMetadata, NUM_PROOFS>(d_sorted_trace_metadata),
+                     PtrArray<Digest, NUM_PROOFS>(d_cached_commits),
+                     d_per_proof,
+                     *inputs
+                );),
+                1,
+                2
+            )),
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8
+        )
+    } else {
+        DeviceArrayCopy<size_t *> per_row_tidx(d_per_row_tidx, num_proofs, stream);
+        DeviceArrayCopy<TraceHeight *> sorted_trace_heights(
+            d_sorted_trace_heights, num_proofs, stream
+        );
+        DeviceArrayCopy<TraceMetadata *> sorted_trace_metadata(
+            d_sorted_trace_metadata, num_proofs, stream
+        );
+        DeviceArrayCopy<Digest *> cached_commits(d_cached_commits, num_proofs, stream);
+        if (per_row_tidx.status() != cudaSuccess) return per_row_tidx.status();
+        if (sorted_trace_heights.status() != cudaSuccess) return sorted_trace_heights.status();
+        if (sorted_trace_metadata.status() != cudaSuccess) return sorted_trace_metadata.status();
+        if (cached_commits.status() != cudaSuccess) return cached_commits.status();
+        int ret = cudaStreamSynchronize(stream);
+        if (ret) return ret;
+        SWITCH_BLOCK(
             inputs->max_cached,
             MAX_CACHED,
-            (proof_shape_tracegen<NUM_PROOFS, MAX_CACHED><<<grid, block, 0, stream>>>(
+            (proof_shape_tracegen_dynamic<MAX_CACHED><<<grid, block, 0, stream>>>(
                  d_trace,
                  height,
                  d_air_data,
-                 PtrArray<size_t, NUM_PROOFS>(d_per_row_tidx),
-                 PtrArray<TraceHeight, NUM_PROOFS>(d_sorted_trace_heights),
-                 PtrArray<TraceMetadata, NUM_PROOFS>(d_sorted_trace_metadata),
-                 PtrArray<Digest, NUM_PROOFS>(d_cached_commits),
+                 per_row_tidx.get(),
+                 sorted_trace_heights.get(),
+                 sorted_trace_metadata.get(),
+                 cached_commits.get(),
                  d_per_proof,
-                 *inputs
+                 *inputs,
+                 num_proofs
             );),
             1,
             2
-        )),
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-        8
-    )
+        )
+    }
     return CHECK_KERNEL();
 }

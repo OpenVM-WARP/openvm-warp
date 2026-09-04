@@ -55,6 +55,13 @@ macro_rules! define_typed_per_proof_lookup_bus {
                 Self(openvm_stark_backend::interaction::LookupBus::new(bus_index))
             }
 
+            /// Return the underlying interaction namespace for setup-time
+            /// collision and wiring checks.
+            #[inline]
+            pub fn index(&self) -> openvm_stark_backend::interaction::BusIndex {
+                self.0.index
+            }
+
             pub fn lookup_key<AB>(
                 &self,
                 builder: &mut AB,
@@ -104,6 +111,14 @@ macro_rules! define_typed_permutation_bus {
                 ))
             }
 
+            /// The underlying bus index, so callers can assert that two references name the
+            /// same bus. Binding an AIR to a bus nothing drives surfaces only as an
+            /// unbalanced LogUp sum, a long way from the wiring that caused it.
+            #[inline]
+            pub fn index(&self) -> openvm_stark_backend::interaction::BusIndex {
+                self.0.index
+            }
+
             #[inline]
             pub fn send<AB>(
                 &self,
@@ -143,6 +158,14 @@ macro_rules! define_typed_per_proof_permutation_bus {
                 Self(openvm_stark_backend::interaction::PermutationCheckBus::new(
                     bus_index,
                 ))
+            }
+
+            /// The underlying bus index, used when auditing setup-fixed
+            /// cross-module transcript routes.
+            #[inline]
+            #[allow(dead_code)]
+            pub fn index(&self) -> openvm_stark_backend::interaction::BusIndex {
+                self.0.index
             }
 
             #[inline]
@@ -267,11 +290,12 @@ impl TranscriptBus {
     pub fn observe<AB: InteractionBuilder>(
         &self,
         builder: &mut AB,
-        proof_idx: AB::Var,
+        proof_idx: impl Into<AB::Expr>,
         tidx: impl Into<AB::Expr>,
         value: impl Into<AB::Expr>,
         is_enabled: impl Into<AB::Expr>,
     ) {
+        let proof_idx = proof_idx.into();
         self.receive(
             builder,
             proof_idx,
@@ -287,17 +311,18 @@ impl TranscriptBus {
     pub fn observe_ext<AB: InteractionBuilder>(
         &self,
         builder: &mut AB,
-        proof_idx: AB::Var,
+        proof_idx: impl Into<AB::Expr>,
         tidx: impl Into<AB::Expr>,
         value: [impl Into<AB::Expr>; D_EF],
         is_enabled: impl Into<AB::Expr>,
     ) {
+        let proof_idx = proof_idx.into();
         let tidx = tidx.into();
         let is_enabled = is_enabled.into();
         for (i, x) in value.into_iter().enumerate() {
             self.receive(
                 builder,
-                proof_idx,
+                proof_idx.clone(),
                 TranscriptBusMessage {
                     tidx: tidx.clone() + AB::Expr::from_usize(i),
                     value: x.into(),
@@ -311,17 +336,18 @@ impl TranscriptBus {
     pub fn observe_commit<AB: InteractionBuilder>(
         &self,
         builder: &mut AB,
-        proof_idx: AB::Var,
+        proof_idx: impl Into<AB::Expr>,
         tidx: impl Into<AB::Expr>,
         commit: [impl Into<AB::Expr>; DIGEST_SIZE],
         is_enabled: impl Into<AB::Expr>,
     ) {
+        let proof_idx = proof_idx.into();
         let tidx = tidx.into();
         let is_enabled = is_enabled.into();
         for (i, x) in commit.into_iter().enumerate() {
             self.receive(
                 builder,
-                proof_idx,
+                proof_idx.clone(),
                 TranscriptBusMessage {
                     tidx: tidx.clone() + AB::Expr::from_usize(i),
                     value: x.into(),
@@ -335,11 +361,12 @@ impl TranscriptBus {
     pub fn sample<AB: InteractionBuilder>(
         &self,
         builder: &mut AB,
-        proof_idx: AB::Var,
+        proof_idx: impl Into<AB::Expr>,
         tidx: impl Into<AB::Expr>,
         value: impl Into<AB::Expr>,
         is_enabled: impl Into<AB::Expr>,
     ) {
+        let proof_idx = proof_idx.into();
         self.receive(
             builder,
             proof_idx,
@@ -355,17 +382,18 @@ impl TranscriptBus {
     pub fn sample_ext<AB: InteractionBuilder>(
         &self,
         builder: &mut AB,
-        proof_idx: AB::Var,
+        proof_idx: impl Into<AB::Expr>,
         tidx: impl Into<AB::Expr>,
         value: [impl Into<AB::Expr>; D_EF],
         is_enabled: impl Into<AB::Expr>,
     ) {
+        let proof_idx = proof_idx.into();
         let tidx = tidx.into();
         let is_enabled = is_enabled.into();
         for (i, x) in value.into_iter().enumerate() {
             self.receive(
                 builder,
-                proof_idx,
+                proof_idx.clone(),
                 TranscriptBusMessage {
                     tidx: tidx.clone() + AB::Expr::from_usize(i),
                     value: x.into(),
@@ -386,6 +414,13 @@ pub struct Poseidon2PermuteMessage<T> {
 
 define_typed_lookup_bus!(Poseidon2PermuteBus, Poseidon2PermuteMessage);
 
+impl Poseidon2PermuteBus {
+    #[must_use]
+    pub const fn index(&self) -> openvm_stark_backend::interaction::BusIndex {
+        self.0.index
+    }
+}
+
 #[repr(C)]
 #[derive(AlignedBorrow, Debug, Clone)]
 pub struct Poseidon2CompressMessage<T> {
@@ -394,6 +429,13 @@ pub struct Poseidon2CompressMessage<T> {
 }
 
 define_typed_lookup_bus!(Poseidon2CompressBus, Poseidon2CompressMessage);
+
+impl Poseidon2CompressBus {
+    #[must_use]
+    pub const fn index(&self) -> openvm_stark_backend::interaction::BusIndex {
+        self.0.index
+    }
+}
 
 #[repr(u8)]
 #[derive(Debug, Copy, Clone)]
@@ -449,6 +491,33 @@ pub struct AirShapeBusMessage<T> {
 }
 
 define_typed_per_proof_lookup_bus!(AirShapeBus, AirShapeBusMessage);
+
+impl AirShapeBus {
+    /// Typed lookup for the proof-shape `(sorted index -> AIR id)` export.
+    ///
+    /// Keeping the property discriminator here prevents enclosing recursive
+    /// circuits from depending on the crate-private enum or duplicating its
+    /// numeric representation.
+    pub fn lookup_air_id<AB: InteractionBuilder>(
+        &self,
+        builder: &mut AB,
+        proof_idx: impl Into<AB::Expr>,
+        sort_idx: impl Into<AB::Expr>,
+        air_idx: impl Into<AB::Expr>,
+        enabled: impl Into<AB::Expr>,
+    ) {
+        self.lookup_key(
+            builder,
+            proof_idx,
+            AirShapeBusMessage {
+                sort_idx: sort_idx.into(),
+                property_idx: AB::Expr::from_u8(AirShapeProperty::AirId as u8),
+                value: air_idx.into(),
+            },
+            enabled,
+        );
+    }
+}
 
 #[repr(C)]
 #[derive(AlignedBorrow, Debug, Clone)]
@@ -528,6 +597,66 @@ pub struct FinalTranscriptStateMessage<T> {
 }
 
 define_typed_per_proof_permutation_bus!(FinalTranscriptStateBus, FinalTranscriptStateMessage);
+
+/// A row-aligned intermediate transcript state exposed to a companion AIR.
+///
+/// Unlike the final/resume buses, this carries the absolute operation index
+/// and the number of samples in the selected transcript row.  A checkpoint
+/// selected after a squeeze therefore determines the complete duplex cursor:
+/// no prover-supplied `absorb_idx` or `sample_idx` is trusted.
+#[repr(C)]
+#[derive(AlignedBorrow, Debug, Clone)]
+pub struct CertifiedTranscriptCheckpointMessage<T> {
+    pub kind: T,
+    pub tidx: T,
+    pub sample_count: T,
+    pub state: [T; POSEIDON2_WIDTH],
+}
+
+define_typed_per_proof_permutation_bus!(
+    CertifiedTranscriptCheckpointBus,
+    CertifiedTranscriptCheckpointMessage
+);
+
+/// The duplex sponge state a transcript proof resumes from.
+///
+/// A proof normally starts at the canonical zero sponge. A recursive history
+/// stage instead continues its child's transcript, and receives the child's
+/// final state here rather than replaying every earlier stage's operations to
+/// re-derive it -- which is what made the circuit's hashing quadratic in the
+/// stage count.
+///
+/// The whole state travels, not just the lanes the resumed proof preserves. The
+/// sender cannot know which rate lanes the first row overwrites with its own
+/// operands, so it hands over everything and the receiver compares only the
+/// lanes it is able to see. `tidx` travels with it so the resumed rows keep
+/// absolute operation indices and every consumer's lookup stays where it was.
+#[repr(C)]
+#[derive(AlignedBorrow, Debug, Clone)]
+pub struct ResumeTranscriptStateMessage<T> {
+    pub tidx: T,
+    pub state: [T; POSEIDON2_WIDTH],
+}
+
+define_typed_per_proof_permutation_bus!(ResumeTranscriptStateBus, ResumeTranscriptStateMessage);
+
+/// The operation index one past a transcript proof's last operation.
+///
+/// Separate from the final-state message because that one also feeds the step
+/// binding, whose preimage layout and public values must not move.
+///
+/// Handing a sponge state from one proof to another must not also hand over a
+/// chosen *length*. Without this the resume index would be a free witness: a
+/// prover could end the prefix early or late and, as long as every
+/// schedule-derived index downstream shifted by the same amount, the
+/// permutation buses would still balance.
+#[repr(C)]
+#[derive(AlignedBorrow, Debug, Clone)]
+pub struct TranscriptEndIndexMessage<T> {
+    pub tidx: T,
+}
+
+define_typed_per_proof_permutation_bus!(TranscriptEndIndexBus, TranscriptEndIndexMessage);
 
 #[repr(C)]
 #[derive(AlignedBorrow, Debug, Clone)]

@@ -1,3 +1,13 @@
+[patch."https://github.com/openvm-org/stark-backend.git"]
+openvm-stark-backend = { git = "https://github.com/OpenVM-WARP/stark-backend-warp.git", rev = "f1d9da7943a70793945c7acc7ecf17f41e501a82" }
+openvm-stark-sdk = { git = "https://github.com/OpenVM-WARP/stark-backend-warp.git", rev = "f1d9da7943a70793945c7acc7ecf17f41e501a82" }
+openvm-cpu-backend = { git = "https://github.com/OpenVM-WARP/stark-backend-warp.git", rev = "f1d9da7943a70793945c7acc7ecf17f41e501a82" }
+openvm-cuda-backend = { git = "https://github.com/OpenVM-WARP/stark-backend-warp.git", rev = "f1d9da7943a70793945c7acc7ecf17f41e501a82" }
+openvm-cuda-builder = { git = "https://github.com/OpenVM-WARP/stark-backend-warp.git", rev = "f1d9da7943a70793945c7acc7ecf17f41e501a82" }
+openvm-cuda-common = { git = "https://github.com/OpenVM-WARP/stark-backend-warp.git", rev = "f1d9da7943a70793945c7acc7ecf17f41e501a82" }
+
+
+
 [workspace.package]
 version = "2.0.0-beta.2"
 edition = "2021"

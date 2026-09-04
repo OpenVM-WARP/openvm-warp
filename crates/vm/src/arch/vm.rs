@@ -12,6 +12,7 @@ use std::{any::TypeId, borrow::Borrow, collections::VecDeque, marker::PhantomDat
 use getset::{Getters, MutGetters, Setters, WithSetters};
 use itertools::{zip_eq, Itertools};
 use openvm_circuit::system::program::trace::compute_exe_commit;
+use openvm_circuit_primitives::utils::next_power_of_two_or_zero;
 use openvm_instructions::{
     exe::{SparseMemoryImage, VmExe},
     program::Program,
@@ -23,7 +24,7 @@ use openvm_stark_backend::{
     memory_metering::ProvingMemoryConfig,
     p3_field::{InjectiveMonomial, PrimeCharacteristicRing, PrimeField32, TwoAdicField},
     p3_util::log2_ceil_usize,
-    proof::Proof,
+    proof::{Proof, TraceVData},
     prover::{
         ColMajorMatrix, CommittedTraceData, DeviceDataTransporter, DeviceMultiStarkProvingKey,
         MatrixDimensions, ProverBackend, ProverDevice, ProvingContext, TraceCommitter,
@@ -55,7 +56,7 @@ use super::{
     hasher::poseidon2::vm_poseidon2_hasher,
     interpreter::InterpretedInstance,
     interpreter_preflight::PreflightInterpretedInstance,
-    AirInventoryError, ChipInventoryError, ExecutionError, ExecutionState, Executor,
+    AirInventoryError, Arena, ChipInventoryError, ExecutionError, ExecutionState, Executor,
     ExecutorInventory, ExecutorInventoryError, MemoryConfig, MeteredExecutor, PreflightExecutor,
     StaticProgramError, SystemConfig, VmBuilder, VmChipComplex, VmCircuitConfig, VmExecState,
     VmExecutionConfig, VmState, BOUNDARY_AIR_ID, CONNECTOR_AIR_ID, MERKLE_AIR_ID, PROGRAM_AIR_ID,
@@ -601,6 +602,9 @@ pub enum VmVerificationError<SC: StarkProtocolConfig> {
     #[error("missing system AIR with ID {air_id}")]
     SystemAirMissing { air_id: usize },
 
+    #[error("invalid segment metadata: {0}")]
+    InvalidSegmentMetadata(&'static str),
+
     #[error("stark verification error: {0}")]
     StarkError(#[from] VerifierError<SC::EF>),
 
@@ -624,6 +628,8 @@ pub enum VirtualMachineError {
     Generation(#[from] GenerationError),
     #[error("program committed trade data not loaded")]
     ProgramIsNotCommitted,
+    #[error("invalid prepared native WARP plan: {0}")]
+    NativeWarpPlan(String),
 }
 
 /// The [VirtualMachine] struct contains the API to generate proofs for _arbitrary_ programs for a
@@ -1230,6 +1236,12 @@ where
         self.chip_complex.system.load_program(cached_program_trace);
     }
 
+    /// Borrow the program PCS allocation loaded at VM construction. This is
+    /// the same allocation used by every segment proof.
+    pub fn cached_program_trace(&self) -> Option<&CommittedTraceData<E::PB>> {
+        self.chip_complex.system.cached_program_trace()
+    }
+
     #[instrument(name = "vm.transport_init_memory", skip_all)]
     pub fn transport_init_memory_to_device(&mut self, memory: &GuestMemory) {
         self.chip_complex
@@ -1314,6 +1326,7 @@ where
                 need_rot: &need_rot,
                 segmentation_limits: SegmentationLimits {
                     max_trace_height_bits: log_stacked_height,
+                    max_trace_cells: self.config().as_ref().segmentation_max_trace_cells,
                     max_memory: self.config().as_ref().segmentation_max_memory,
                     max_interactions: <Val<E::SC> as PrimeField32>::ORDER_U32,
                 },
@@ -1353,8 +1366,54 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{SystemConfig, VirtualMachine, CONNECTOR_AIR_ID, PROGRAM_AIR_ID};
-    use crate::{system::SystemCpuBuilder, utils::test_cpu_engine};
+    use openvm_stark_backend::p3_field::PrimeCharacteristicRing;
+    use openvm_stark_sdk::config::baby_bear_poseidon2::F;
+
+    use super::{
+        bucket_native_warp_trace_heights, verify_segment_metadata_sequence, SystemConfig,
+        VirtualMachine, VmSegmentMetadata, BOUNDARY_AIR_PRESENT, CONNECTOR_AIR_ID,
+        CONNECTOR_AIR_PRESENT, MERKLE_AIR_PRESENT, PROGRAM_AIR_ID, PROGRAM_AIR_PRESENT,
+    };
+    use crate::{arch::testing::TestSC, system::SystemCpuBuilder, utils::test_cpu_engine};
+
+    const ALL_SYSTEM_AIRS: u8 =
+        PROGRAM_AIR_PRESENT | CONNECTOR_AIR_PRESENT | BOUNDARY_AIR_PRESENT | MERKLE_AIR_PRESENT;
+
+    fn digest(value: u32) -> [F; super::DIGEST_WIDTH] {
+        [F::from_u32(value); super::DIGEST_WIDTH]
+    }
+
+    fn segment(
+        program: u32,
+        initial_pc: u32,
+        final_pc: u32,
+        initial_memory: u32,
+        final_memory: u32,
+        terminate: bool,
+    ) -> VmSegmentMetadata<TestSC> {
+        VmSegmentMetadata {
+            program_commit: digest(program),
+            initial_pc: F::from_u32(initial_pc),
+            final_pc: F::from_u32(final_pc),
+            exit_code: F::from_u32(if terminate {
+                super::ExitCode::Success as u32
+            } else {
+                super::DEFAULT_SUSPEND_EXIT_CODE
+            }),
+            is_terminate: F::from_bool(terminate),
+            initial_memory_root: digest(initial_memory),
+            final_memory_root: digest(final_memory),
+            present_system_airs: ALL_SYSTEM_AIRS,
+        }
+    }
+
+    fn valid_segment_chain() -> Vec<VmSegmentMetadata<TestSC>> {
+        vec![
+            segment(7, 0, 8, 10, 11, false),
+            segment(7, 8, 16, 11, 12, false),
+            segment(7, 16, 24, 12, 13, true),
+        ]
+    }
 
     #[test]
     fn keygen_marks_required_airs_for_continuations() {
@@ -1370,6 +1429,67 @@ mod tests {
         assert!(pk.per_air[merkle_air_id].vk.is_required);
         assert!(pk.per_air[boundary_air_id].vk.is_required);
     }
+
+    #[test]
+    fn segment_metadata_sequence_accepts_valid_chain() {
+        assert!(verify_segment_metadata_sequence(&valid_segment_chain()).is_ok());
+    }
+
+    #[test]
+    fn segment_metadata_sequence_rejects_reordering_removal_and_duplication() {
+        let valid = valid_segment_chain();
+
+        let mut reordered = valid.clone();
+        reordered.swap(0, 1);
+        assert!(verify_segment_metadata_sequence(&reordered).is_err());
+
+        let removed = vec![valid[0].clone(), valid[2].clone()];
+        assert!(verify_segment_metadata_sequence(&removed).is_err());
+
+        let duplicated = vec![valid[0].clone(), valid[1].clone(), valid[1].clone()];
+        assert!(verify_segment_metadata_sequence(&duplicated).is_err());
+    }
+
+    #[test]
+    fn segment_metadata_sequence_rejects_tampered_bindings() {
+        let valid = valid_segment_chain();
+
+        let mut wrong_program = valid.clone();
+        wrong_program[1].program_commit = digest(8);
+        assert!(verify_segment_metadata_sequence(&wrong_program).is_err());
+
+        let mut disconnected_memory = valid.clone();
+        disconnected_memory[1].initial_memory_root = digest(99);
+        assert!(verify_segment_metadata_sequence(&disconnected_memory).is_err());
+
+        let mut early_termination = valid.clone();
+        early_termination[1].is_terminate = F::ONE;
+        early_termination[1].exit_code = F::ZERO;
+        assert!(verify_segment_metadata_sequence(&early_termination).is_err());
+
+        let mut missing_termination = valid;
+        missing_termination[2].is_terminate = F::ZERO;
+        missing_termination[2].exit_code = F::from_u32(super::DEFAULT_SUSPEND_EXIT_CODE);
+        assert!(verify_segment_metadata_sequence(&missing_termination).is_err());
+    }
+
+    #[test]
+    fn native_warp_height_buckets_round_up_without_exceeding_each_air_maximum() {
+        let mut heights = vec![
+            vec![1 << 14, 1 << 9, 0],
+            vec![1 << 13, 1 << 7, 1 << 6],
+            vec![1 << 10, 1 << 5, 1 << 3],
+        ];
+        bucket_native_warp_trace_heights(&mut heights, 2);
+        assert_eq!(
+            heights,
+            vec![
+                vec![1 << 14, 1 << 9, 0],
+                vec![1 << 14, 1 << 7, 1 << 6],
+                vec![1 << 10, 1 << 5, 1 << 4],
+            ]
+        );
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1380,6 +1500,78 @@ mod tests {
 pub struct ContinuationVmProof<SC: StarkProtocolConfig> {
     pub per_segment: Vec<Proof<SC>>,
     pub user_public_values: UserPublicValuesProof<{ DIGEST_WIDTH }, Val<SC>>,
+}
+
+#[derive(Error, Debug)]
+pub enum NativeWarpStreamError<SegmentError> {
+    #[error("virtual machine error: {0}")]
+    Vm(#[from] VirtualMachineError),
+    #[error("native WARP segment consumer error: {0}")]
+    Segment(SegmentError),
+}
+
+/// Exact continuation schedule and AIR heights prepared for native WARP.
+///
+/// The plan is derived from the same metered execution and preflight trace
+/// generation used by proving. Keeping it as a typed artifact lets setup
+/// generate shape-dependent history keys before online proving without
+/// changing segmentation or trusting caller-supplied trace dimensions.
+#[derive(Clone, Debug)]
+pub struct NativeWarpContinuationPlan {
+    segments: Vec<Segment>,
+    planned_heights: Vec<Vec<u32>>,
+}
+
+impl NativeWarpContinuationPlan {
+    #[must_use]
+    pub fn planned_heights(&self) -> &[Vec<u32>] {
+        &self.planned_heights
+    }
+
+    #[must_use]
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+}
+
+/// Coarsen only the padding heights used by native WARP. Segment instruction
+/// boundaries and zero/absent AIRs are unchanged. Buckets are anchored at each
+/// AIR's observed maximum, so rounding can never exceed the metered per-AIR
+/// scalar-message limit.
+fn bucket_native_warp_trace_heights(planned_heights: &mut [Vec<u32>], stride: u8) {
+    if stride <= 1 || planned_heights.is_empty() {
+        return;
+    }
+    let air_count = planned_heights[0].len();
+    assert!(
+        planned_heights
+            .iter()
+            .all(|segment| segment.len() == air_count),
+        "native WARP height plan must be rectangular"
+    );
+    let mut max_logs = vec![None::<u32>; air_count];
+    for segment in planned_heights.iter() {
+        for (air_id, &height) in segment.iter().enumerate() {
+            if height != 0 {
+                assert!(height.is_power_of_two());
+                let log_height = height.ilog2();
+                max_logs[air_id] =
+                    Some(max_logs[air_id].map_or(log_height, |max| max.max(log_height)));
+            }
+        }
+    }
+    let stride = u32::from(stride);
+    for segment in planned_heights {
+        for (air_id, height) in segment.iter_mut().enumerate() {
+            if *height == 0 {
+                continue;
+            }
+            let max_log = max_logs[air_id].expect("active AIR has an observed maximum");
+            let current_log = height.ilog2();
+            let bucket_distance = (max_log - current_log) / stride * stride;
+            *height = 1u32 << (max_log - bucket_distance);
+        }
+    }
 }
 
 /// Prover for a specific exe in a specific continuation VM using a specific Stark config.
@@ -1409,6 +1601,13 @@ where
     exe: Arc<VmExe<Val<E::SC>>>,
     #[getset(get = "pub", get_mut = "pub")]
     state: Option<VmState<Val<E::SC>, GuestMemory>>,
+    /// Checked, executable-specific native metering artifact selected by the SDK.
+    ///
+    /// The VM loader deliberately does not define a trust policy for persisted native code. The
+    /// SDK validates its versioned manifest, executable/shape/toolchain identity, and file digest
+    /// before installing this path.
+    #[cfg(feature = "rvr")]
+    metered_artifact_path: Option<std::path::PathBuf>,
 }
 
 impl<E, VB> VmInstance<E, VB>
@@ -1431,7 +1630,21 @@ where
             program_commitment,
             exe,
             state: Some(state),
+            #[cfg(feature = "rvr")]
+            metered_artifact_path: None,
         })
+    }
+
+    /// Select a previously validated native metering artifact for continuation planning.
+    #[cfg(feature = "rvr")]
+    pub fn set_metered_artifact_path(&mut self, path: impl Into<std::path::PathBuf>) {
+        self.metered_artifact_path = Some(path.into());
+    }
+
+    /// Clear the selected native metering artifact and compile metering code on the next run.
+    #[cfg(feature = "rvr")]
+    pub fn clear_metered_artifact_path(&mut self) {
+        self.metered_artifact_path = None;
     }
 
     #[instrument(name = "vm.reset_state", level = "debug", skip_all)]
@@ -1486,8 +1699,16 @@ where
     ) -> Result<ContinuationVmProof<E::SC>, VirtualMachineError> {
         let input = input.into();
         self.reset_state(input.clone());
+        #[cfg(feature = "rvr")]
+        let metered_artifact_path = self.metered_artifact_path.clone();
         let vm = &mut self.vm;
         let metered_ctx = vm.build_metered_ctx(&self.exe);
+        #[cfg(feature = "rvr")]
+        let metered_instance = match metered_artifact_path {
+            Some(path) => vm.load_metered_instance(&path, &self.exe)?,
+            None => vm.metered_instance(&self.exe)?,
+        };
+        #[cfg(not(feature = "rvr"))]
         let metered_instance = vm.metered_instance(&self.exe)?;
         let (segments, _) = metered_instance.execute_metered(input, metered_ctx)?;
         let mut proofs = Vec::with_capacity(segments.len());
@@ -1535,7 +1756,308 @@ where
             user_public_values,
         })
     }
+
+    /// Derives the native-WARP continuation schedule and AIR heights.
+    ///
+    /// Heights come from the metered pass's per-AIR bounds rounded to the next power of two, so
+    /// no preflight or trace generation runs here. That substitution is what makes this cheap:
+    /// it previously ran a full `execute_preflight` + `generate_proving_ctx` per segment purely
+    /// to read `common_main.height()` and then dropped the context, which doubled the VM half of
+    /// native-WARP proving against the recursive lane.
+    ///
+    /// The bound is not always tight -- the Poseidon2 periphery is bounded by
+    /// `2 * leaves + 2 * merkle_nodes` and then deduplicates equal hash inputs during trace
+    /// generation -- so the streaming pass pins every trace to the planned height rather than
+    /// letting it shrink. Padding to a plan is sound because the descriptor binding requires
+    /// each `log_height` to *equal* the catalog shape, authenticated by a membership proof, not
+    /// to be minimal; the padding rows are the ones trace generation already emits between the
+    /// record count and the next power of two.
+    #[instrument(name = "plan_continuations_native_warp", level = "info", skip_all)]
+    pub fn plan_continuations_native_warp(
+        &mut self,
+        input: impl Into<Streams<Val<E::SC>>>,
+    ) -> Result<NativeWarpContinuationPlan, VirtualMachineError> {
+        let input = input.into();
+        self.reset_state(input.clone());
+        #[cfg(feature = "rvr")]
+        let metered_artifact_path = self.metered_artifact_path.clone();
+        let segments = {
+            let vm = &mut self.vm;
+            let metered_ctx = vm.build_metered_ctx(&self.exe);
+            #[cfg(feature = "rvr")]
+            let metered_instance = match metered_artifact_path {
+                Some(path) => vm.load_metered_instance(&path, &self.exe)?,
+                None => vm.metered_instance(&self.exe)?,
+            };
+            #[cfg(not(feature = "rvr"))]
+            let metered_instance = vm.metered_instance(&self.exe)?;
+            metered_instance
+                .execute_metered(input.clone(), metered_ctx)?
+                .0
+        };
+
+        let num_airs = self.vm.pk().per_air.len();
+        // Planning every AIR present at `2^l_skip`, to make the trace set uniform across
+        // segments and settle the history stage key, overflows the reduction endpoint program
+        // by a consistent ~15%: measured 610,354 instructions against a 524,288 cap at a 2^19
+        // history stacked height, and 1,194,126 against 1,048,576 at 2^20. The program scales
+        // with the cap, so raising the height is a treadmill -- and the check in
+        // `native_reduction_endpoint_program_chunks` is on the largest *single* program, so
+        // chunking cannot absorb it either.
+        //
+        // The six AIRs this admits are absent from most segments and would enter at minimum
+        // height with no real rows, yet each still costs roughly 14k instructions because the
+        // program emits a full constraint evaluation regardless of trace height. Closing a 15%
+        // gap therefore means emitting a compact program for an empty trace, not a bigger
+        // circuit. Until then, absent AIRs stay absent.
+        let mut planned_heights: Vec<Vec<u32>> = segments
+            .iter()
+            .map(|segment| {
+                assert_eq!(segment.trace_heights.len(), num_airs);
+                segment
+                    .trace_heights
+                    .iter()
+                    .map(|&height| {
+                        next_power_of_two_or_zero(height as usize)
+                            .try_into()
+                            .expect("planned trace height fits in u32")
+                    })
+                    .collect::<Vec<u32>>()
+            })
+            .collect();
+        let height_bucket_stride = self.vm.config().as_ref().native_warp_height_bucket_stride;
+        let rows_before = planned_heights
+            .iter()
+            .flatten()
+            .map(|&height| u64::from(height))
+            .sum::<u64>();
+        bucket_native_warp_trace_heights(&mut planned_heights, height_bucket_stride);
+        let rows_after = planned_heights
+            .iter()
+            .flatten()
+            .map(|&height| u64::from(height))
+            .sum::<u64>();
+        tracing::info!(
+            height_bucket_stride,
+            rows_before,
+            rows_after,
+            padding_ratio = rows_after as f64 / rows_before.max(1) as f64,
+            "native WARP verifier-shape height bucketing"
+        );
+        release_unused_allocator_memory();
+        self.reset_state(input);
+        Ok(NativeWarpContinuationPlan {
+            segments,
+            planned_heights,
+        })
+    }
 }
+
+/// The native-WARP streaming pass, which pins trace heights to the plan.
+///
+/// Split from the block above for the one extra bound: pinning the system AIRs needs
+/// [`SystemWithFixedTraceHeights`]. Both concrete inventories implement it, so this is a
+/// bound rather than a restriction -- keeping it off the shared block leaves
+/// `prove_continuations` and the other lanes generic over inventories that do not.
+impl<E, VB> VmInstance<E, VB>
+where
+    E: StarkEngine,
+    Val<E::SC>: PrimeField32,
+    VB: VmBuilder<E>,
+    VB::SystemChipInventory: SystemWithFixedTraceHeights,
+    <VB::VmConfig as VmExecutionConfig<Val<E::SC>>>::Executor: Executor<Val<E::SC>>
+        + MeteredExecutor<Val<E::SC>>
+        + PreflightExecutor<Val<E::SC>, VB::RecordArena>,
+{
+    /// Streams proving contexts using an exact plan prepared by
+    /// [`Self::plan_continuations_native_warp`].
+    pub fn prove_continuations_native_warp_stream_prepared<SegmentError>(
+        &mut self,
+        input: impl Into<Streams<Val<E::SC>>>,
+        plan: NativeWarpContinuationPlan,
+        mut modify_ctx: impl FnMut(usize, &mut ProvingContext<E::PB>),
+        mut consume_segment: impl FnMut(
+            usize,
+            &E,
+            &DeviceMultiStarkProvingKey<E::PB>,
+            ProvingContext<E::PB>,
+        ) -> Result<(), SegmentError>,
+    ) -> Result<
+        UserPublicValuesProof<{ DIGEST_WIDTH }, Val<E::SC>>,
+        NativeWarpStreamError<SegmentError>,
+    > {
+        let input = input.into();
+        self.reset_state(input);
+        let NativeWarpContinuationPlan {
+            segments,
+            planned_heights,
+        } = plan;
+
+        let mut state = self.state.take();
+        log_native_warp_process_memory("after_vm_state_take", usize::MAX);
+        let vm = &mut self.vm;
+        for (seg_idx, segment) in segments.into_iter().enumerate() {
+            // Two spans, as in the recursive lane: the outer one carries the
+            // label, and the inner one closes while the outer is still entered
+            // so its children inherit `segment=N`. Without these the streaming
+            // pass emits no per-segment timing at all and its gauges collapse
+            // to a single last-writer-wins sample.
+            let _segment_span = info_span!("prove_segment", segment = seg_idx).entered();
+            let _warp_segment_span = info_span!("warp_segment_total").entered();
+            log_native_warp_process_memory("before_segment_span", seg_idx);
+            log_native_warp_process_memory("before_preflight", seg_idx);
+            let Segment {
+                num_insns,
+                trace_heights,
+                ..
+            } = segment;
+            let from_state = Option::take(&mut state).unwrap();
+            vm.transport_init_memory_to_device(&from_state.memory);
+            let PreflightExecutionOutput {
+                system_records,
+                mut record_arenas,
+                to_state,
+            } = vm
+                .execute_preflight(
+                    &mut self.interpreter,
+                    from_state,
+                    Some(num_insns),
+                    &trace_heights,
+                )
+                .map_err(VirtualMachineError::from)?;
+            state = Some(to_state);
+            log_native_warp_process_memory("after_preflight", seg_idx);
+            // Pin every trace to the plan before generating it. The plan is an upper bound
+            // derived from metered execution, and the shape catalog is already committed to it,
+            // so a trace that generated fewer rows must be padded up rather than shrink the
+            // shape out from under the binding.
+            let Some(planned) = planned_heights.get(seg_idx) else {
+                return Err(NativeWarpStreamError::Vm(
+                    VirtualMachineError::NativeWarpPlan(
+                        "planned heights are missing a segment".to_owned(),
+                    ),
+                ));
+            };
+            // `record_arenas` is indexed by AIR id: `execute_preflight` builds one arena per
+            // entry of `trace_heights`, and `generate_proving_ctx` only splits off the leading
+            // system block afterwards.
+            for (air_idx, arena) in record_arenas.iter_mut().enumerate() {
+                arena.force_trace_height(planned[air_idx] as usize);
+            }
+            vm.override_system_trace_heights(planned);
+            let mut ctx = vm
+                .generate_proving_ctx(system_records, record_arenas)
+                .map_err(VirtualMachineError::from)?;
+            let mut exact = vec![0u32; vm.pk().per_air.len()];
+            for (air_id, trace) in &ctx.per_trace {
+                exact[*air_id] = trace
+                    .common_main
+                    .height()
+                    .try_into()
+                    .expect("validated trace height fits in u32");
+            }
+            if planned_heights.get(seg_idx) != Some(&exact) {
+                return Err(NativeWarpStreamError::Vm(
+                    VirtualMachineError::NativeWarpPlan(format!(
+                        "AIR heights changed between setup and proving in segment {seg_idx}: {}",
+                        planned
+                            .iter()
+                            .zip(&exact)
+                            .enumerate()
+                            .filter(|(_, (planned, exact))| planned != exact)
+                            .map(|(air_id, (planned, exact))| {
+                                format!("AIR {air_id}: planned {planned}, actual {exact}")
+                            })
+                            .join(", ")
+                    )),
+                ));
+            }
+            #[cfg(any(debug_assertions, feature = "test-utils", feature = "stark-debug"))]
+            if std::env::var_os("OPENVM_WARP_DEBUG_SEGMENT").is_some() {
+                debug_proving_ctx(vm, &ctx);
+            }
+            log_native_warp_process_memory("after_trace_gen", seg_idx);
+            modify_ctx(seg_idx, &mut ctx);
+            consume_segment(seg_idx, &vm.engine, vm.pk(), ctx)
+                .map_err(NativeWarpStreamError::Segment)?;
+            log_native_warp_process_memory("after_segment_consumer", seg_idx);
+        }
+        let to_state = state.unwrap();
+        let final_memory = &to_state.memory.memory;
+        let final_memory_top_tree = vm.memory_top_tree().expect("memory top tree should exist");
+        let user_public_values = UserPublicValuesProof::compute(
+            vm.config().as_ref(),
+            &vm_poseidon2_hasher(),
+            final_memory,
+            final_memory_top_tree,
+        );
+        self.state = Some(to_state);
+        Ok(user_public_values)
+    }
+
+    /// Plans exact segment shapes and streams original AIR contexts into the
+    /// native WARP backend without constructing deferred SWIRL proofs.
+    pub fn prove_continuations_native_warp_stream_with_plan<SegmentError>(
+        &mut self,
+        input: impl Into<Streams<Val<E::SC>>>,
+        modify_ctx: impl FnMut(usize, &mut ProvingContext<E::PB>),
+        plan_segments: impl FnOnce(&[Vec<u32>]) -> Result<(), SegmentError>,
+        consume_segment: impl FnMut(
+            usize,
+            &E,
+            &DeviceMultiStarkProvingKey<E::PB>,
+            ProvingContext<E::PB>,
+        ) -> Result<(), SegmentError>,
+    ) -> Result<
+        UserPublicValuesProof<{ DIGEST_WIDTH }, Val<E::SC>>,
+        NativeWarpStreamError<SegmentError>,
+    > {
+        let input = input.into();
+        let plan = self
+            .plan_continuations_native_warp(input.clone())
+            .map_err(NativeWarpStreamError::Vm)?;
+        log_native_warp_process_memory("before_plan_callback", usize::MAX);
+        plan_segments(plan.planned_heights()).map_err(NativeWarpStreamError::Segment)?;
+        log_native_warp_process_memory("after_plan_callback", usize::MAX);
+        self.prove_continuations_native_warp_stream_prepared(
+            input,
+            plan,
+            modify_ctx,
+            consume_segment,
+        )
+    }
+}
+
+fn release_unused_allocator_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn log_native_warp_process_memory(phase: &'static str, segment: usize) {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return;
+    };
+    let value_kib = |name: &str| {
+        status.lines().find_map(|line| {
+            let value = line.strip_prefix(name)?.trim();
+            value.split_whitespace().next()?.parse::<u64>().ok()
+        })
+    };
+    tracing::info!(
+        phase,
+        segment,
+        rss_mib = value_kib("VmRSS:").unwrap_or_default() >> 10,
+        virtual_mib = value_kib("VmSize:").unwrap_or_default() >> 10,
+        swap_mib = value_kib("VmSwap:").unwrap_or_default() >> 10,
+        "native WARP process memory"
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+fn log_native_warp_process_memory(_phase: &'static str, _segment: usize) {}
 
 /// The payload of a verified guest VM execution.
 pub struct VerifiedExecutionPayload<F> {
@@ -1549,6 +2071,230 @@ pub struct VerifiedExecutionPayload<F> {
     pub exe_commit: [F; DIGEST_WIDTH],
     /// The Merkle root of the final memory state.
     pub final_memory_root: [F; DIGEST_WIDTH],
+}
+
+const PROGRAM_AIR_PRESENT: u8 = 1 << 0;
+const CONNECTOR_AIR_PRESENT: u8 = 1 << 1;
+const BOUNDARY_AIR_PRESENT: u8 = 1 << 2;
+const MERKLE_AIR_PRESENT: u8 = 1 << 3;
+pub const REQUIRED_SYSTEM_AIRS: u8 =
+    PROGRAM_AIR_PRESENT | CONNECTOR_AIR_PRESENT | BOUNDARY_AIR_PRESENT | MERKLE_AIR_PRESENT;
+
+/// Verifier-visible continuation data extracted from one authenticated segment relation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound = "")]
+pub struct VmSegmentMetadata<SC: StarkProtocolConfig> {
+    pub program_commit: SC::Digest,
+    pub initial_pc: SC::F,
+    pub final_pc: SC::F,
+    pub exit_code: SC::F,
+    pub is_terminate: SC::F,
+    pub initial_memory_root: [SC::F; DIGEST_WIDTH],
+    pub final_memory_root: [SC::F; DIGEST_WIDTH],
+    pub present_system_airs: u8,
+}
+
+/// Extracts and validates the public continuation fields shared by recursive and WARP proofs.
+pub fn vm_segment_metadata_from_parts<SC>(
+    vk: &MultiStarkVerifyingKey<SC>,
+    trace_vdata: &[Option<TraceVData<SC>>],
+    public_values: &[Vec<SC::F>],
+) -> Result<VmSegmentMetadata<SC>, VmVerificationError<SC>>
+where
+    SC: StarkProtocolConfig,
+    SC::F: PrimeField32,
+{
+    if trace_vdata.len() != vk.inner.per_air.len() || public_values.len() != vk.inner.per_air.len()
+    {
+        return Err(VmVerificationError::InvalidSegmentMetadata(
+            "AIR vector length",
+        ));
+    }
+
+    let mut program_commit = None;
+    let mut connector = None;
+    let mut memory = None;
+    let mut present_system_airs = 0u8;
+
+    for (air_idx, ((vdata, pvs), air_vk)) in trace_vdata
+        .iter()
+        .zip(public_values)
+        .zip(&vk.inner.per_air)
+        .enumerate()
+    {
+        if air_idx == PROGRAM_AIR_ID {
+            let vdata = vdata
+                .as_ref()
+                .ok_or(VmVerificationError::SystemAirMissing {
+                    air_id: PROGRAM_AIR_ID,
+                })?;
+            let commitment = vdata
+                .cached_commitments
+                .get(PROGRAM_CACHED_TRACE_INDEX)
+                .copied()
+                .ok_or(VmVerificationError::InvalidSegmentMetadata(
+                    "program cached commitment",
+                ))?;
+            program_commit = Some(commitment);
+            present_system_airs |= PROGRAM_AIR_PRESENT;
+        } else if air_idx == CONNECTOR_AIR_ID {
+            if vdata.is_none() {
+                return Err(VmVerificationError::SystemAirMissing {
+                    air_id: CONNECTOR_AIR_ID,
+                });
+            }
+            if pvs.len() != 4 {
+                return Err(VmVerificationError::UnexpectedPvs {
+                    expected: 4,
+                    actual: pvs.len(),
+                });
+            }
+            let values: &VmConnectorPvs<_> = pvs.as_slice().borrow();
+            connector = Some((
+                values.initial_pc,
+                values.final_pc,
+                values.exit_code,
+                values.is_terminate,
+            ));
+            present_system_airs |= CONNECTOR_AIR_PRESENT;
+        } else if air_idx == BOUNDARY_AIR_ID {
+            if vdata.is_some() {
+                present_system_airs |= BOUNDARY_AIR_PRESENT;
+            }
+            if !pvs.is_empty() {
+                return Err(VmVerificationError::UnexpectedPvs {
+                    expected: 0,
+                    actual: pvs.len(),
+                });
+            }
+        } else if air_idx == MERKLE_AIR_ID {
+            if vdata.is_none() {
+                return Err(VmVerificationError::SystemAirMissing {
+                    air_id: MERKLE_AIR_ID,
+                });
+            }
+            if pvs.len() != 2 * DIGEST_WIDTH {
+                return Err(VmVerificationError::UnexpectedPvs {
+                    expected: 2 * DIGEST_WIDTH,
+                    actual: pvs.len(),
+                });
+            }
+            let values: &MemoryMerklePvs<_, DIGEST_WIDTH> = pvs.as_slice().borrow();
+            memory = Some((values.initial_root, values.final_root));
+            present_system_airs |= MERKLE_AIR_PRESENT;
+        } else if !pvs.is_empty() {
+            return Err(VmVerificationError::UnexpectedPvs {
+                expected: 0,
+                actual: pvs.len(),
+            });
+        } else {
+            debug_assert_eq!(air_vk.params.num_public_values, 0);
+        }
+    }
+
+    if present_system_airs != REQUIRED_SYSTEM_AIRS {
+        for (air_id, flag) in [
+            (PROGRAM_AIR_ID, PROGRAM_AIR_PRESENT),
+            (CONNECTOR_AIR_ID, CONNECTOR_AIR_PRESENT),
+            (BOUNDARY_AIR_ID, BOUNDARY_AIR_PRESENT),
+            (MERKLE_AIR_ID, MERKLE_AIR_PRESENT),
+        ] {
+            if present_system_airs & flag == 0 {
+                return Err(VmVerificationError::SystemAirMissing { air_id });
+            }
+        }
+    }
+
+    let (initial_pc, final_pc, exit_code, is_terminate) = connector.ok_or(
+        VmVerificationError::InvalidSegmentMetadata("connector public values"),
+    )?;
+    let (initial_memory_root, final_memory_root) = memory.ok_or(
+        VmVerificationError::InvalidSegmentMetadata("memory public values"),
+    )?;
+    Ok(VmSegmentMetadata {
+        program_commit: program_commit.ok_or(VmVerificationError::InvalidSegmentMetadata(
+            "program commitment",
+        ))?,
+        initial_pc,
+        final_pc,
+        exit_code,
+        is_terminate,
+        initial_memory_root,
+        final_memory_root,
+        present_system_airs,
+    })
+}
+
+/// Checks the ordered continuation chain after each segment relation has been authenticated.
+pub fn verify_segment_metadata_sequence<SC>(
+    segments: &[VmSegmentMetadata<SC>],
+) -> Result<VerifiedExecutionPayload<SC::F>, VmVerificationError<SC>>
+where
+    SC: StarkProtocolConfig,
+    SC::F: PrimeField32,
+    SC::Digest: Into<[SC::F; DIGEST_WIDTH]>,
+{
+    let first = segments.first().ok_or(VmVerificationError::ProofNotFound)?;
+    let program_commit = first.program_commit;
+    let start_pc = first.initial_pc;
+    let initial_memory_root = first.initial_memory_root;
+    let mut previous_final_pc = None;
+    let mut previous_final_memory_root = None;
+
+    for (index, segment) in segments.iter().enumerate() {
+        if segment.present_system_airs != REQUIRED_SYSTEM_AIRS {
+            return Err(VmVerificationError::InvalidSegmentMetadata(
+                "required system AIR bitmap",
+            ));
+        }
+        if segment.program_commit != program_commit {
+            return Err(VmVerificationError::ProgramCommitMismatch { index });
+        }
+        if let Some(previous) = previous_final_pc {
+            if segment.initial_pc != previous {
+                return Err(VmVerificationError::InitialPcMismatch {
+                    initial: segment.initial_pc.as_canonical_u32(),
+                    prev_final: previous.as_canonical_u32(),
+                });
+            }
+        }
+        if let Some(previous) = previous_final_memory_root {
+            if segment.initial_memory_root != previous {
+                return Err(VmVerificationError::InitialMemoryRootMismatch);
+            }
+        }
+
+        let expected_is_terminate = index + 1 == segments.len();
+        if segment.is_terminate != SC::F::from_bool(expected_is_terminate) {
+            return Err(VmVerificationError::IsTerminateMismatch {
+                expected: expected_is_terminate,
+                actual: segment.is_terminate.as_canonical_u32() != 0,
+            });
+        }
+        let expected_exit_code = if expected_is_terminate {
+            ExitCode::Success as u32
+        } else {
+            DEFAULT_SUSPEND_EXIT_CODE
+        };
+        if segment.exit_code != SC::F::from_u32(expected_exit_code) {
+            return Err(VmVerificationError::ExitCodeMismatch {
+                expected: expected_exit_code,
+                actual: segment.exit_code.as_canonical_u32(),
+            });
+        }
+        previous_final_pc = Some(segment.final_pc);
+        previous_final_memory_root = Some(segment.final_memory_root);
+    }
+
+    Ok(VerifiedExecutionPayload {
+        exe_commit: compute_exe_commit(
+            &vm_poseidon2_hasher(),
+            &program_commit.into(),
+            &initial_memory_root,
+            start_pc,
+        ),
+        final_memory_root: previous_final_memory_root.expect("non-empty segment metadata"),
+    })
 }
 
 /// Verify segment proofs with boundary condition checks for continuation between segments.
@@ -1580,141 +2326,16 @@ where
     if proofs.is_empty() {
         return Err(VmVerificationError::ProofNotFound);
     }
-    let mut prev_final_memory_root = None;
-    let mut prev_final_pc = None;
-    let mut start_pc = None;
-    let mut initial_memory_root = None;
-    let mut program_commit = None;
-
-    for (i, proof) in proofs.iter().enumerate() {
-        let res = engine.verify(vk, proof);
-        match res {
-            Ok(_) => (),
-            Err(e) => return Err(VmVerificationError::StarkError(e)),
-        };
-
-        let mut program_air_present = false;
-        let mut connector_air_present = false;
-        let mut boundary_air_present = false;
-        let mut merkle_air_present = false;
-
-        // Check public values.
-        for (air_idx, (vdata, pvs)) in proof
-            .trace_vdata
-            .iter()
-            .zip(proof.public_values.iter())
-            .enumerate()
-        {
-            let air_vk = &vk.inner.per_air[air_idx];
-            if air_idx == PROGRAM_AIR_ID {
-                program_air_present = true;
-                let vdata = vdata.as_ref().unwrap();
-                if i == 0 {
-                    program_commit = Some(vdata.cached_commitments[PROGRAM_CACHED_TRACE_INDEX]);
-                } else if program_commit.unwrap()
-                    != vdata.cached_commitments[PROGRAM_CACHED_TRACE_INDEX]
-                {
-                    return Err(VmVerificationError::ProgramCommitMismatch { index: i });
-                }
-            } else if air_idx == CONNECTOR_AIR_ID {
-                connector_air_present = true;
-                let pvs: &VmConnectorPvs<_> = pvs.as_slice().borrow();
-
-                if i != 0 {
-                    // Check initial pc matches the previous final pc.
-                    if pvs.initial_pc != prev_final_pc.unwrap() {
-                        return Err(VmVerificationError::InitialPcMismatch {
-                            initial: pvs.initial_pc.as_canonical_u32(),
-                            prev_final: prev_final_pc.unwrap().as_canonical_u32(),
-                        });
-                    }
-                } else {
-                    start_pc = Some(pvs.initial_pc);
-                }
-                prev_final_pc = Some(pvs.final_pc);
-
-                let expected_is_terminate = i == proofs.len() - 1;
-                if pvs.is_terminate != PrimeCharacteristicRing::from_bool(expected_is_terminate) {
-                    return Err(VmVerificationError::IsTerminateMismatch {
-                        expected: expected_is_terminate,
-                        actual: pvs.is_terminate.as_canonical_u32() != 0,
-                    });
-                }
-
-                let expected_exit_code = if expected_is_terminate {
-                    ExitCode::Success as u32
-                } else {
-                    DEFAULT_SUSPEND_EXIT_CODE
-                };
-                if pvs.exit_code != PrimeCharacteristicRing::from_u32(expected_exit_code) {
-                    return Err(VmVerificationError::ExitCodeMismatch {
-                        expected: expected_exit_code,
-                        actual: pvs.exit_code.as_canonical_u32(),
-                    });
-                }
-            } else if air_idx == BOUNDARY_AIR_ID {
-                boundary_air_present = vdata.is_some();
-                if !pvs.is_empty() {
-                    return Err(VmVerificationError::UnexpectedPvs {
-                        expected: 0,
-                        actual: pvs.len(),
-                    });
-                }
-            } else if air_idx == MERKLE_AIR_ID {
-                merkle_air_present = true;
-                let pvs: &MemoryMerklePvs<_, DIGEST_WIDTH> = pvs.as_slice().borrow();
-
-                // Check that initial root matches the previous final root.
-                if i != 0 {
-                    if pvs.initial_root != prev_final_memory_root.unwrap() {
-                        return Err(VmVerificationError::InitialMemoryRootMismatch);
-                    }
-                } else {
-                    initial_memory_root = Some(pvs.initial_root);
-                }
-                prev_final_memory_root = Some(pvs.final_root);
-            } else {
-                if !pvs.is_empty() {
-                    return Err(VmVerificationError::UnexpectedPvs {
-                        expected: 0,
-                        actual: pvs.len(),
-                    });
-                }
-                // We assume the vk is valid, so this is only a debug assert.
-                debug_assert_eq!(air_vk.params.num_public_values, 0);
-            }
-        }
-        if !program_air_present {
-            return Err(VmVerificationError::SystemAirMissing {
-                air_id: PROGRAM_AIR_ID,
-            });
-        }
-        if !connector_air_present {
-            return Err(VmVerificationError::SystemAirMissing {
-                air_id: CONNECTOR_AIR_ID,
-            });
-        }
-        if !boundary_air_present {
-            return Err(VmVerificationError::SystemAirMissing {
-                air_id: BOUNDARY_AIR_ID,
-            });
-        }
-        if !merkle_air_present {
-            return Err(VmVerificationError::SystemAirMissing {
-                air_id: MERKLE_AIR_ID,
-            });
-        }
+    let mut metadata = Vec::with_capacity(proofs.len());
+    for proof in proofs {
+        engine.verify(vk, proof)?;
+        metadata.push(vm_segment_metadata_from_parts(
+            vk,
+            &proof.trace_vdata,
+            &proof.public_values,
+        )?);
     }
-    let exe_commit = compute_exe_commit(
-        &vm_poseidon2_hasher(),
-        &program_commit.unwrap().into(),
-        initial_memory_root.as_ref().unwrap(),
-        start_pc.unwrap(),
-    );
-    Ok(VerifiedExecutionPayload {
-        exe_commit,
-        final_memory_root: prev_final_memory_root.unwrap(),
-    })
+    verify_segment_metadata_sequence(&metadata)
 }
 
 impl<SC: StarkProtocolConfig> Clone for ContinuationVmProof<SC>
@@ -1745,12 +2366,15 @@ where
     VC::SystemChipInventory: SystemWithFixedTraceHeights,
 {
     /// Sets fixed trace heights for the system AIRs' trace matrices.
+    ///
+    /// `heights` is the whole AIR-ordered vector, not just the leading system block. The system
+    /// owns AIRs at both ends of that vector -- program and connector at the front, the
+    /// Poseidon2 periphery and the range checker at the back -- so truncating to
+    /// `num_airs()` would silently drop the one system AIR whose height actually needs pinning.
     pub fn override_system_trace_heights(&mut self, heights: &[u32]) {
         let num_sys_airs = self.config().as_ref().num_airs();
         assert!(heights.len() >= num_sys_airs);
-        self.chip_complex
-            .system
-            .override_trace_heights(&heights[..num_sys_airs]);
+        self.chip_complex.system.override_trace_heights(heights);
     }
 }
 

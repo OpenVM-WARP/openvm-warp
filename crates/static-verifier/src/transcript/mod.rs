@@ -237,7 +237,17 @@ impl TranscriptChip {
     // --- Low-level sponge (matches DuplexSponge::absorb/squeeze) ---
 
     fn sponge_absorb(&mut self, ctx: &mut Context<Fr>, value: AssignedValue<Fr>) {
+        let gate = self.baby_bear.range().gate();
         self.sponge_state[self.absorb_idx] = value;
+        // Protocol-v29 length binding: every absorbed BN254 word increments
+        // the first capacity lane before a possible permutation. This must
+        // exactly mirror `DuplexSponge::absorb`; otherwise the Halo2 static
+        // verifier derives a different Root transcript.
+        self.sponge_state[POSEIDON2_RATE] = gate.add(
+            ctx,
+            self.sponge_state[POSEIDON2_RATE],
+            QuantumCell::Constant(Fr::ONE),
+        );
         self.absorb_idx += 1;
         if self.absorb_idx == POSEIDON2_RATE {
             self.permute_state(ctx);

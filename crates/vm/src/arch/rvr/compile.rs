@@ -4,6 +4,7 @@ use std::{
     fs::{self, File},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -91,10 +92,30 @@ impl RvrCompiled {
                 source,
             })?;
         }
-        fs::copy(&self.lib_path, dest_lib).map_err(|source| CompileError::CProject {
-            path: dest_lib.to_path_buf(),
+        static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let file_name = dest_lib
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                CompileError::LibLoad(format!(
+                    "shared library destination has no UTF-8 filename: {}",
+                    dest_lib.display()
+                ))
+            })?;
+        let temp_lib =
+            dest_lib.with_file_name(format!(".{file_name}.tmp-{}-{counter}", std::process::id()));
+        fs::copy(&self.lib_path, &temp_lib).map_err(|source| CompileError::CProject {
+            path: temp_lib.clone(),
             source,
         })?;
+        if let Err(source) = fs::rename(&temp_lib, dest_lib) {
+            let _ = fs::remove_file(&temp_lib);
+            return Err(CompileError::CProject {
+                path: dest_lib.to_path_buf(),
+                source,
+            });
+        }
         Ok(dest_lib.to_path_buf())
     }
 

@@ -21,7 +21,6 @@ pub use openvm_build::{cargo_command, get_rustup_toolchain_name};
 pub use openvm_circuit;
 #[cfg(feature = "rvr")]
 use openvm_circuit::arch::{
-    execution_mode::MeteredCtx,
     instructions::program::DEFAULT_PC_STEP,
     rvr::{default_addr2line_cmd, GuestDebugMap},
 };
@@ -52,7 +51,9 @@ use openvm_verify_stark_host::{
 pub use types::{ExecutableFormat, ExecutableInput};
 
 #[cfg(feature = "rvr")]
-use crate::compiled::load_metered_artifact_metadata;
+use crate::compiled::{
+    load_metered_artifact_metadata, metered_artifact_identity, validate_metered_artifact,
+};
 use crate::{
     config::{AggregationConfig, AggregationSystemParams, AggregationTreeConfig},
     keygen::{AggPrefixProvingKey, AggProvingKey},
@@ -79,6 +80,140 @@ cfg_if::cfg_if! {
     }
 }
 
+/// CUDA application-prover constructors for the reduced-SWIRL boundary.
+///
+/// These are separate from `app_prover`: the exact initial RS matrices must
+/// remain owned by the GPU prover from key/program commitment onward. Toggling
+/// that policy after ordinary construction would require reconstructing and
+/// recommitting the source payload that WARP is meant to reuse.
+#[cfg(feature = "cuda")]
+impl<VB> GenericSdk<GpuBabyBearPoseidon2Engine, VB>
+where
+    VB: VmBuilder<GpuBabyBearPoseidon2Engine> + Clone,
+    <VB::VmConfig as VmExecutionConfig<F>>::Executor:
+        Executor<F> + MeteredExecutor<F> + PreflightExecutor<F, VB::RecordArena>,
+{
+    pub fn reduced_swirl_app_prover(
+        &self,
+        exe: impl Into<ExecutableFormat>,
+    ) -> Result<AppProver<GpuBabyBearPoseidon2Engine, VB>, SdkError> {
+        let exe = self.convert_to_exe(exe)?;
+        let app_pk = self.app_pk();
+        prover::reduced_swirl_execution_cuda::new_reduced_swirl_cuda_app_prover(
+            self.app_vm_builder.clone(),
+            &app_pk.app_vm_pk,
+            exe,
+        )
+        .map_err(SdkError::from)
+    }
+
+    #[cfg(feature = "rvr")]
+    pub fn reduced_swirl_app_prover_with_metered_cache(
+        &self,
+        cache_dir: &Path,
+        exe: impl Into<ExecutableFormat>,
+    ) -> Result<
+        (
+            AppProver<GpuBabyBearPoseidon2Engine, VB>,
+            MeteredArtifactCacheStatus,
+        ),
+        SdkError,
+    > {
+        let mut prover = self.reduced_swirl_app_prover(exe)?;
+        let (artifact_path, cache_status) =
+            self.prepare_metered_artifact_for_app_prover(cache_dir, &prover)?;
+        prover.set_metered_artifact_path(artifact_path);
+        Ok((prover, cache_status))
+    }
+
+    /// Prove directly from OpenVM's deferred-SWIRL boundary, accumulate the
+    /// original stacked RS codewords with WARP, and return one ordinary
+    /// recursively normalized standalone proof.
+    ///
+    /// This is the production replacement path: it does not construct full
+    /// per-segment WHIR proofs and it does not accumulate completed segment
+    /// proofs.  Setup parameters are inherited from the same aggregation keys
+    /// as the regular recursive lane so benchmark comparisons use identical
+    /// EF4/PCS profiles outside the new accumulation boundary.
+    pub fn prove_reduced_swirl_warp(
+        &self,
+        exe: impl Into<ExecutableFormat>,
+        inputs: StdIn,
+        input_arity: usize,
+        family_target_bits: usize,
+    ) -> Result<prover::reduced_swirl_production_cuda::ReducedSwirlProductionCudaOutput, SdkError>
+    where
+        VB::SystemChipInventory: openvm_circuit::system::SystemWithFixedTraceHeights,
+    {
+        if self.def_hook_cached_commit().is_some() {
+            return Err(SdkError::Other(eyre::eyre!(
+                "reduced-SWIRL WARP does not yet support deferral proofs"
+            )));
+        }
+        let app_prover = self.reduced_swirl_app_prover(exe)?;
+        // WARP needs the recursive lane's setup-fixed PCS parameters, not its
+        // proving keys. Calling `agg_pk()` here constructs and retains the
+        // complete ordinary leaf/internal aggregation stack merely to clone
+        // these two small values. Besides being duplicate setup work, those
+        // unused host/device keys overlap the custom WARP wrapper keygen and
+        // materially increase its peak memory. The config is the authority
+        // from which `AggProver` itself would build the same keys.
+        let recursive_leaf_params = self.agg_config.params.leaf.clone();
+        let recursive_internal_params = self.agg_config.params.internal.clone();
+        prover::reduced_swirl_production_cuda::prove_reduced_swirl_production_cuda(
+            app_prover,
+            inputs,
+            input_arity,
+            family_target_bits,
+            recursive_leaf_params,
+            recursive_internal_params,
+        )
+        .map_err(|error| SdkError::Other(eyre::eyre!(error)))
+    }
+
+    #[cfg(feature = "rvr")]
+    pub fn prove_reduced_swirl_warp_with_metered_cache(
+        &self,
+        cache_dir: &Path,
+        exe: impl Into<ExecutableFormat>,
+        inputs: StdIn,
+        input_arity: usize,
+        family_target_bits: usize,
+    ) -> Result<
+        (
+            prover::reduced_swirl_production_cuda::ReducedSwirlProductionCudaOutput,
+            MeteredArtifactCacheStatus,
+        ),
+        SdkError,
+    >
+    where
+        VB::SystemChipInventory: openvm_circuit::system::SystemWithFixedTraceHeights,
+    {
+        if self.def_hook_cached_commit().is_some() {
+            return Err(SdkError::Other(eyre::eyre!(
+                "reduced-SWIRL WARP does not yet support deferral proofs"
+            )));
+        }
+        let (app_prover, cache_status) =
+            self.reduced_swirl_app_prover_with_metered_cache(cache_dir, exe)?;
+        // Match `prove_reduced_swirl_warp`: sharing PCS parameters with the
+        // recursive lane must not instantiate its otherwise-unused proving
+        // keys inside the WARP process.
+        let recursive_leaf_params = self.agg_config.params.leaf.clone();
+        let recursive_internal_params = self.agg_config.params.internal.clone();
+        let output = prover::reduced_swirl_production_cuda::prove_reduced_swirl_production_cuda(
+            app_prover,
+            inputs,
+            input_arity,
+            family_target_bits,
+            recursive_leaf_params,
+            recursive_internal_params,
+        )
+        .map_err(|error| SdkError::Other(eyre::eyre!(error)))?;
+        Ok((output, cache_status))
+    }
+}
+
 pub use openvm_stark_sdk::config::baby_bear_poseidon2::{BabyBearPoseidon2Config as SC, F};
 
 pub mod builder;
@@ -100,6 +235,11 @@ mod tests;
 mod error;
 mod stdin;
 pub use compiled::{CompiledExeMetered, CompiledExeMeteredCost, CompiledExePure};
+#[cfg(feature = "rvr")]
+pub use compiled::{
+    MeteredArtifactCacheStatus, MeteredArtifactIdentity, MeteredArtifactMetadata,
+    METERED_ARTIFACT_FORMAT_VERSION,
+};
 pub use error::SdkError;
 pub use stdin::*;
 
@@ -473,6 +613,14 @@ where
         let ctx = vm.build_metered_ctx(&exe);
         let executor_idx_to_air_idx = vm.executor_idx_to_air_idx();
         #[cfg(feature = "rvr")]
+        let artifact_identity = metered_artifact_identity(
+            &exe,
+            &ctx.config,
+            ctx.segmentation_ctx.config(),
+            &executor_idx_to_air_idx,
+        )
+        .map_err(SdkError::Other)?;
+        #[cfg(feature = "rvr")]
         let guest_debug_map = input
             .elf_path
             .as_deref()
@@ -493,11 +641,16 @@ where
             ctx,
             #[cfg(feature = "rvr")]
             executor_idx_to_air_idx,
+            #[cfg(feature = "rvr")]
+            artifact_identity,
         })
     }
 
-    /// Load a previously saved metered-mode artifact. The `MeteredCtx`
-    /// is rebuilt. Caller supplies `app_exe`; no compatibility validation is performed.
+    /// Load a previously saved metered-mode artifact after validating its executable, VM shape,
+    /// native toolchain, and shared-library digest.
+    ///
+    /// The execution context and executor-to-AIR mapping are recomputed from `app_exe` and this
+    /// SDK. Values from the cache manifest are never used as trusted execution configuration.
     #[cfg(feature = "rvr")]
     pub fn load_compiled_metered(
         &self,
@@ -506,20 +659,176 @@ where
     ) -> Result<CompiledExeMetered<'_>, SdkError> {
         let metadata = load_metered_artifact_metadata(lib_path).map_err(SdkError::Other)?;
         let exe = self.convert_to_exe(app_exe)?;
-        let ctx = MeteredCtx::from_config(
-            metadata.metered_ctx_config,
-            metadata.segmentation_config,
-            self.executor.config.as_ref(),
-        );
+        let app_prover = self.app_prover(exe.clone())?;
+        let vm = app_prover.vm();
+        let ctx = vm.build_metered_ctx(&exe);
+        let executor_idx_to_air_idx = vm.executor_idx_to_air_idx();
+        let artifact_identity = metered_artifact_identity(
+            &exe,
+            &ctx.config,
+            ctx.segmentation_ctx.config(),
+            &executor_idx_to_air_idx,
+        )
+        .map_err(SdkError::Other)?;
+        validate_metered_artifact(lib_path, &metadata, &artifact_identity)
+            .map_err(SdkError::Other)?;
         let instance = self
             .executor
-            .load_metered_instance(lib_path, &exe, &metadata.executor_idx_to_air_idx)
+            .load_metered_instance(lib_path, &exe, &executor_idx_to_air_idx)
             .map_err(VirtualMachineError::from)?;
         Ok(CompiledExeMetered {
             instance,
             ctx,
-            executor_idx_to_air_idx: metadata.executor_idx_to_air_idx,
+            executor_idx_to_air_idx,
+            artifact_identity,
         })
+    }
+
+    /// Load a checked native metered artifact from a content-addressed cache, compiling and
+    /// atomically replacing the entry on a miss or validation failure.
+    #[cfg(feature = "rvr")]
+    #[tracing::instrument(name = "sdk.compile_or_load_metered_cached", level = "info", skip_all)]
+    pub fn compile_or_load_metered_cached(
+        &self,
+        cache_dir: &Path,
+        app_exe: impl Into<ExecutableInput>,
+    ) -> Result<(CompiledExeMetered<'_>, MeteredArtifactCacheStatus), SdkError> {
+        let input = self.compile_input(app_exe)?;
+        let elf_path = input.elf_path.clone();
+        let exe = self.convert_to_exe(input.executable)?;
+        let app_prover = self.app_prover(exe.clone())?;
+        let vm = app_prover.vm();
+        let ctx = vm.build_metered_ctx(&exe);
+        let executor_idx_to_air_idx = vm.executor_idx_to_air_idx();
+        let identity = metered_artifact_identity(
+            &exe,
+            &ctx.config,
+            ctx.segmentation_ctx.config(),
+            &executor_idx_to_air_idx,
+        )
+        .map_err(SdkError::Other)?;
+        let lib_path = identity
+            .cache_library_path(cache_dir)
+            .map_err(SdkError::Other)?;
+        let entry_dir = lib_path
+            .parent()
+            .expect("content-addressed metered artifact has a parent directory");
+        let metadata_path = compiled::metered_artifact_metadata_path(&lib_path);
+
+        let mut status = MeteredArtifactCacheStatus::Miss;
+        if lib_path.is_file() && metadata_path.is_file() {
+            match self.load_compiled_metered(&lib_path, exe.clone()) {
+                Ok(compiled) => {
+                    tracing::info!(path = %lib_path.display(), "native metered artifact cache hit");
+                    return Ok((compiled, MeteredArtifactCacheStatus::Hit));
+                }
+                Err(error) => {
+                    let reason = error.to_string();
+                    tracing::warn!(
+                        path = %lib_path.display(),
+                        %reason,
+                        "rejecting invalid native metered artifact cache entry"
+                    );
+                    status = MeteredArtifactCacheStatus::Rebuilt { reason };
+                }
+            }
+        }
+
+        std::fs::create_dir_all(entry_dir)?;
+        let compile_input = if let Some(elf_path) = elf_path {
+            ExecutableInput::with_elf_path(exe, elf_path)
+        } else {
+            ExecutableInput::from(exe)
+        };
+        let compiled = self.compile_metered(compile_input)?;
+        if compiled.artifact_identity != identity {
+            return Err(SdkError::Other(eyre::eyre!(
+                "native metered cache identity changed while compiling"
+            )));
+        }
+        compiled.save_to_path(&lib_path).map_err(SdkError::Other)?;
+        tracing::info!(path = %lib_path.display(), ?status, "stored native metered artifact");
+        Ok((compiled, status))
+    }
+
+    /// Ensure a checked native metering artifact exists and return its stable cache path.
+    ///
+    /// This drops the temporary loaded instance before returning. A continuation prover can then
+    /// load the same artifact in its own VM without retaining duplicate native-library handles.
+    #[cfg(feature = "rvr")]
+    pub fn prepare_metered_artifact_cache(
+        &self,
+        cache_dir: &Path,
+        app_exe: impl Into<ExecutableInput>,
+    ) -> Result<(PathBuf, MeteredArtifactCacheStatus), SdkError> {
+        let (compiled, status) = self.compile_or_load_metered_cached(cache_dir, app_exe)?;
+        let lib_path = compiled
+            .artifact_identity()
+            .cache_library_path(cache_dir)
+            .map_err(SdkError::Other)?;
+        drop(compiled);
+        Ok((lib_path, status))
+    }
+
+    #[cfg(feature = "rvr")]
+    fn prepare_metered_artifact_for_app_prover(
+        &self,
+        cache_dir: &Path,
+        prover: &AppProver<E, VB>,
+    ) -> Result<(PathBuf, MeteredArtifactCacheStatus), SdkError> {
+        let vm = prover.vm();
+        let exe = prover.exe();
+        let ctx = vm.build_metered_ctx(&exe);
+        let executor_idx_to_air_idx = vm.executor_idx_to_air_idx();
+        let identity = metered_artifact_identity(
+            &exe,
+            &ctx.config,
+            ctx.segmentation_ctx.config(),
+            &executor_idx_to_air_idx,
+        )
+        .map_err(SdkError::Other)?;
+        let lib_path = identity
+            .cache_library_path(cache_dir)
+            .map_err(SdkError::Other)?;
+        let metadata_path = compiled::metered_artifact_metadata_path(&lib_path);
+
+        let mut status = MeteredArtifactCacheStatus::Miss;
+        if lib_path.is_file() && metadata_path.is_file() {
+            match load_metered_artifact_metadata(&lib_path)
+                .and_then(|metadata| validate_metered_artifact(&lib_path, &metadata, &identity))
+            {
+                Ok(()) => {
+                    tracing::info!(path = %lib_path.display(), "native metered artifact cache hit");
+                    return Ok((lib_path, MeteredArtifactCacheStatus::Hit));
+                }
+                Err(error) => {
+                    let reason = error.to_string();
+                    tracing::warn!(
+                        path = %lib_path.display(),
+                        %reason,
+                        "rejecting invalid native metered artifact cache entry"
+                    );
+                    status = MeteredArtifactCacheStatus::Rebuilt { reason };
+                }
+            }
+        }
+
+        let entry_dir = lib_path
+            .parent()
+            .expect("content-addressed metered artifact has a parent directory");
+        std::fs::create_dir_all(entry_dir)?;
+        let instance = vm
+            .metered_instance(&exe)
+            .map_err(VirtualMachineError::from)?;
+        let compiled = CompiledExeMetered {
+            instance,
+            ctx,
+            executor_idx_to_air_idx,
+            artifact_identity: identity,
+        };
+        compiled.save_to_path(&lib_path).map_err(SdkError::Other)?;
+        tracing::info!(path = %lib_path.display(), ?status, "stored native metered artifact");
+        Ok((lib_path, status))
     }
 
     /// Run a [`CompiledExeMetered`] against `inputs`.
@@ -659,6 +968,33 @@ where
         Ok((proof, baseline))
     }
 
+    /// [`Self::prove`] with a checked content-addressed native metering cache.
+    ///
+    /// Warm-cache time excludes native C generation/compilation while preserving the exact
+    /// metered execution and segment schedule. The status lets benchmarks report cold and warm
+    /// runs separately.
+    #[cfg(feature = "rvr")]
+    pub fn prove_with_metered_cache(
+        &self,
+        cache_dir: &Path,
+        app_exe: impl Into<ExecutableFormat>,
+        inputs: StdIn,
+        def_inputs: &[DeferralInput],
+    ) -> Result<
+        (
+            VmStarkProof,
+            VerificationBaseline,
+            MeteredArtifactCacheStatus,
+        ),
+        SdkError,
+    > {
+        let (mut prover, cache_status) = tracing::info_span!("recursive_prover_setup")
+            .in_scope(|| self.prover_with_metered_cache(cache_dir, app_exe))?;
+        let proof = prover.prove(inputs, def_inputs)?.0;
+        let baseline = prover.generate_baseline();
+        Ok((proof, baseline, cache_status))
+    }
+
     #[cfg(feature = "evm-prove")]
     /// Generates an EVM-verifiable proof for the given executable and inputs.
     pub fn prove_evm(
@@ -692,6 +1028,23 @@ where
         Ok(prover)
     }
 
+    /// Construct an application prover using a checked content-addressed native metering
+    /// artifact. Cache preparation happens before the prover installs the path, so unvalidated
+    /// shared libraries never reach the VM loader through this API.
+    #[cfg(feature = "rvr")]
+    pub fn app_prover_with_metered_cache(
+        &self,
+        cache_dir: &Path,
+        exe: impl Into<ExecutableFormat>,
+    ) -> Result<(AppProver<E, VB>, MeteredArtifactCacheStatus), SdkError> {
+        let exe = self.convert_to_exe(exe)?;
+        let mut prover = self.app_prover(exe)?;
+        let (artifact_path, cache_status) =
+            self.prepare_metered_artifact_for_app_prover(cache_dir, &prover)?;
+        prover.set_metered_artifact_path(artifact_path);
+        Ok((prover, cache_status))
+    }
+
     /// Constructs a new [StarkProver] instance for the given executable.
     /// This function will generate the [AppProvingKey] if it does not already
     /// exist.
@@ -709,6 +1062,22 @@ where
             self.def_path_prover.clone(),
         )?;
         Ok(stark_prover)
+    }
+
+    /// Construct a recursive STARK prover using a checked content-addressed native metering
+    /// artifact.
+    #[cfg(feature = "rvr")]
+    pub fn prover_with_metered_cache(
+        &self,
+        cache_dir: &Path,
+        app_exe: impl Into<ExecutableFormat>,
+    ) -> Result<(StarkProver<E, VB>, MeteredArtifactCacheStatus), SdkError> {
+        let app_exe = self.convert_to_exe(app_exe)?;
+        let mut prover = self.prover(app_exe)?;
+        let (artifact_path, cache_status) =
+            self.prepare_metered_artifact_for_app_prover(cache_dir, &prover.app_prover)?;
+        prover.app_prover.set_metered_artifact_path(artifact_path);
+        Ok((prover, cache_status))
     }
 
     #[cfg(feature = "root-prover")]

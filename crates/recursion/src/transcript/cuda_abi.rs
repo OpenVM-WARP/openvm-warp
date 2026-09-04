@@ -22,6 +22,18 @@ extern "C" {
         stream: cudaStream_t,
     ) -> i32;
 
+    fn _poseidon2_multibus_tracegen(
+        d_trace: *mut F,
+        height: usize,
+        width: usize,
+        d_records: *mut F,
+        d_counts: *mut u32,
+        num_records: usize,
+        num_bus_groups: usize,
+        sbox_regs: usize,
+        stream: cudaStream_t,
+    ) -> i32;
+
     fn _poseidon2_deduplicate_records_get_temp_bytes(
         d_records: *mut F,
         d_counts: *mut Poseidon2Count,
@@ -97,6 +109,31 @@ pub unsafe fn poseidon2_tracegen(
         d_records.as_mut_ptr(),
         d_counts.as_mut_ptr(),
         num_records,
+        sbox_regs,
+        stream,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn poseidon2_multibus_tracegen(
+    d_trace: &DeviceBuffer<F>,
+    height: usize,
+    width: usize,
+    d_records: &DeviceBuffer<F>,
+    d_counts: &DeviceBuffer<u32>,
+    num_records: usize,
+    num_bus_groups: usize,
+    sbox_regs: usize,
+    stream: cudaStream_t,
+) -> Result<(), CudaError> {
+    CudaError::from_result(_poseidon2_multibus_tracegen(
+        d_trace.as_mut_ptr(),
+        height,
+        width,
+        d_records.as_mut_ptr(),
+        d_counts.as_mut_ptr(),
+        num_records,
+        num_bus_groups,
         sbox_regs,
         stream,
     ))

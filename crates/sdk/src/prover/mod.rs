@@ -5,6 +5,7 @@ mod deferral;
 mod evm;
 #[cfg(feature = "evm-prove")]
 mod halo2;
+mod native_warp;
 #[cfg(feature = "root-prover")]
 mod root;
 mod stark;
@@ -17,6 +18,7 @@ pub use deferral::*;
 pub use evm::*;
 #[cfg(feature = "evm-prove")]
 pub use halo2::*;
+pub use native_warp::*;
 #[cfg(feature = "root-prover")]
 pub use root::*;
 pub use stark::*;

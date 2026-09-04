@@ -11,7 +11,10 @@ use crate::{
     primitives::{
         pow::cuda::PowerCheckerGpuTraceGenerator, range::cuda::RangeCheckerGpuTraceGenerator,
     },
-    proof_shape::{cuda_abi::proof_shape_tracegen, proof_shape::ProofShapeCols},
+    proof_shape::{
+        cuda_abi::proof_shape_tracegen,
+        proof_shape::{ProofShapeCols, ProofShapeMetadataCols},
+    },
     system::POW_CHECKER_HEIGHT,
     tracegen::ModuleChip,
 };
@@ -33,19 +36,64 @@ pub(crate) struct ProofShapeTracegenInputs {
     max_interaction_count: u32,
     max_cached: usize,
     min_cached_idx: usize,
+    selector_width: usize,
+    metadata_lookup: u32,
+    air_idx_gap_bits: usize,
     pre_hash: Digest,
     range_checker_8_ptr: *mut u32,
     range_checker_5_ptr: *mut u32,
+    /// Table for the AIR-index gap, checked at the selected width rather than `LIMB_BITS`.
+    /// Separate because the range bus is keyed `(value, max_bits)`.
+    range_checker_gap_ptr: *mut u32,
     pow_checker_ptr: *mut u32,
+}
+
+#[derive(Clone)]
+pub(in crate::proof_shape) enum ProofShapeGapRangeCheckerGpu {
+    Bits10(Arc<RangeCheckerGpuTraceGenerator<10>>),
+    Bits12(Arc<RangeCheckerGpuTraceGenerator<12>>),
+}
+
+impl ProofShapeGapRangeCheckerGpu {
+    pub fn new(bits: usize, device_ctx: GpuDeviceCtx) -> Self {
+        match bits {
+            10 => Self::Bits10(Arc::new(RangeCheckerGpuTraceGenerator::new(device_ctx))),
+            12 => Self::Bits12(Arc::new(RangeCheckerGpuTraceGenerator::new(device_ctx))),
+            _ => panic!("unsupported proof-shape AIR-index gap width {bits}"),
+        }
+    }
+
+    fn bits(&self) -> usize {
+        match self {
+            Self::Bits10(_) => 10,
+            Self::Bits12(_) => 12,
+        }
+    }
+
+    fn count_mut_ptr(&self) -> *mut u32 {
+        match self {
+            Self::Bits10(generator) => generator.count_mut_ptr(),
+            Self::Bits12(generator) => generator.count_mut_ptr(),
+        }
+    }
+
+    pub fn into_trace(self) -> Option<DeviceMatrix<openvm_cuda_backend::prelude::F>> {
+        match self {
+            Self::Bits10(generator) => Arc::try_unwrap(generator).ok().map(|g| g.generate_trace()),
+            Self::Bits12(generator) => Arc::try_unwrap(generator).ok().map(|g| g.generate_trace()),
+        }
+    }
 }
 
 #[derive(derive_new::new)]
 pub(in crate::proof_shape) struct ProofShapeChipGpu<const NUM_LIMBS: usize, const LIMB_BITS: usize>
 {
     encoder_width: usize,
+    metadata_lookup: bool,
     min_cached_idx: usize,
     max_cached: usize,
     range_checker: Arc<RangeCheckerGpuTraceGenerator<LIMB_BITS>>,
+    gap_range_checker: ProofShapeGapRangeCheckerGpu,
     pow_checker: Arc<PowerCheckerGpuTraceGenerator<2, POW_CHECKER_HEIGHT>>,
 }
 
@@ -71,14 +119,18 @@ impl ModuleChip<GpuBackend> for ProofShapeChipGpu<NUM_LIMBS, LIMB_BITS> {
         } else {
             num_valid_rows.next_power_of_two()
         };
-        let encoder_width = self.encoder_width;
+        let selector_width = if self.metadata_lookup {
+            ProofShapeMetadataCols::<u8>::width()
+        } else {
+            self.encoder_width
+        };
         let min_cached_idx = self.min_cached_idx;
         let max_cached = self.max_cached;
         let range_checker = &self.range_checker;
         let pow_checker = &self.pow_checker;
         let num_airs = vk_gpu.per_air.len();
         let width =
-            ProofShapeCols::<u8, NUM_LIMBS>::width() + encoder_width + max_cached * DIGEST_SIZE;
+            ProofShapeCols::<u8, NUM_LIMBS>::width() + selector_width + max_cached * DIGEST_SIZE;
         let trace = DeviceMatrix::with_capacity_on(height, width, device_ctx);
 
         let per_row_tidx = preflights_gpu
@@ -116,9 +168,13 @@ impl ModuleChip<GpuBackend> for ProofShapeChipGpu<NUM_LIMBS, LIMB_BITS> {
             max_interaction_count: vk_gpu.system_params.logup.max_interaction_count,
             max_cached,
             min_cached_idx,
+            selector_width,
+            metadata_lookup: u32::from(self.metadata_lookup),
+            air_idx_gap_bits: self.gap_range_checker.bits(),
             pre_hash: vk_gpu.pre_hash,
             range_checker_8_ptr: range_checker.count_mut_ptr(),
             range_checker_5_ptr: pow_checker.range_count_mut_ptr(),
+            range_checker_gap_ptr: self.gap_range_checker.count_mut_ptr(),
             pow_checker_ptr: pow_checker.pow_count_mut_ptr(),
         };
 

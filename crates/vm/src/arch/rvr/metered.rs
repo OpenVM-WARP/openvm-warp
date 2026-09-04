@@ -366,6 +366,14 @@ impl<F: PrimeField32, S> RvrMeteredInstanceWith<'_, F, S> {
         self.compiled.save_artifact(&dir.join(dest_lib))
     }
 
+    /// Persist the compiled shared library at an exact path.
+    ///
+    /// This is used by content-addressed caches, whose lookup path must not depend on the
+    /// temporary filename chosen by the compiler.
+    pub fn save_to_path(&self, lib_path: &Path) -> Result<PathBuf, super::CompileError> {
+        self.compiled.save_artifact(lib_path)
+    }
+
     /// Persist generated C sources for inspection.
     pub fn save_generated_sources(&self, dir: &Path) -> Result<(), super::CompileError> {
         self.compiled.save_generated_sources(dir)
@@ -485,6 +493,7 @@ mod tests {
                 need_rot: &need_rot,
                 segmentation_limits: SegmentationLimits {
                     max_trace_height_bits: 11,
+                    max_trace_cells: None,
                     max_memory: DEFAULT_MAX_MEMORY,
                     max_interactions: u32::MAX,
                 },
@@ -501,14 +510,17 @@ mod tests {
         with_interval_buffer.mem_page_buf[0] = PageAccess {
             page_id: 7,
             leaf_mask: 1,
+            write_mask: 0,
         };
         with_interval_buffer.pv_page_buf[0] = PageAccess {
             page_id: 3,
             leaf_mask: 1,
+            write_mask: 0,
         };
         with_interval_buffer.deferral_page_buf[0] = PageAccess {
             page_id: 2,
             leaf_mask: 1,
+            write_mask: 0,
         };
         with_interval_buffer.initialize_segment_memory(1, 1, 1);
 

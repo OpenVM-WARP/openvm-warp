@@ -1,10 +1,7 @@
 use std::sync::Arc;
 
 use derive_new::new;
-use openvm_circuit::{
-    arch::{DenseRecordArena, RecordSeeker},
-    utils::next_power_of_two_or_zero,
-};
+use openvm_circuit::arch::{DenseRecordArena, RecordSeeker};
 use openvm_circuit_primitives::{var_range::VariableRangeCheckerChipGPU, Chip};
 use openvm_cuda_backend::{base::DeviceMatrix, prelude::F, GpuBackend};
 use openvm_cuda_common::copy::MemCopyH2D;
@@ -32,11 +29,9 @@ pub struct OffsetInfo {
 
 impl Chip<DenseRecordArena, GpuBackend> for Rv64HintStoreChipGpu {
     fn generate_proving_ctx(&self, mut arena: DenseRecordArena) -> AirProvingContext<GpuBackend> {
+        let forced_height = arena.forced_height();
         let width = Rv64HintStoreCols::<u8>::width();
         let records = arena.allocated_mut();
-        if records.is_empty() {
-            return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
-        }
 
         let mut offsets = Vec::<OffsetInfo>::new();
         let mut offset = 0;
@@ -59,7 +54,10 @@ impl Chip<DenseRecordArena, GpuBackend> for Rv64HintStoreChipGpu {
             .unwrap();
         let d_record_offsets = offsets.to_device_on(device_ctx).unwrap();
 
-        let trace_height = next_power_of_two_or_zero(offsets.len());
+        let trace_height = DenseRecordArena::resolve_trace_height(forced_height, offsets.len());
+        if trace_height == 0 {
+            return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
+        }
         let d_trace = DeviceMatrix::<F>::with_capacity_on(trace_height, width, device_ctx);
 
         unsafe {

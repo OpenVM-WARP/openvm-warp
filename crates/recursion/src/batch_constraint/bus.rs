@@ -37,6 +37,46 @@ pub struct SumcheckClaimMessage<T> {
 
 define_typed_per_proof_permutation_bus!(SumcheckClaimBus, SumcheckClaimMessage);
 
+/// Final algebraic claim emitted by `ExpressionClaimAir` after it has matched
+/// the last sumcheck claim.
+#[repr(C)]
+#[derive(AlignedBorrow, Debug, Clone)]
+pub struct BatchConstraintEndpointClaimMessage<T> {
+    pub value: [T; D_EF],
+}
+
+define_typed_per_proof_permutation_bus!(
+    BatchConstraintEndpointClaimBus,
+    BatchConstraintEndpointClaimMessage
+);
+
+/// Authenticated endpoint exported by an interaction-only partial verifier.
+/// The consumer receives both the exact transcript cursor and the equation's
+/// final claim as one permutation-bus tuple.
+#[repr(C)]
+#[derive(AlignedBorrow, Debug, Clone)]
+pub struct BatchConstraintEndpointMessage<T> {
+    pub tidx: T,
+    pub final_claim: [T; D_EF],
+}
+
+define_typed_per_proof_permutation_bus!(BatchConstraintEndpointBus, BatchConstraintEndpointMessage);
+
+/// Proof-indexed opening point exported by the interaction-only verifier.
+///
+/// These are the exact `r_0, .., r_n` challenges sampled by the univariate
+/// and multilinear batch-constraint sumchecks.  Protocol-v19 SWIRL consumes
+/// them to reconstruct the mapped raw-source functional.  The sumcheck AIRs
+/// are the only senders; no host checkpoint can authorize this message.
+#[repr(C)]
+#[derive(AlignedBorrow, Debug, Clone)]
+pub struct LogUpOnlyOpeningPointMessage<T> {
+    pub index: T,
+    pub value: [T; D_EF],
+}
+
+define_typed_per_proof_permutation_bus!(LogUpOnlyOpeningPointBus, LogUpOnlyOpeningPointMessage);
+
 #[repr(C)]
 #[derive(AlignedBorrow, Debug, Clone)]
 pub struct EqSharpUniMessage<T> {

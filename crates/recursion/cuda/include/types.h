@@ -36,6 +36,13 @@ typedef struct {
     size_t num_interactions_per_row;
     size_t total_width;
     bool has_preprocessed;
+    bool is_required;
+    bool need_rot;
+    size_t num_public_values;
+    size_t common_main_width;
+    size_t preprocessed_width;
+    size_t preprocessed_log_height;
+    Digest preprocessed_commit;
 } AirData;
 
 typedef struct {

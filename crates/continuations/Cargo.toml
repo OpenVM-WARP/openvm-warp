@@ -10,6 +10,7 @@ p3-air = { workspace = true }
 p3-bn254 = { workspace = true, optional = true }
 p3-field = { workspace = true }
 p3-matrix = { workspace = true }
+p3-maybe-rayon = { workspace = true }
 openvm-recursion-circuit = { workspace = true }
 openvm-recursion-circuit-derive = { workspace = true }
 openvm-verify-stark-host = { workspace = true }
@@ -23,6 +24,7 @@ openvm-poseidon2-air = { workspace = true }
 itertools.workspace = true
 tracing.workspace = true
 eyre.workspace = true
+serde.workspace = true
 derive-new.workspace = true
 cfg-if.workspace = true
 num-bigint.workspace = true
@@ -31,12 +33,14 @@ openvm-cuda-common = { workspace = true, optional = true }
 openvm-cuda-backend = { workspace = true, optional = true }
 
 [dev-dependencies]
+openvm-stark-backend = { workspace = true, features = ["test-utils"] }
 openvm-riscv-circuit = { workspace = true, features = ["test-utils"] }
 openvm-riscv-transpiler = { workspace = true }
 openvm-deferral-circuit = { workspace = true }
 openvm-deferral-transpiler = { workspace = true }
 openvm-transpiler = { workspace = true }
 test-case = { workspace = true }
+serde_json = { workspace = true }
 
 [features]
 default = ["parallel"]
@@ -45,7 +49,11 @@ root-prover = [
     "openvm-stark-sdk/baby-bear-bn254-poseidon2",
     "openvm-cuda-backend?/baby-bear-bn254-poseidon2",
 ]
-parallel = ["openvm-circuit/parallel", "openvm-recursion-circuit/parallel"]
+parallel = [
+    "p3-maybe-rayon/parallel",
+    "openvm-circuit/parallel",
+    "openvm-recursion-circuit/parallel",
+]
 metrics = ["openvm-circuit/metrics"]
 
 cuda = [

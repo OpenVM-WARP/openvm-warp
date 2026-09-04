@@ -1,7 +1,7 @@
 use std::{mem::size_of, sync::Arc};
 
 use derive_new::new;
-use openvm_circuit::{arch::DenseRecordArena, utils::next_power_of_two_or_zero};
+use openvm_circuit::arch::DenseRecordArena;
 use openvm_circuit_primitives::{
     bitwise_op_lookup::BitwiseOperationLookupChipGPU, range_tuple::RangeTupleCheckerChipGPU,
     var_range::VariableRangeCheckerChipGPU, Chip,
@@ -33,14 +33,18 @@ impl Chip<DenseRecordArena, GpuBackend> for Rv64MulHChipGpu {
             MulHCoreRecord<RV64_REGISTER_NUM_LIMBS, RV64_BYTE_BITS>,
         )>();
         let records = arena.allocated();
-        if records.is_empty() {
+        // Honour a pinned height: a chip that executed zero times this segment still
+        // owes the rows the plan plus shape catalog were built against. The kernel
+        // fills every row at or past the record count with this chip's padding row, so
+        // an empty record set with a pinned height is a valid all-padding trace.
+        let trace_height = arena.trace_height(RECORD_SIZE);
+        if trace_height == 0 {
             return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
         }
         debug_assert_eq!(records.len() % RECORD_SIZE, 0);
 
         let trace_width = MulHCoreCols::<F, RV64_REGISTER_NUM_LIMBS, RV64_BYTE_BITS>::width()
             + Rv64MultAdapterCols::<F>::width();
-        let trace_height = next_power_of_two_or_zero(records.len() / RECORD_SIZE);
 
         let tuple_checker_sizes = self.range_tuple_checker.sizes;
         let tuple_checker_sizes = UInt2::new(tuple_checker_sizes[0], tuple_checker_sizes[1]);

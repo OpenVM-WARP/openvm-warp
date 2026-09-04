@@ -8,6 +8,7 @@
 #include "stacking_blob.cuh"
 #include "switch_macro.h"
 #include "types.h"
+#include "util.cuh"
 
 #include <cassert>
 #include <cstddef>
@@ -186,6 +187,118 @@ __global__ void stacking_claims_zero_padding_accums(
     }
 }
 
+__global__ void stacking_claims_tracegen_dynamic(
+    Fp *trace,
+    size_t height,
+    const uint32_t *__restrict__ row_bounds,
+    StackingClaim *const *__restrict__ claims, // [records[i].num_valid]
+    FpExt *const *__restrict__ coeffs,         // [records[i].num_valid]
+    FpExt *const *__restrict__ mu_pows,        // [records[i].num_valid]
+    const ClaimsRecordsPerProof *__restrict__ records,
+    uint32_t num_proofs
+) {
+    uint32_t global_row_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    RowSlice row(trace + global_row_idx, height);
+
+    uint32_t proof_idx = partition_point_leq(row_bounds, num_proofs, global_row_idx);
+    if (proof_idx >= num_proofs) {
+        row.fill_zero(0, sizeof(StackingClaimsCols<uint8_t>));
+        COL_WRITE_VALUE(row, StackingClaimsCols, proof_idx, num_proofs);
+        COL_WRITE_VALUE(row, StackingClaimsCols, is_last, global_row_idx + 1 == height);
+        return;
+    }
+    uint32_t proof_row_start = proof_idx == 0 ? 0 : row_bounds[proof_idx - 1];
+    uint32_t row_idx = global_row_idx - proof_row_start;
+    uint32_t num_rows = row_bounds[proof_idx] - proof_row_start;
+
+    uint32_t num_valid = records[proof_idx].num_valid;
+    bool is_valid = row_idx < num_valid;
+    bool is_padding = !is_valid;
+    bool is_last = is_padding ? (row_idx + 1 == num_rows)
+                              : (num_valid == num_rows && row_idx + 1 == num_valid);
+
+    row.fill_zero(0, sizeof(StackingClaimsCols<uint8_t>));
+    COL_WRITE_VALUE(row, StackingClaimsCols, proof_idx, proof_idx);
+    COL_WRITE_VALUE(row, StackingClaimsCols, is_valid, is_valid);
+    COL_WRITE_VALUE(row, StackingClaimsCols, is_padding, is_padding);
+    COL_WRITE_VALUE(row, StackingClaimsCols, is_first, is_valid && row_idx == 0);
+    COL_WRITE_VALUE(row, StackingClaimsCols, is_last, is_last);
+    COL_WRITE_VALUE(row, StackingClaimsCols, global_col_idx, row_idx);
+
+    if (is_padding) {
+        // Padding rows leave scan inputs as zero. A post-scan kernel resets
+        // scanned accumulators for padding rows to zero.
+        return;
+    }
+
+    StackingClaim claim = claims[proof_idx][row_idx];
+    FpExt coeff = coeffs[proof_idx][row_idx];
+    FpExt mu_pow = mu_pows[proof_idx][row_idx];
+    ClaimsRecordsPerProof record = records[proof_idx];
+
+    COL_WRITE_VALUE(row, StackingClaimsCols, commit_idx, claim.commit_idx);
+    COL_WRITE_VALUE(row, StackingClaimsCols, stacked_col_idx, claim.stacked_col_idx);
+
+    COL_WRITE_VALUE(row, StackingClaimsCols, tidx, record.initial_tidx + (row_idx * D_EF));
+    COL_WRITE_ARRAY(row, StackingClaimsCols, mu, record.mu.elems);
+    COL_WRITE_ARRAY(row, StackingClaimsCols, mu_pow, mu_pow.elems);
+
+    COL_WRITE_VALUE(row, StackingClaimsCols, mu_pow_witness, record.mu_pow_witness);
+    COL_WRITE_VALUE(row, StackingClaimsCols, mu_pow_sample, record.mu_pow_sample);
+
+    COL_WRITE_ARRAY(row, StackingClaimsCols, stacking_claim, claim.claim.elems);
+    COL_WRITE_ARRAY(row, StackingClaimsCols, claim_coefficient, coeff.elems);
+
+    // Needs to be accumulated via prefix scan
+    FpExt final_s_eval = coeff * claim.claim;
+    COL_WRITE_ARRAY(row, StackingClaimsCols, final_s_eval, final_s_eval.elems);
+
+    // Needs to be accumulated via prefix scan
+    FpExt whir_claim = mu_pow * claim.claim;
+    COL_WRITE_ARRAY(row, StackingClaimsCols, whir_claim, whir_claim.elems);
+}
+
+__global__ void stacking_claims_zero_padding_accums_dynamic(
+    Fp *trace,
+    size_t height,
+    const uint32_t *__restrict__ row_bounds,
+    const ClaimsRecordsPerProof *__restrict__ records,
+    uint32_t num_proofs
+) {
+    uint32_t global_row_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (global_row_idx >= height) {
+        return;
+    }
+
+    uint32_t proof_idx = partition_point_leq(row_bounds, num_proofs, global_row_idx);
+    if (proof_idx >= num_proofs) {
+        return;
+    }
+    uint32_t proof_row_start = proof_idx == 0 ? 0 : row_bounds[proof_idx - 1];
+    uint32_t row_idx = global_row_idx - proof_row_start;
+    uint32_t num_rows = row_bounds[proof_idx] - proof_row_start;
+
+    uint32_t num_valid = records[proof_idx].num_valid;
+    bool is_padding = row_idx >= num_valid;
+    if (!is_padding || num_valid == 0 || num_valid == num_rows) {
+        return;
+    }
+
+    uint32_t last_valid_global_row_idx = proof_row_start + num_valid - 1;
+
+    RowSlice row(trace + global_row_idx, height);
+    RowSlice last_valid_row(trace + last_valid_global_row_idx, height);
+
+    constexpr uint32_t final_s_eval_col = COL_INDEX(StackingClaimsCols, final_s_eval);
+    constexpr uint32_t whir_claim_col = COL_INDEX(StackingClaimsCols, whir_claim);
+
+#pragma unroll
+    for (uint32_t i = 0; i < D_EF; i++) {
+        row[final_s_eval_col + i] = row[final_s_eval_col + i] - last_valid_row[final_s_eval_col + i];
+        row[whir_claim_col + i] = row[whir_claim_col + i] - last_valid_row[whir_claim_col + i];
+    }
+}
+
 // ============================================================================
 // LAUNCHERS
 // ============================================================================
@@ -220,42 +333,84 @@ extern "C" int _stacking_claims_tracegen(
     assert(width == sizeof(StackingClaimsCols<uint8_t>));
     auto [grid, block] = kernel_launch_params(height, 256);
 
-    // Single SWITCH_BLOCK for both kernel dispatches to work around an NVCC
-    // 12.9 bug.
-    SWITCH_BLOCK(
-        num_proofs,
-        NUM_PROOFS,
-        (stacking_claims_tracegen<NUM_PROOFS><<<grid, block, 0, stream>>>(
-             d_trace,
-             height,
-             Array<uint32_t, NUM_PROOFS>(h_row_bounds),
-             PtrArray<StackingClaim, NUM_PROOFS>(d_claims),
-             PtrArray<FpExt, NUM_PROOFS>(d_coeffs),
-             PtrArray<FpExt, NUM_PROOFS>(d_mu_pows),
-             d_records
-        );
-        {
-            int ret = CHECK_KERNEL();
-            if (ret) return ret;
-            Fp *d_proof_idx = d_trace + COL_INDEX(StackingClaimsCols, proof_idx) * height;
-            Fp *d_claim_accums = d_trace + COL_INDEX(StackingClaimsCols, final_s_eval) * height;
-            ret = prefix_scan_by_key_n_arrays<2 * D_EF>(
-                d_proof_idx, d_claim_accums, height, d_temp_buffer, temp_bytes, FpEqual{}, stream
+    if (num_proofs <= 8) {
+        // Keep the ordinary recursive implementation intact for its supported
+        // child arities. In particular, both launches remain in one dispatch,
+        // preserving the NVCC 12.9 workaround used by the reference path.
+        SWITCH_BLOCK(
+            num_proofs,
+            NUM_PROOFS,
+            (stacking_claims_tracegen<NUM_PROOFS><<<grid, block, 0, stream>>>(
+                 d_trace,
+                 height,
+                 Array<uint32_t, NUM_PROOFS>(h_row_bounds),
+                 PtrArray<StackingClaim, NUM_PROOFS>(d_claims),
+                 PtrArray<FpExt, NUM_PROOFS>(d_coeffs),
+                 PtrArray<FpExt, NUM_PROOFS>(d_mu_pows),
+                 d_records
             );
-            if (ret) return ret;
-        }
-        stacking_claims_zero_padding_accums<NUM_PROOFS><<<grid, block, 0, stream>>>(
-             d_trace, height, Array<uint32_t, NUM_PROOFS>(h_row_bounds), d_records
-        );),
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-        8
-    )
+            {
+                int ret = CHECK_KERNEL();
+                if (ret) return ret;
+                Fp *d_proof_idx = d_trace + COL_INDEX(StackingClaimsCols, proof_idx) * height;
+                Fp *d_claim_accums = d_trace + COL_INDEX(StackingClaimsCols, final_s_eval) * height;
+                ret = prefix_scan_by_key_n_arrays<2 * D_EF>(
+                    d_proof_idx,
+                    d_claim_accums,
+                    height,
+                    d_temp_buffer,
+                    temp_bytes,
+                    FpEqual{},
+                    stream
+                );
+                if (ret) return ret;
+            }
+            stacking_claims_zero_padding_accums<NUM_PROOFS><<<grid, block, 0, stream>>>(
+                 d_trace, height, Array<uint32_t, NUM_PROOFS>(h_row_bounds), d_records
+            );),
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8
+        )
+        return CHECK_KERNEL();
+    }
 
+    DeviceArrayCopy<uint32_t> row_bounds(h_row_bounds, num_proofs, stream);
+    DeviceArrayCopy<StackingClaim *> claims(d_claims, num_proofs, stream);
+    DeviceArrayCopy<FpExt *> coeffs(d_coeffs, num_proofs, stream);
+    DeviceArrayCopy<FpExt *> mu_pows(d_mu_pows, num_proofs, stream);
+    if (row_bounds.status() != cudaSuccess) return row_bounds.status();
+    if (claims.status() != cudaSuccess) return claims.status();
+    if (coeffs.status() != cudaSuccess) return coeffs.status();
+    if (mu_pows.status() != cudaSuccess) return mu_pows.status();
+    int ret = cudaStreamSynchronize(stream);
+    if (ret) return ret;
+
+    stacking_claims_tracegen_dynamic<<<grid, block, 0, stream>>>(
+        d_trace,
+        height,
+        row_bounds.get(),
+        claims.get(),
+        coeffs.get(),
+        mu_pows.get(),
+        d_records,
+        num_proofs
+    );
+    ret = CHECK_KERNEL();
+    if (ret) return ret;
+    Fp *d_proof_idx = d_trace + COL_INDEX(StackingClaimsCols, proof_idx) * height;
+    Fp *d_claim_accums = d_trace + COL_INDEX(StackingClaimsCols, final_s_eval) * height;
+    ret = prefix_scan_by_key_n_arrays<2 * D_EF>(
+        d_proof_idx, d_claim_accums, height, d_temp_buffer, temp_bytes, FpEqual{}, stream
+    );
+    if (ret) return ret;
+    stacking_claims_zero_padding_accums_dynamic<<<grid, block, 0, stream>>>(
+        d_trace, height, row_bounds.get(), d_records, num_proofs
+    );
     return CHECK_KERNEL();
 }

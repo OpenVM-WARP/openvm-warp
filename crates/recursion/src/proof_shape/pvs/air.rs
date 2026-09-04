@@ -39,6 +39,7 @@ pub struct PublicValuesAir {
     pub num_pvs_bus: NumPublicValuesBus,
     pub transcript_bus: TranscriptBus,
     pub(crate) continuations_enabled: bool,
+    pub transcript_enabled: bool,
 }
 
 impl<F> BaseAir<F> for PublicValuesAir {
@@ -136,15 +137,17 @@ where
         }
 
         // Receive transcript read of public values
-        self.transcript_bus.receive(
-            builder,
-            local.proof_idx,
-            TranscriptBusMessage {
-                tidx: local.tidx.into(),
-                value: local.value.into(),
-                is_sample: AB::Expr::ZERO,
-            },
-            local.is_valid,
-        );
+        if self.transcript_enabled {
+            self.transcript_bus.receive(
+                builder,
+                local.proof_idx,
+                TranscriptBusMessage {
+                    tidx: local.tidx.into(),
+                    value: local.value.into(),
+                    is_sample: AB::Expr::ZERO,
+                },
+                local.is_valid,
+            );
+        }
     }
 }

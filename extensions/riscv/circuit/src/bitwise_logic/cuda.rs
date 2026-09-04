@@ -1,7 +1,7 @@
 use std::{mem::size_of, sync::Arc};
 
 use derive_new::new;
-use openvm_circuit::{arch::DenseRecordArena, utils::next_power_of_two_or_zero};
+use openvm_circuit::arch::DenseRecordArena;
 use openvm_circuit_primitives::{
     bitwise_op_lookup::BitwiseOperationLookupChipGPU, var_range::VariableRangeCheckerChipGPU, Chip,
 };
@@ -31,7 +31,12 @@ impl Chip<DenseRecordArena, GpuBackend> for Rv64BitwiseLogicChipGpu {
             BitwiseLogicCoreRecord<RV64_REGISTER_NUM_LIMBS>,
         )>();
         let records = arena.allocated();
-        if records.is_empty() {
+        // Honour a pinned height: a chip that executed zero times this segment still
+        // owes the rows the plan plus shape catalog were built against. The kernel
+        // fills every row at or past the record count with this chip's padding row, so
+        // an empty record set with a pinned height is a valid all-padding trace.
+        let trace_height = arena.trace_height(RECORD_SIZE);
+        if trace_height == 0 {
             return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
         }
         debug_assert_eq!(records.len() % RECORD_SIZE, 0);
@@ -39,7 +44,6 @@ impl Chip<DenseRecordArena, GpuBackend> for Rv64BitwiseLogicChipGpu {
         let trace_width =
             BitwiseLogicCoreCols::<F, RV64_REGISTER_NUM_LIMBS, RV64_BYTE_BITS>::width()
                 + Rv64BaseAluAdapterCols::<F>::width();
-        let trace_height = next_power_of_two_or_zero(records.len() / RECORD_SIZE);
         let device_ctx = &self.range_checker.device_ctx;
 
         let d_records = tracing::info_span!("trace_gen.h2d_records")

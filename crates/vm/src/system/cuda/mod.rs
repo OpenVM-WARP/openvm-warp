@@ -6,12 +6,13 @@ use openvm_circuit::{
     arch::{DenseRecordArena, SystemConfig},
     system::{
         connector::VmConnectorChip, memory::online::GuestMemory, SystemChipComplex, SystemRecords,
+        SystemWithFixedTraceHeights, CONNECTOR_AIR_ID, PROGRAM_AIR_ID,
     },
 };
 use openvm_circuit_primitives::{var_range::VariableRangeCheckerChipGPU, Chip};
 use openvm_cuda_backend::{prelude::F, GpuBackend};
 use openvm_cuda_common::stream::GpuDeviceCtx;
-use openvm_stark_backend::prover::{AirProvingContext, CommittedTraceData};
+use openvm_stark_backend::prover::{AirProvingContext, CommittedTraceData, MatrixDimensions};
 use poseidon2::Poseidon2PeripheryChipGPU;
 use program::ProgramChipGPU;
 
@@ -66,9 +67,32 @@ impl SystemChipInventoryGPU {
     }
 }
 
+impl SystemWithFixedTraceHeights for SystemChipInventoryGPU {
+    /// Warning: as on the CPU inventory, this does not set the override for the program chip.
+    /// The program trace is cached and its height is already fixed by the loaded program, so the
+    /// two constant-height system AIRs are asserted rather than pinned.
+    fn override_trace_heights(&mut self, heights: &[u32]) {
+        assert_eq!(
+            heights[PROGRAM_AIR_ID] as usize,
+            self.program
+                .cached
+                .as_ref()
+                .expect("program not loaded")
+                .trace
+                .height()
+        );
+        assert_eq!(heights[CONNECTOR_AIR_ID], 2);
+        self.memory_inventory.set_override_trace_heights(heights);
+    }
+}
+
 impl SystemChipComplex<DenseRecordArena, GpuBackend> for SystemChipInventoryGPU {
     fn load_program(&mut self, cached_program_trace: CommittedTraceData<GpuBackend>) {
         self.program.cached.replace(cached_program_trace);
+    }
+
+    fn cached_program_trace(&self) -> Option<&CommittedTraceData<GpuBackend>> {
+        self.program.cached.as_ref()
     }
 
     fn transport_init_memory_to_device(&mut self, memory: &GuestMemory) {

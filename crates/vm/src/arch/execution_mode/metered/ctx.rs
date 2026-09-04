@@ -224,21 +224,12 @@ impl MeteredCtx {
 impl ExecutionCtxTrait for MeteredCtx {
     #[inline(always)]
     fn on_memory_operation(&mut self, address_space: u32, ptr: u32, size: u32) {
-        debug_assert!(
-            address_space != RV64_IMM_AS,
-            "address space must not be immediate"
-        );
-        debug_assert!(size > 0, "size must be greater than 0, got {size}");
-        debug_assert!(
-            size.is_power_of_two(),
-            "size must be a power of 2, got {size}"
-        );
+        self.record_memory_operation(address_space, ptr, size, true);
+    }
 
-        // Handle merkle tree updates
-        if address_space != RV64_REGISTER_AS {
-            self.memory_ctx
-                .update_boundary_merkle_heights(address_space, ptr, size);
-        }
+    #[inline(always)]
+    fn on_memory_read(&mut self, address_space: u32, ptr: u32, size: u32) {
+        self.record_memory_operation(address_space, ptr, size, false);
     }
 
     #[inline(always)]
@@ -270,6 +261,27 @@ impl ExecutionCtxTrait for MeteredCtx {
             .ctx
             .segmentation_ctx
             .create_final_segment(&exec_state.ctx.trace_heights);
+    }
+}
+
+impl MeteredCtx {
+    #[inline(always)]
+    fn record_memory_operation(&mut self, address_space: u32, ptr: u32, size: u32, is_write: bool) {
+        debug_assert!(
+            address_space != RV64_IMM_AS,
+            "address space must not be immediate"
+        );
+        debug_assert!(size > 0, "size must be greater than 0, got {size}");
+        debug_assert!(
+            size.is_power_of_two(),
+            "size must be a power of 2, got {size}"
+        );
+
+        // Handle merkle tree updates
+        if address_space != RV64_REGISTER_AS {
+            self.memory_ctx
+                .update_boundary_merkle_heights(address_space, ptr, size, is_write);
+        }
     }
 }
 

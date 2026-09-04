@@ -1,0 +1,25 @@
+[package]
+name = "openvm-history-v19-private-harness"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+openvm-circuit-primitives = { path = "../../../../../circuits/primitives" }
+openvm-recursion-circuit = { path = "../../../../../recursion" }
+openvm-recursion-circuit-derive = { path = "../../../../../recursion/derive" }
+openvm-stark-backend = { path = "../../../../../../../../stark-backend-native-warp-rv64/crates/stark-backend" }
+openvm-stark-sdk = { path = "../../../../../../../../stark-backend-native-warp-rv64/crates/stark-sdk", features = ["cpu-backend"] }
+
+[patch."https://github.com/openvm-org/stark-backend.git"]
+openvm-stark-backend = { path = "../../../../../../../../stark-backend-native-warp-rv64/crates/stark-backend" }
+openvm-stark-sdk = { path = "../../../../../../../../stark-backend-native-warp-rv64/crates/stark-sdk" }
+openvm-cpu-backend = { path = "../../../../../../../../stark-backend-native-warp-rv64/crates/cpu-backend" }
+openvm-cuda-backend = { path = "../../../../../../../../stark-backend-native-warp-rv64/crates/cuda-backend" }
+openvm-cuda-builder = { path = "../../../../../../../../stark-backend-native-warp-rv64/crates/cuda-builder" }
+openvm-cuda-common = { path = "../../../../../../../../stark-backend-native-warp-rv64/crates/cuda-common" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(openvm_intrinsics)', 'cfg(target_os, values("openvm"))'] }

@@ -14,8 +14,10 @@ use p3_matrix::Matrix;
 
 use crate::{
     bus::{
+        CertifiedTranscriptCheckpointBus, CertifiedTranscriptCheckpointMessage,
         FinalTranscriptStateBus, FinalTranscriptStateMessage, Poseidon2PermuteBus,
-        Poseidon2PermuteMessage, TranscriptBus, TranscriptBusMessage,
+        Poseidon2PermuteMessage, ResumeTranscriptStateBus, ResumeTranscriptStateMessage,
+        TranscriptBus, TranscriptBusMessage, TranscriptEndIndexBus, TranscriptEndIndexMessage,
     },
     subairs::nested_for_loop::{NestedForLoopIoCols, NestedForLoopSubAir},
     transcript::poseidon2::{CHUNK, POSEIDON2_WIDTH},
@@ -40,17 +42,79 @@ pub struct TranscriptCols<T> {
     pub post_state: [T; POSEIDON2_WIDTH],
 }
 
+/// Trailing columns present only when [`TranscriptAir::resume_state_bus`] is set.
+///
+/// Held apart from [`TranscriptCols`] so a circuit that starts its transcripts at
+/// the canonical zero sponge -- every circuit except the native WARP recursive
+/// history stage -- keeps the width it had. Widening the shared struct instead
+/// would grow the recursive aggregation lane's transcript trace for no benefit,
+/// which would also distort the very lane comparison this work is measured by.
+#[repr(C)]
+#[derive(AlignedBorrow, Debug, StructReflection)]
+pub struct TranscriptResumeCols<T> {
+    /// The sponge state handed over by the proof this one continues. Only the
+    /// first row of each proof reads it.
+    pub state: [T; POSEIDON2_WIDTH],
+}
+
+/// Trailing selectors present only when an intermediate checkpoint bus is
+/// enabled.  Kind zero is the pre-VACC boundary and kind one the post-VACC
+/// boundary.  Keeping them optional leaves the recursive lane's shared
+/// transcript width unchanged.
+#[repr(C)]
+#[derive(AlignedBorrow, Debug, StructReflection)]
+pub struct TranscriptCheckpointCols<T> {
+    pub selected: [T; 2],
+}
+
 #[derive(ColumnsAir)]
 #[columns_via(TranscriptCols<u8>)]
 pub struct TranscriptAir {
     pub transcript_bus: TranscriptBus,
     pub poseidon2_permute_bus: Poseidon2PermuteBus,
     pub final_state_bus: Option<FinalTranscriptStateBus>,
+    /// Set when the proofs in this circuit continue an earlier transcript
+    /// instead of starting at the canonical zero sponge.
+    ///
+    /// Keyed rather than witnessed, so a circuit cannot choose per proof whether
+    /// the zero-state rule binds it: the native WARP genesis stage is built
+    /// without this and every later stage with it.
+    pub resume_state_bus: Option<ResumeTranscriptStateBus>,
+    /// Emits this proof's end index; see [`TranscriptEndIndexBus`].
+    pub end_index_bus: Option<TranscriptEndIndexBus>,
+    /// Emits two row-aligned intermediate states selected by witness columns.
+    /// A companion AIR fixes their indices and values, while boolean selectors
+    /// ensure they can only name actual sample rows.
+    pub checkpoint_state_bus: Option<CertifiedTranscriptCheckpointBus>,
+}
+
+impl TranscriptAir {
+    /// Width of the trailing resume columns, zero when not resuming.
+    pub fn resume_width<F: Field>(&self) -> usize {
+        if self.resume_state_bus.is_some() {
+            TranscriptResumeCols::<F>::width()
+        } else {
+            0
+        }
+    }
+
+    /// Total row width, which trace generation must match.
+    pub fn row_width<F: Field>(&self) -> usize {
+        TranscriptCols::<F>::width() + self.resume_width::<F>() + self.checkpoint_width::<F>()
+    }
+
+    pub fn checkpoint_width<F: Field>(&self) -> usize {
+        if self.checkpoint_state_bus.is_some() {
+            TranscriptCheckpointCols::<F>::width()
+        } else {
+            0
+        }
+    }
 }
 
 impl<F: Field> BaseAir<F> for TranscriptAir {
     fn width(&self) -> usize {
-        TranscriptCols::<F>::width()
+        self.row_width::<F>()
     }
 }
 
@@ -64,8 +128,13 @@ impl<AB: AirBuilder + InteractionBuilder> Air<AB> for TranscriptAir {
             main.row_slice(0).expect("window should have two elements"),
             main.row_slice(1).expect("window should have two elements"),
         );
-        let local: &TranscriptCols<AB::Var> = (*local).borrow();
-        let next: &TranscriptCols<AB::Var> = (*next).borrow();
+        let base_width = TranscriptCols::<AB::Var>::width();
+        let resume_width = self.resume_width::<AB::F>();
+        let resume_end = base_width + resume_width;
+        let local_resume = local[base_width..resume_end].to_vec();
+        let local_checkpoint = local[resume_end..].to_vec();
+        let local: &TranscriptCols<AB::Var> = local[..base_width].borrow();
+        let next: &TranscriptCols<AB::Var> = next[..base_width].borrow();
 
         ///////////////////////////////////////////////////////////////////////
         // Constraints
@@ -91,19 +160,78 @@ impl<AB: AirBuilder + InteractionBuilder> Air<AB> for TranscriptAir {
             ),
         );
 
-        builder.when(local.is_proof_start).assert_zero(local.tidx);
         builder.when(local.is_proof_start).assert_one(is_valid);
         builder.assert_bool(local.is_sample);
 
-        // Initial state constraints
+        // Initial state constraints.
+        //
+        // A proof's first row does not preserve the state it starts from: an
+        // observe overwrites rate lanes `0..count` with its own operands. Only
+        // the capacity half and the rate lanes this row leaves alone are visible
+        // here, so those are the only ones either branch can constrain.
+        //
+        // Without resumption they must all be zero. With it they must equal the
+        // handed-over state, which is received in full because the sender cannot
+        // know which lanes get overwritten. Everything after the first row is
+        // unchanged -- `next.tidx = local.tidx + count` and the post/prev state
+        // chaining still force the sequence -- so resumption relocates where a
+        // proof begins and cannot perturb what follows.
+        // Length binding: an observe row adds its operation count to the
+        // first capacity lane of its own permutation input, mirroring
+        // `DuplexSponge::absorb`'s per-absorb counter. Sample rows add zero.
+        let mut local_count = AB::Expr::ZERO;
+        let mut next_count = AB::Expr::ZERO;
         for i in 0..CHUNK {
-            builder
-                .when(local.is_proof_start)
-                .assert_eq(local.prev_state[i + CHUNK], AB::Expr::ZERO);
+            local_count += local.mask[i].into();
+            next_count += next.mask[i].into();
+        }
+        let local_capacity_add = local_count * (AB::Expr::ONE - local.is_sample);
+        let next_capacity_add = next_count * (AB::Expr::ONE - next.is_sample);
 
-            builder
-                .when(local.is_proof_start * (AB::Expr::ONE - local.mask[i]))
-                .assert_eq(local.prev_state[i], AB::Expr::ZERO);
+        if let Some(resume_state_bus) = self.resume_state_bus {
+            let resume: &TranscriptResumeCols<AB::Var> = local_resume.as_slice().borrow();
+            resume_state_bus.receive(
+                builder,
+                local.proof_idx,
+                ResumeTranscriptStateMessage {
+                    tidx: local.tidx.into(),
+                    state: resume.state.map(Into::into),
+                },
+                local.is_proof_start,
+            );
+            for i in 0..CHUNK {
+                if i == 0 {
+                    builder.when(local.is_proof_start).assert_eq(
+                        local.prev_state[CHUNK],
+                        resume.state[CHUNK] + local_capacity_add.clone(),
+                    );
+                } else {
+                    builder
+                        .when(local.is_proof_start)
+                        .assert_eq(local.prev_state[i + CHUNK], resume.state[i + CHUNK]);
+                }
+
+                builder
+                    .when(local.is_proof_start * (AB::Expr::ONE - local.mask[i]))
+                    .assert_eq(local.prev_state[i], resume.state[i]);
+            }
+        } else {
+            builder.when(local.is_proof_start).assert_zero(local.tidx);
+            for i in 0..CHUNK {
+                if i == 0 {
+                    builder
+                        .when(local.is_proof_start)
+                        .assert_eq(local.prev_state[CHUNK], local_capacity_add.clone());
+                } else {
+                    builder
+                        .when(local.is_proof_start)
+                        .assert_eq(local.prev_state[i + CHUNK], AB::Expr::ZERO);
+                }
+
+                builder
+                    .when(local.is_proof_start * (AB::Expr::ONE - local.mask[i]))
+                    .assert_eq(local.prev_state[i], AB::Expr::ZERO);
+            }
         }
 
         let mut count = AB::Expr::ZERO;
@@ -129,14 +257,47 @@ impl<AB: AirBuilder + InteractionBuilder> Air<AB> for TranscriptAir {
                 .when(next.is_sample * local_next_same_proof.clone())
                 .assert_eq(local.post_state[i], next.prev_state[i]);
 
-            // The capacity part should always be the same
-            builder
-                .when(local_next_same_proof.clone()) // if next is valid
-                .assert_eq(local.post_state[i + CHUNK], next.prev_state[i + CHUNK]);
+            // The capacity part carries over, with the next row's absorb
+            // count added to the first capacity lane (length binding).
+            if i == 0 {
+                builder.when(local_next_same_proof.clone()).assert_eq(
+                    next.prev_state[CHUNK],
+                    local.post_state[CHUNK] + next_capacity_add.clone(),
+                );
+            } else {
+                builder
+                    .when(local_next_same_proof.clone()) // if next is valid
+                    .assert_eq(local.post_state[i + CHUNK], next.prev_state[i + CHUNK]);
+            }
+        }
+
+        // One past this row's last operation; on a proof's final row this is
+        // the proof's end index.
+        let end_tidx = local.tidx + count.clone();
+
+        if let Some(checkpoint_state_bus) = self.checkpoint_state_bus {
+            let checkpoint: &TranscriptCheckpointCols<AB::Var> =
+                local_checkpoint.as_slice().borrow();
+            for (kind, selected) in checkpoint.selected.into_iter().enumerate() {
+                builder.assert_bool(selected);
+                builder.when(selected).assert_one(is_valid);
+                builder.when(selected).assert_one(local.is_sample);
+                checkpoint_state_bus.send(
+                    builder,
+                    local.proof_idx,
+                    CertifiedTranscriptCheckpointMessage {
+                        kind: AB::Expr::from_usize(kind),
+                        tidx: end_tidx.clone(),
+                        sample_count: count.clone(),
+                        state: local.post_state.map(Into::into),
+                    },
+                    selected,
+                );
+            }
         }
 
         let mut when_same_proof = builder.when(local_next_same_proof.clone());
-        when_same_proof.assert_eq(next.tidx, local.tidx + count.clone());
+        when_same_proof.assert_eq(next.tidx, end_tidx.clone());
 
         // If local.is_sample = next.is_sample, there have to be CHUNK operations
         when_same_proof
@@ -191,6 +352,15 @@ impl<AB: AirBuilder + InteractionBuilder> Air<AB> for TranscriptAir {
             local.prev_state,
             local.post_state,
         );
+
+        if let Some(end_index_bus) = self.end_index_bus {
+            end_index_bus.send(
+                builder,
+                local.proof_idx,
+                TranscriptEndIndexMessage { tidx: end_tidx },
+                and(is_valid, or(not(next_valid), next.is_proof_start)),
+            );
+        }
 
         if let Some(final_state_bus) = self.final_state_bus {
             final_state_bus.send(

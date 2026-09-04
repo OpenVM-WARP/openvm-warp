@@ -62,14 +62,11 @@ impl<const BLOCKS: usize> Chip<DenseRecordArena, GpuBackend> for HybridModularCh
             );
 
         let records = arena.allocated();
-        if records.is_empty() {
+        let height = arena.trace_height(record_size);
+        if height == 0 {
             return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
         }
         debug_assert_eq!(records.len() % record_size, 0);
-
-        let num_records = records.len() / record_size;
-
-        let height = num_records.next_power_of_two();
         let mut seeker = arena.get_record_seeker::<AlgebraRecord<2, BLOCKS>, AdapterCoreLayout<
             FieldExpressionMetadata<F, Rv64VecHeapAdapterExecutor<2, BLOCKS, BLOCKS>>,
         >>();
@@ -77,6 +74,7 @@ impl<const BLOCKS: usize> Chip<DenseRecordArena, GpuBackend> for HybridModularCh
         let width = adapter_width + BaseAir::<F>::width(&self.cpu.inner.expr);
         let mut matrix_arena = MatrixRecordArena::<F>::with_capacity(height, width);
         seeker.transfer_to_matrix_arena(&mut matrix_arena, layout);
+        matrix_arena.force_trace_height(height);
         let cpu_ctx = Chip::<_, CpuBackend<SC>>::generate_proving_ctx(&self.cpu, matrix_arena);
         cpu_proving_ctx_to_gpu(cpu_ctx, &self.device_ctx)
     }
@@ -99,13 +97,11 @@ impl<const NUM_LANES: usize, const TOTAL_LIMBS: usize> Chip<DenseRecordArena, Gp
         let trace_width = Rv64IsEqualModU16AdapterCols::<F, 2, NUM_LANES>::width()
             + ModularIsEqualCoreCols::<F, TOTAL_LIMBS>::width();
         let records = arena.allocated();
-        if records.is_empty() {
+        let height = arena.trace_height(record_size);
+        if height == 0 {
             return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
         }
         debug_assert_eq!(records.len() % record_size, 0);
-
-        let num_records = records.len() / record_size;
-        let height = num_records.next_power_of_two();
         let mut seeker = arena.get_record_seeker::<(
             &mut Rv64IsEqualModU16AdapterRecord<2, NUM_LANES>,
             &mut ModularIsEqualRecord<TOTAL_LIMBS>,
@@ -115,6 +111,7 @@ impl<const NUM_LANES: usize, const TOTAL_LIMBS: usize> Chip<DenseRecordArena, Gp
         >>();
         let mut matrix_arena = MatrixRecordArena::<F>::with_capacity(height, trace_width);
         seeker.transfer_to_matrix_arena(&mut matrix_arena, EmptyAdapterCoreLayout::new());
+        matrix_arena.force_trace_height(height);
         let cpu_ctx = Chip::<_, CpuBackend<SC>>::generate_proving_ctx(&self.cpu, matrix_arena);
         cpu_proving_ctx_to_gpu(cpu_ctx, &self.device_ctx)
     }
@@ -272,13 +269,11 @@ impl<const BLOCKS: usize> Chip<DenseRecordArena, GpuBackend> for HybridFp2Chip<F
             );
 
         let records = arena.allocated();
-        if records.is_empty() {
+        let height = arena.trace_height(record_size);
+        if height == 0 {
             return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
         }
         debug_assert_eq!(records.len() % record_size, 0);
-
-        let num_records = records.len() / record_size;
-        let height = num_records.next_power_of_two();
         let mut seeker = arena.get_record_seeker::<AlgebraRecord<2, BLOCKS>, AdapterCoreLayout<
             FieldExpressionMetadata<F, Rv64VecHeapAdapterExecutor<2, BLOCKS, BLOCKS>>,
         >>();
@@ -286,6 +281,7 @@ impl<const BLOCKS: usize> Chip<DenseRecordArena, GpuBackend> for HybridFp2Chip<F
         let width = adapter_width + BaseAir::<F>::width(&self.cpu.inner.expr);
         let mut matrix_arena = MatrixRecordArena::<F>::with_capacity(height, width);
         seeker.transfer_to_matrix_arena(&mut matrix_arena, layout);
+        matrix_arena.force_trace_height(height);
         let cpu_ctx = Chip::<_, CpuBackend<SC>>::generate_proving_ctx(&self.cpu, matrix_arena);
         cpu_proving_ctx_to_gpu(cpu_ctx, &self.device_ctx)
     }

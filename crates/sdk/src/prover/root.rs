@@ -111,6 +111,26 @@ impl RootProver {
         ctx
     }
 
+    /// Generate the Root witness with the canonical CPU backend even in a
+    /// CUDA-enabled SDK build.
+    ///
+    /// Root keys are backend-independent.  Keeping this explicit path is also
+    /// useful as a transcript-correctness anchor for the BN254 CUDA prover.
+    pub fn generate_cpu_proving_ctx(
+        &self,
+        input: VmStarkProof,
+    ) -> Option<ProvingContext<<CpuRootE as StarkEngine>::PB>> {
+        let engine = CpuRootE::new(self.0.get_pk().params.clone());
+        info_span!("tracegen_attempt", group = "root_cpu").in_scope(|| {
+            self.0.generate_proving_ctx(
+                input.inner,
+                &input.user_pvs_proof,
+                input.deferral_merkle_proofs.as_ref(),
+                engine_device_ctx(&engine),
+            )
+        })
+    }
+
     pub fn prove_from_ctx(
         &self,
         ctx: ProvingContext<<E as StarkEngine>::PB>,
@@ -118,6 +138,19 @@ impl RootProver {
         let proof = info_span!("agg_layer", group = format!("root"))
             .in_scope(|| info_span!("root").in_scope(|| self.0.root_prove_from_ctx::<E>(ctx)))?;
         Ok(proof)
+    }
+
+    /// Prove Root using the canonical CPU BN254 engine.
+    ///
+    /// This is deliberately not a silent fallback: callers opt into it and can
+    /// benchmark or differential-test it against [`Self::prove_from_ctx`].
+    pub fn prove_cpu_from_ctx(
+        &self,
+        ctx: ProvingContext<<CpuRootE as StarkEngine>::PB>,
+    ) -> Result<Proof<RootSC>> {
+        info_span!("agg_layer", group = "root_cpu").in_scope(|| {
+            info_span!("root_cpu").in_scope(|| self.0.root_prove_from_ctx::<CpuRootE>(ctx))
+        })
     }
 
     pub fn prove(

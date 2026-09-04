@@ -1,10 +1,7 @@
 use std::{array::from_fn, mem::size_of, sync::Arc};
 
 use derive_new::new;
-use openvm_circuit::{
-    arch::{DenseRecordArena, SizedRecord},
-    utils::next_power_of_two_or_zero,
-};
+use openvm_circuit::arch::{DenseRecordArena, SizedRecord};
 use openvm_circuit_primitives::{
     bitwise_op_lookup::BitwiseOperationLookupChipGPU, var_range::VariableRangeCheckerChipGPU, Chip,
 };
@@ -37,10 +34,8 @@ pub struct DeferralOutputChipGpu {
 
 impl Chip<DenseRecordArena, GpuBackend> for DeferralOutputChipGpu {
     fn generate_proving_ctx(&self, mut arena: DenseRecordArena) -> AirProvingContext<GpuBackend> {
+        let forced_height = arena.forced_height();
         let records = arena.allocated_mut();
-        if records.is_empty() {
-            return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
-        }
 
         let poseidon2_chip = deferral_poseidon2_chip::<F>();
         let mut per_call = Vec::<DeferralOutputPerCall>::new();
@@ -110,7 +105,10 @@ impl Chip<DenseRecordArena, GpuBackend> for DeferralOutputChipGpu {
         debug_assert_eq!(offset, records.len());
 
         let rows_used = per_row.len();
-        let trace_height = next_power_of_two_or_zero(rows_used);
+        let trace_height = DenseRecordArena::resolve_trace_height(forced_height, rows_used);
+        if trace_height == 0 {
+            return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
+        }
         let trace_width = DeferralOutputCols::<F>::width();
         let device_ctx = &self.range_checker.device_ctx;
         let trace = DeviceMatrix::<F>::with_capacity_on(trace_height, trace_width, device_ctx);

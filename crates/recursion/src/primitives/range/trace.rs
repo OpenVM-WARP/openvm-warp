@@ -23,6 +23,18 @@ impl<const NUM_BITS: usize> Default for RangeCheckerCpuTraceGenerator<NUM_BITS> 
 }
 
 impl<const NUM_BITS: usize> RangeCheckerCpuTraceGenerator<NUM_BITS> {
+    /// Merge a separately generated request set into this table.
+    ///
+    /// This is useful when independent circuit shards generate witnesses in
+    /// parallel but share one range-table AIR. Counts are the table's complete
+    /// semantic state, so component-wise addition is equivalent to registering
+    /// the same requests serially.
+    pub fn merge_from(&self, other: Self) {
+        for (count, other_count) in self.count.iter().zip(other.count) {
+            count.fetch_add(other_count.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+    }
+
     pub fn add_count(&self, value: usize) {
         self.add_count_mult(value, 1);
     }
@@ -45,5 +57,30 @@ impl<const NUM_BITS: usize> RangeCheckerCpuTraceGenerator<NUM_BITS> {
             })
             .collect_vec();
         RowMajorMatrix::new(trace, RangeCheckerCols::<u8>::width())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merged_counts_match_sequential_registration() {
+        let sequential = RangeCheckerCpuTraceGenerator::<8>::default();
+        sequential.add_count_mult(3, 2);
+        sequential.add_count(7);
+        sequential.add_count_mult(3, 4);
+
+        let merged = RangeCheckerCpuTraceGenerator::<8>::default();
+        merged.add_count_mult(3, 2);
+        merged.add_count(7);
+        let suffix = RangeCheckerCpuTraceGenerator::<8>::default();
+        suffix.add_count_mult(3, 4);
+        merged.merge_from(suffix);
+
+        assert_eq!(
+            merged.generate_trace_row_major().values,
+            sequential.generate_trace_row_major().values
+        );
     }
 }

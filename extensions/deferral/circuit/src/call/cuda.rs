@@ -1,7 +1,7 @@
 use std::{mem::size_of, sync::Arc};
 
 use derive_new::new;
-use openvm_circuit::{arch::DenseRecordArena, utils::next_power_of_two_or_zero};
+use openvm_circuit::arch::DenseRecordArena;
 use openvm_circuit_primitives::{
     bitwise_op_lookup::BitwiseOperationLookupChipGPU, var_range::VariableRangeCheckerChipGPU, Chip,
 };
@@ -33,13 +33,13 @@ impl Chip<DenseRecordArena, GpuBackend> for DeferralCallChipGpu {
         const RECORD_SIZE: usize = size_of::<Record>();
 
         let records = arena.allocated();
-        if records.is_empty() {
+        let trace_height = arena.trace_height(RECORD_SIZE);
+        if trace_height == 0 {
             return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
         }
         debug_assert_eq!(records.len() % RECORD_SIZE, 0);
 
         let num_records = records.len() / RECORD_SIZE;
-        let trace_height = next_power_of_two_or_zero(num_records);
         let trace_width =
             DeferralCallAdapterCols::<F>::width() + DeferralCallCoreCols::<F>::width();
         let device_ctx = &self.range_checker.device_ctx;

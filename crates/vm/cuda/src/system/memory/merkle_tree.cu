@@ -18,6 +18,7 @@ struct alignas(32) digest_t {
 enum MemoryMerkleSubTreeLayout : uint8_t {
     FULL = 0,
     OMIT_BOTTOM_LEVELS = 1,
+    EMPTY = 2,
 };
 
 __device__ __forceinline__ void hash_raw_memory_leaf(
@@ -348,6 +349,10 @@ __device__ void load_virtual_node(
     size_t const label,
     digest_t *out
 ) {
+    if (layout == EMPTY) {
+        COPY_DIGEST(out, &zero_hash[node_height]);
+        return;
+    }
     if (!virtual_node_exists(node_height, actual_height, label)) {
         COPY_DIGEST(out, &zero_hash[node_height]);
         return;
@@ -371,6 +376,11 @@ __device__ void store_virtual_node(
     size_t const label,
     digest_t const *value
 ) {
+    if (layout == EMPTY) {
+        // Empty subtrees store only their root. The caller propagates the
+        // updated virtual root into that slot after completing all layers.
+        return;
+    }
     if (layout == OMIT_BOTTOM_LEVELS && node_height < OMITTED_BOTTOM_LEVELS) {
         return;
     }
@@ -718,6 +728,7 @@ extern "C" int _update_merkle_tree(
     size_t need_tmp_storage_bytes,
     Fp *const merkle_trace,
     size_t const unpadded_trace_height,
+    size_t const padded_trace_height,
     size_t const num_subtrees,
     uintptr_t *subtrees,
     digest_t *top_roots,
@@ -735,9 +746,12 @@ extern "C" int _update_merkle_tree(
     assert(poseidon2_capacity % 16 == 0 && "poseidon2_capacity must be a multiple of 16");
     size_t poseidon2_record_capacity = poseidon2_capacity / 16;
     uint32_t num_children = num_leaves;
-    size_t const trace_height = [](uint32_t x) {
+    size_t const natural_trace_height = [](uint32_t x) {
         return x ? (1u << (32 - __builtin_clz(x - 1))) : 0;
     }(unpadded_trace_height);
+    assert(padded_trace_height >= natural_trace_height);
+    assert((padded_trace_height & (padded_trace_height - 1)) == 0);
+    size_t const trace_height = padded_trace_height;
 
     {
         auto [grid, block] = kernel_launch_params(num_leaves, 256);

@@ -1,6 +1,4 @@
-#[cfg(feature = "metrics")]
-use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::{atomic::AtomicUsize, Arc, Mutex};
 
 use openvm_circuit::{
     primitives::Chip, system::poseidon2::columns::Poseidon2PeripheryCols,
@@ -36,6 +34,16 @@ pub struct Poseidon2ChipGPU<const SBOX_REGISTERS: usize> {
     pub device_ctx: GpuDeviceCtx,
     pub records: Arc<Mutex<Option<Arc<DeviceBuffer<F>>>>>,
     pub idx: Arc<DeviceBuffer<u32>>,
+    /// Trace height pinned by [`Self::set_forced_height`], or 0 for "derive it from the records".
+    ///
+    /// This chip is the only one in the system whose exact height cannot be predicted from metered
+    /// execution: tracegen deduplicates equal hash inputs by value. The metered pass counts one
+    /// initial hash for every touched memory leaf/node and a possible distinct final hash only for
+    /// written leaves and their ancestors. This is much tighter than counting both trees in full,
+    /// but remains an upper bound because a write can restore the initial value and unrelated
+    /// inputs can coincide. Pinning the height lets a caller plan from that sound bound instead of
+    /// running trace generation twice just to learn this one number.
+    forced_height: Arc<AtomicUsize>,
     #[cfg(feature = "metrics")]
     pub(crate) current_trace_height: Arc<AtomicUsize>,
 }
@@ -48,9 +56,29 @@ impl<const SBOX_REGISTERS: usize> Poseidon2ChipGPU<SBOX_REGISTERS> {
             device_ctx: device_ctx.clone(),
             records: Arc::new(Mutex::new(None)),
             idx,
+            forced_height: Arc::new(AtomicUsize::new(0)),
             #[cfg(feature = "metrics")]
             current_trace_height: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Pins the next generated trace to `height` rows. `0` restores the default.
+    ///
+    /// The padding rows this adds are the same dummy permutation of the zero state that trace
+    /// generation already writes between the deduplicated record count and the next power of
+    /// two, so a larger height widens the padding region without changing its contents.
+    pub fn set_forced_height(&self, height: usize) {
+        assert!(
+            height.is_power_of_two() || height == 0,
+            "forced Poseidon2 trace height {height} must be a power of two"
+        );
+        self.forced_height
+            .store(height, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn take_forced_height(&self) -> usize {
+        self.forced_height
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Prepare an exact one-segment scratch buffer for Poseidon2 records.
@@ -85,13 +113,49 @@ impl<const SBOX_REGISTERS: usize> Poseidon2ChipGPU<SBOX_REGISTERS> {
     pub fn trace_width() -> usize {
         Poseidon2PeripheryCols::<F, SBOX_REGISTERS>::width()
     }
+
+    /// A trace of `forced_height` pure padding rows, or the empty matrix when nothing is pinned.
+    ///
+    /// A chip that hashed nothing this segment still owes its pinned rows: the plan named a
+    /// height and the shape catalog is bound to it. Returning the dummy matrix here would make
+    /// the generated shape disagree with the plan, which the height gate rejects.
+    fn padding_only_ctx(&self, forced_height: usize) -> AirProvingContext<GpuBackend> {
+        if forced_height == 0 {
+            return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
+        }
+        let trace = DeviceMatrix::<F>::with_capacity_on(
+            forced_height,
+            Self::trace_width(),
+            &self.device_ctx,
+        );
+        trace.buffer().fill_zero_on(&self.device_ctx).unwrap();
+        let empty_records = DeviceBuffer::<F>::new();
+        let empty_counts = DeviceBuffer::<u32>::new();
+        unsafe {
+            poseidon2::tracegen(
+                trace.buffer(),
+                trace.height(),
+                trace.width(),
+                &empty_records,
+                &empty_counts,
+                0,
+                SBOX_REGISTERS,
+                self.device_ctx.stream.as_raw(),
+            )
+            .expect("Failed to generate Poseidon2 padding trace");
+        }
+        AirProvingContext::simple_no_pis(trace)
+    }
 }
 
 impl<RA, const SBOX_REGISTERS: usize> Chip<RA, GpuBackend> for Poseidon2ChipGPU<SBOX_REGISTERS> {
     fn generate_proving_ctx(&self, _: RA) -> AirProvingContext<GpuBackend> {
+        // Taken, not read: a pinned height applies to exactly one segment, so leaving it set
+        // would silently carry into the next one.
+        let forced_height = self.take_forced_height();
         let Some(records) = self.records.lock().unwrap().take() else {
             self.idx.fill_zero_on(&self.device_ctx).unwrap();
-            return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
+            return self.padding_only_ctx(forced_height);
         };
         debug_assert_eq!(records.len() % POSEIDON2_WIDTH, 0);
         let capacity_records = records.len() / POSEIDON2_WIDTH;
@@ -102,7 +166,7 @@ impl<RA, const SBOX_REGISTERS: usize> Chip<RA, GpuBackend> for Poseidon2ChipGPU<
         );
         if num_records == 0 {
             self.idx.fill_zero_on(&self.device_ctx).unwrap();
-            return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
+            return self.padding_only_ctx(forced_height);
         }
         let counts = DeviceBuffer::<u32>::with_capacity_on(num_records, &self.device_ctx);
         let dedup_records =
@@ -148,7 +212,17 @@ impl<RA, const SBOX_REGISTERS: usize> Chip<RA, GpuBackend> for Poseidon2ChipGPU<
         #[cfg(feature = "metrics")]
         self.current_trace_height
             .store(num_records, std::sync::atomic::Ordering::Relaxed);
-        let trace_height = next_power_of_two_or_zero(num_records);
+        let natural_height = next_power_of_two_or_zero(num_records);
+        let trace_height = if forced_height == 0 {
+            natural_height
+        } else {
+            assert!(
+                forced_height >= natural_height,
+                "forced Poseidon2 trace height {forced_height} is below the {natural_height} \
+                 rows the deduplicated records need"
+            );
+            forced_height
+        };
         let trace = DeviceMatrix::<F>::with_capacity_on(
             trace_height,
             Self::trace_width(),
@@ -192,6 +266,14 @@ impl Poseidon2PeripheryChipGPU {
         match self {
             Self::Register0(chip) => chip.prepare_records(num_records),
             Self::Register1(chip) => chip.prepare_records(num_records),
+        }
+    }
+
+    /// See [`Poseidon2ChipGPU::set_forced_height`].
+    pub fn set_forced_height(&self, height: usize) {
+        match self {
+            Self::Register0(chip) => chip.set_forced_height(height),
+            Self::Register1(chip) => chip.set_forced_height(height),
         }
     }
 

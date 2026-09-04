@@ -5,7 +5,6 @@ use openvm_circuit::{
     arch::DenseRecordArena,
     primitives::Chip,
     system::phantom::{PhantomCols, PhantomRecord},
-    utils::next_power_of_two_or_zero,
 };
 use openvm_cuda_backend::{base::DeviceMatrix, prelude::F, GpuBackend};
 use openvm_cuda_common::{copy::MemCopyH2D, stream::GpuDeviceCtx};
@@ -23,7 +22,7 @@ impl PhantomChipGPU {
         let record_size = size_of::<PhantomRecord>();
         let records_len = arena.allocated().len();
         assert_eq!(records_len % record_size, 0);
-        records_len / record_size
+        arena.trace_height(record_size)
     }
 
     pub fn trace_width() -> usize {
@@ -33,26 +32,27 @@ impl PhantomChipGPU {
 
 impl Chip<DenseRecordArena, GpuBackend> for PhantomChipGPU {
     fn generate_proving_ctx(&self, arena: DenseRecordArena) -> AirProvingContext<GpuBackend> {
-        let num_records = Self::trace_height(&arena);
-        if num_records == 0 {
+        let trace_height = Self::trace_height(&arena);
+        if trace_height == 0 {
             return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
         }
-        let trace_height = next_power_of_two_or_zero(num_records);
         let trace = DeviceMatrix::<F>::with_capacity_on(
             trace_height,
             Self::trace_width(),
             &self.device_ctx,
         );
         trace.buffer().fill_zero_on(&self.device_ctx).unwrap();
-        unsafe {
-            phantom::tracegen(
-                trace.buffer(),
-                trace.height(),
-                trace.width(),
-                &arena.allocated().to_device_on(&self.device_ctx).unwrap(),
-                self.device_ctx.stream.as_raw(),
-            )
-            .expect("Failed to generate trace");
+        if !arena.allocated().is_empty() {
+            unsafe {
+                phantom::tracegen(
+                    trace.buffer(),
+                    trace.height(),
+                    trace.width(),
+                    &arena.allocated().to_device_on(&self.device_ctx).unwrap(),
+                    self.device_ctx.stream.as_raw(),
+                )
+                .expect("Failed to generate trace");
+            }
         }
         AirProvingContext::simple_no_pis(trace)
     }

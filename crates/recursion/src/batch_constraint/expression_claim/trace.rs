@@ -19,14 +19,19 @@ pub struct ExpressionClaimBlob {
     claims: MultiProofVecVec<(isize, EF)>,
 }
 
-pub fn generate_expression_claim_blob(
+pub fn generate_expression_claim_blob_for_mode(
     cf_folded_claims: &MultiProofVecVec<(isize, EF)>,
     if_folded_claims: &MultiProofVecVec<(isize, EF)>,
+    includes_air: bool,
 ) -> ExpressionClaimBlob {
     let mut claims = MultiProofVecVec::new();
-    for pidx in 0..cf_folded_claims.num_proofs() {
+    let num_proofs = if_folded_claims.num_proofs();
+    debug_assert!(!includes_air || cf_folded_claims.num_proofs() == num_proofs);
+    for pidx in 0..num_proofs {
         claims.extend(if_folded_claims[pidx].iter().cloned());
-        claims.extend(cf_folded_claims[pidx].iter().cloned());
+        if includes_air {
+            claims.extend(cf_folded_claims[pidx].iter().cloned());
+        }
         claims.end_proof();
     }
     ExpressionClaimBlob { claims }
@@ -39,6 +44,7 @@ pub(crate) struct ExpressionClaimCtx<'a> {
     pub proofs: &'a [&'a Proof<BabyBearPoseidon2Config>],
     pub preflights: &'a [&'a Preflight],
     pub pow_checker: &'a PowerCheckerCpuTraceGenerator<2, POW_CHECKER_HEIGHT>,
+    pub includes_air: bool,
 }
 
 impl RowMajorChip<F> for ExpressionClaimTraceGenerator {
@@ -75,7 +81,8 @@ impl RowMajorChip<F> for ExpressionClaimTraceGenerator {
                 .sumcheck_round_polys
                 .len();
             let num_present = preflight.proof_shape.sorted_trace_vdata.len();
-            debug_assert_eq!(claims.len(), 3 * num_present);
+            let expected_claims = (2 + usize::from(ctx.includes_air)) * num_present;
+            debug_assert_eq!(claims.len(), expected_claims);
             let mu_tidx = preflight.batch_constraint.tidx_before_univariate - D_EF;
 
             trace[cur_height * width..(cur_height + claims.len()) * width]
@@ -84,7 +91,7 @@ impl RowMajorChip<F> for ExpressionClaimTraceGenerator {
                 .for_each(|(i, chunk)| {
                     let n_lift = claims[i].0.max(0) as usize;
                     let n_abs = claims[i].0.unsigned_abs();
-                    let is_interaction = i < 2 * num_present;
+                    let is_interaction = !ctx.includes_air || i < 2 * num_present;
                     if is_interaction {
                         pow_checker.add_pow(n_abs);
                     }
@@ -96,7 +103,8 @@ impl RowMajorChip<F> for ExpressionClaimTraceGenerator {
                     cols.group_idx = F::from_bool(!is_interaction);
                     // is_first_in_group: true at start of proof (i==0) and at start of
                     // constraint group (i == 2*num_present)
-                    cols.is_first_in_group = F::from_bool(i == 0 || i == 2 * num_present);
+                    cols.is_first_in_group =
+                        F::from_bool(i == 0 || (ctx.includes_air && i == 2 * num_present));
                     cols.num_multilinear_sumcheck_rounds = F::from_usize(num_rounds);
                     cols.idx = F::from_usize(if i < 2 * num_present {
                         i
@@ -111,7 +119,7 @@ impl RowMajorChip<F> for ExpressionClaimTraceGenerator {
                     };
                     cols.trace_idx = F::from_usize(trace_idx);
                     cols.mu
-                        .copy_from_slice(&preflight.transcript.values()[mu_tidx..mu_tidx + D_EF]);
+                        .copy_from_slice(preflight.transcript_values_at(mu_tidx, D_EF));
                     cols.value
                         .copy_from_slice(claims[i].1.as_basis_coefficients_slice());
                     cols.eq_sharp_ns.copy_from_slice(
@@ -127,10 +135,9 @@ impl RowMajorChip<F> for ExpressionClaimTraceGenerator {
 
             // Setting `cur_sum`
             let mut cur_sum = EF::ZERO;
-            let mu = EF::from_basis_coefficients_slice(
-                &preflight.transcript.values()[mu_tidx..mu_tidx + D_EF],
-            )
-            .unwrap();
+            let mu =
+                EF::from_basis_coefficients_slice(preflight.transcript_values_at(mu_tidx, D_EF))
+                    .unwrap();
             trace[cur_height * width..(cur_height + claims.len()) * width]
                 .chunks_exact_mut(width)
                 .rev()

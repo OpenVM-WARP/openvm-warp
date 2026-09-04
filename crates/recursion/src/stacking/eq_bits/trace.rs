@@ -1,6 +1,5 @@
 use std::{borrow::BorrowMut, collections::HashMap};
 
-#[cfg(all(test, feature = "cuda"))]
 use itertools::Itertools;
 use openvm_stark_sdk::config::baby_bear_poseidon2::{EF, F};
 use p3_field::{BasedVectorSpace, PrimeCharacteristicRing};
@@ -118,10 +117,14 @@ impl RowMajorChip<F> for EqBitsTraceGenerator {
                     first_cols.external_mult = F::from_usize(base_external_mult);
                 }
 
-                #[cfg(all(test, feature = "cuda"))]
+                // WARP's regenerative source path may execute this fixed verifier trace
+                // generator more than once for the same proof.  `HashMap` iteration order is
+                // randomized per map, so emitting rows directly from `iter()` makes the
+                // systematic message, commitment root, and Fiat--Shamir transcript change
+                // between otherwise identical regenerations.  The AIR treats these rows as a
+                // multiset, but the PCS does not: row order is committed.  Keep the canonical
+                // lexicographic `(b_value, num_bits)` order in every build, not only CUDA tests.
                 let b_value_iter = b_value_map.iter().sorted();
-                #[cfg(any(not(test), not(feature = "cuda")))]
-                let b_value_iter = b_value_map.iter();
 
                 for ((&(b_value, num_bits), &(sub_eval, _, internal_mult, external_mult)), chunk) in
                     b_value_iter.zip(trace.chunks_mut(width).skip(1).take(b_value_map.len()))

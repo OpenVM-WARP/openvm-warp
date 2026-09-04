@@ -52,13 +52,11 @@ impl<const NUM_READS: usize, const BLOCKS: usize> Chip<DenseRecordArena, GpuBack
         >::get_aligned_record_size(&layout);
 
         let records = arena.allocated();
-        if records.is_empty() {
+        let height = arena.trace_height(record_size);
+        if height == 0 {
             return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
         }
         debug_assert_eq!(records.len() % record_size, 0);
-
-        let num_records = records.len() / record_size;
-        let height = num_records.next_power_of_two();
         let mut seeker = arena.get_record_seeker::<EccRecord<NUM_READS, BLOCKS>, AdapterCoreLayout<
             FieldExpressionMetadata<F, Rv64VecHeapAdapterExecutor<NUM_READS, BLOCKS, BLOCKS>>,
         >>();
@@ -66,6 +64,7 @@ impl<const NUM_READS: usize, const BLOCKS: usize> Chip<DenseRecordArena, GpuBack
         let width = adapter_width + BaseAir::<F>::width(&self.cpu.inner.expr);
         let mut matrix_arena = MatrixRecordArena::<F>::with_capacity(height, width);
         seeker.transfer_to_matrix_arena(&mut matrix_arena, layout);
+        matrix_arena.force_trace_height(height);
         let cpu_ctx = Chip::<_, CpuBackend<SC>>::generate_proving_ctx(&self.cpu, matrix_arena);
         cpu_proving_ctx_to_gpu(cpu_ctx, &self.device_ctx)
     }

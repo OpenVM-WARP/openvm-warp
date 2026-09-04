@@ -25,9 +25,11 @@ _Static_assert(
  * (see DEFERRAL_PAGE_BUF_CAP in metered.rs). */
 
 typedef struct PageAccess {
-  /* Page table index plus a 64-bit leaf mask for that page. */
+  /* Page table index plus touched/written 64-bit leaf masks for that page. */
   uint32_t page_id;
   uint64_t leaf_mask;
+  /* Subset of leaf_mask. Zero means the access was known to be read-only. */
+  uint64_t write_mask;
 } PageAccess;
 
 /* One page buffer per address space stores local page ids and leaf masks.
@@ -55,6 +57,7 @@ typedef struct TraceMemory {
   uint32_t last_mem_page;
   uint32_t mem_page_buf_len;
   uint64_t last_mem_leaf_mask;
+  uint64_t last_mem_write_mask;
   PageAccess* mem_page_buf;
 } TraceMemory;
 
@@ -92,15 +95,16 @@ static __attribute__((always_inline)) inline uint64_t leaf_mask_range(
 
 static __attribute__((always_inline)) inline void append_page_access(
     PageAccess* restrict buf, uint32_t* restrict len, uint32_t page,
-    uint64_t leaf_mask) {
+    uint64_t leaf_mask, uint64_t write_mask) {
   PageAccess* slot = &buf[(*len)++];
   slot->page_id = page;
   slot->leaf_mask = leaf_mask;
+  slot->write_mask = write_mask;
 }
 
 static __attribute__((always_inline)) inline void append_page_access_range(
     PageAccess* restrict buf, uint32_t* restrict len, uint32_t first_leaf,
-    uint32_t last_leaf) {
+    uint32_t last_leaf, uint8_t is_write) {
   uint32_t first_page = first_leaf >> TRACER_PAGE_BITS;
   uint32_t last_page = last_leaf >> TRACER_PAGE_BITS;
   for (uint32_t page = first_page; page <= last_page; page++) {
@@ -108,30 +112,37 @@ static __attribute__((always_inline)) inline void append_page_access_range(
     uint32_t page_last_leaf = page_first_leaf + (1u << TRACER_PAGE_BITS) - 1u;
     uint32_t start = first_leaf > page_first_leaf ? first_leaf : page_first_leaf;
     uint32_t end = last_leaf < page_last_leaf ? last_leaf : page_last_leaf;
-    append_page_access(buf, len, page, leaf_mask_range(start, end));
+    uint64_t leaf_mask = leaf_mask_range(start, end);
+    append_page_access(buf, len, page, leaf_mask, is_write ? leaf_mask : 0);
   }
 }
 
 /* No bounds check — see MEM_PAGE_BUF_CAP in metered.rs. */
 static __attribute__((always_inline)) inline void record_mem_page(
-    Tracer* t, uint32_t page, uint64_t leaf_mask) {
+    Tracer* t, uint32_t page, uint64_t leaf_mask, uint64_t write_mask) {
   if (likely(page == t->last_mem_page)) {
     t->mem_page_buf[t->mem_page_buf_len - 1u].leaf_mask |= leaf_mask;
+    t->mem_page_buf[t->mem_page_buf_len - 1u].write_mask |= write_mask;
     return;
   }
   t->last_mem_page = page;
-  append_page_access(t->mem_page_buf, &t->mem_page_buf_len, page, leaf_mask);
+  append_page_access(t->mem_page_buf, &t->mem_page_buf_len, page, leaf_mask,
+                     write_mask);
 }
 
 static __attribute__((always_inline)) inline void record_mem_page_range(
-    Tracer* t, uint32_t first_leaf, uint32_t last_leaf) {
+    Tracer* t, uint32_t first_leaf, uint32_t last_leaf, uint8_t is_write) {
   uint32_t first_page = first_leaf >> TRACER_PAGE_BITS;
   uint32_t last_page = last_leaf >> TRACER_PAGE_BITS;
   if (likely(first_page == t->last_mem_page)) {
-    t->mem_page_buf[t->mem_page_buf_len - 1u].leaf_mask |=
-        leaf_mask_range(first_leaf, first_page == last_page
-                                        ? last_leaf
-                                        : ((first_page + 1u) << TRACER_PAGE_BITS) - 1u);
+    uint64_t leaf_mask = leaf_mask_range(
+        first_leaf, first_page == last_page
+                        ? last_leaf
+                        : ((first_page + 1u) << TRACER_PAGE_BITS) - 1u);
+    t->mem_page_buf[t->mem_page_buf_len - 1u].leaf_mask |= leaf_mask;
+    if (is_write) {
+      t->mem_page_buf[t->mem_page_buf_len - 1u].write_mask |= leaf_mask;
+    }
     if (first_page == last_page) {
       return;
     }
@@ -143,7 +154,9 @@ static __attribute__((always_inline)) inline void record_mem_page_range(
     uint32_t page_last_leaf = page_first_leaf + (1u << TRACER_PAGE_BITS) - 1u;
     uint32_t start = first_leaf > page_first_leaf ? first_leaf : page_first_leaf;
     uint32_t end = last_leaf < page_last_leaf ? last_leaf : page_last_leaf;
-    append_page_access(t->mem_page_buf, &len, page, leaf_mask_range(start, end));
+    uint64_t leaf_mask = leaf_mask_range(start, end);
+    append_page_access(t->mem_page_buf, &len, page, leaf_mask,
+                       is_write ? leaf_mask : 0);
   }
   t->mem_page_buf_len = len;
   t->last_mem_page = last_page;
@@ -151,72 +164,92 @@ static __attribute__((always_inline)) inline void record_mem_page_range(
 
 /* No bounds check — see PV_PAGE_BUF_CAP in metered.rs. */
 static __attribute__((always_inline)) inline void record_pv_page(
-    Tracer* t, uint32_t page, uint64_t leaf_mask) {
-  append_page_access(t->pv_page_buf, &t->pv_page_buf_len, page, leaf_mask);
+    Tracer* t, uint32_t page, uint64_t leaf_mask, uint64_t write_mask) {
+  append_page_access(t->pv_page_buf, &t->pv_page_buf_len, page, leaf_mask,
+                     write_mask);
 }
 
 static __attribute__((always_inline)) inline void record_pv_page_range(
-    Tracer* t, uint32_t first_leaf, uint32_t last_leaf) {
+    Tracer* t, uint32_t first_leaf, uint32_t last_leaf, uint8_t is_write) {
   uint32_t len = t->pv_page_buf_len;
-  append_page_access_range(t->pv_page_buf, &len, first_leaf, last_leaf);
+  append_page_access_range(t->pv_page_buf, &len, first_leaf, last_leaf, is_write);
   t->pv_page_buf_len = len;
 }
 
 /* No bounds check — see DEFERRAL_PAGE_BUF_CAP in metered.rs. */
 static __attribute__((always_inline)) inline void record_deferral_page(
-    Tracer* t, uint32_t page, uint64_t leaf_mask) {
-  append_page_access(t->deferral_page_buf, &t->deferral_page_buf_len, page, leaf_mask);
+    Tracer* t, uint32_t page, uint64_t leaf_mask, uint64_t write_mask) {
+  append_page_access(t->deferral_page_buf, &t->deferral_page_buf_len, page,
+                     leaf_mask, write_mask);
 }
 
 static __attribute__((always_inline)) inline void record_deferral_page_range(
-    Tracer* t, uint32_t first_leaf, uint32_t last_leaf) {
+    Tracer* t, uint32_t first_leaf, uint32_t last_leaf, uint8_t is_write) {
   uint32_t len = t->deferral_page_buf_len;
-  append_page_access_range(t->deferral_page_buf, &len, first_leaf, last_leaf);
+  append_page_access_range(t->deferral_page_buf, &len, first_leaf, last_leaf,
+                           is_write);
   t->deferral_page_buf_len = len;
 }
 
 /* Record a single page access. `addr_space` is a compile-time constant at
  * every direct call site in generated C, so the branches below fold away. */
-static __attribute__((always_inline)) inline void record_page(
-    Tracer* t, uint32_t addr_space, uint64_t ptr, uint32_t size) {
+static __attribute__((always_inline)) inline void record_page_access(
+    Tracer* t, uint32_t addr_space, uint64_t ptr, uint32_t size,
+    uint8_t is_write) {
   uint32_t first_leaf = addr_to_local_leaf(addr_space, ptr);
   uint32_t last_leaf = addr_to_local_leaf(addr_space, ptr + size - 1u);
   uint32_t first_page = first_leaf >> TRACER_PAGE_BITS;
   uint32_t last_page = last_leaf >> TRACER_PAGE_BITS;
   if (likely(addr_space == AS_MEMORY)) {
     if (likely(first_page == last_page)) {
-      record_mem_page(t, first_page, leaf_mask_range(first_leaf, last_leaf));
+      uint64_t leaf_mask = leaf_mask_range(first_leaf, last_leaf);
+      record_mem_page(t, first_page, leaf_mask, is_write ? leaf_mask : 0);
     } else {
-      record_mem_page_range(t, first_leaf, last_leaf);
+      record_mem_page_range(t, first_leaf, last_leaf, is_write);
     }
   } else if (addr_space == AS_PUBLIC_VALUES) {
     if (first_page == last_page) {
-      record_pv_page(t, first_page, leaf_mask_range(first_leaf, last_leaf));
+      uint64_t leaf_mask = leaf_mask_range(first_leaf, last_leaf);
+      record_pv_page(t, first_page, leaf_mask, is_write ? leaf_mask : 0);
     } else {
-      record_pv_page_range(t, first_leaf, last_leaf);
+      record_pv_page_range(t, first_leaf, last_leaf, is_write);
     }
   } else {
     if (first_page == last_page) {
-      record_deferral_page(t, first_page, leaf_mask_range(first_leaf, last_leaf));
+      uint64_t leaf_mask = leaf_mask_range(first_leaf, last_leaf);
+      record_deferral_page(t, first_page, leaf_mask, is_write ? leaf_mask : 0);
     } else {
-      record_deferral_page_range(t, first_leaf, last_leaf);
+      record_deferral_page_range(t, first_leaf, last_leaf, is_write);
     }
   }
 }
 
+/* Generic extension accesses remain conservative: if direction is unknown,
+ * classify the access as a write. */
+static __attribute__((always_inline)) inline void record_page(
+    Tracer* t, uint32_t addr_space, uint64_t ptr, uint32_t size) {
+  record_page_access(t, addr_space, ptr, size, 1);
+}
+
 /* Record leaves touched by [first_addr, last_addr]. Duplicates are fine —
  * Rust-side checkpoint processing deduplicates by page mask. */
-static __attribute__((always_inline)) inline void record_page_range(
-    Tracer* t, uint32_t addr_space, uint64_t first_addr, uint64_t last_addr) {
+static __attribute__((always_inline)) inline void record_page_range_access(
+    Tracer* t, uint32_t addr_space, uint64_t first_addr, uint64_t last_addr,
+    uint8_t is_write) {
   uint32_t first_leaf = addr_to_local_leaf(addr_space, first_addr);
   uint32_t last_leaf = addr_to_local_leaf(addr_space, last_addr);
   if (likely(addr_space == AS_MEMORY)) {
-    record_mem_page_range(t, first_leaf, last_leaf);
+    record_mem_page_range(t, first_leaf, last_leaf, is_write);
   } else if (addr_space == AS_PUBLIC_VALUES) {
-    record_pv_page_range(t, first_leaf, last_leaf);
+    record_pv_page_range(t, first_leaf, last_leaf, is_write);
   } else {
-    record_deferral_page_range(t, first_leaf, last_leaf);
+    record_deferral_page_range(t, first_leaf, last_leaf, is_write);
   }
+}
+
+static __attribute__((always_inline)) inline void record_page_range(
+    Tracer* t, uint32_t addr_space, uint64_t first_addr, uint64_t last_addr) {
+  record_page_range_access(t, addr_space, first_addr, last_addr, 1);
 }
 
 /* ── Block-local AS_MEMORY page cache ─────────────────────────────── */
@@ -227,6 +260,7 @@ static __attribute__((always_inline)) inline TraceMemory trace_memory_setup(
       .last_mem_page = NO_LAST_PAGE,
       .mem_page_buf_len = t->mem_page_buf_len,
       .last_mem_leaf_mask = 0,
+      .last_mem_write_mask = 0,
       .mem_page_buf = t->mem_page_buf,
   };
   return memory;
@@ -238,12 +272,15 @@ static __attribute__((always_inline)) inline void trace_memory_drain(
       memory->last_mem_leaf_mask == 0) {
     memory->last_mem_page = NO_LAST_PAGE;
     memory->last_mem_leaf_mask = 0;
+    memory->last_mem_write_mask = 0;
     return;
   }
   append_page_access(memory->mem_page_buf, &memory->mem_page_buf_len,
-                     memory->last_mem_page, memory->last_mem_leaf_mask);
+                     memory->last_mem_page, memory->last_mem_leaf_mask,
+                     memory->last_mem_write_mask);
   memory->last_mem_page = NO_LAST_PAGE;
   memory->last_mem_leaf_mask = 0;
+  memory->last_mem_write_mask = 0;
 }
 
 static __attribute__((always_inline)) inline void trace_memory_flush(
@@ -258,27 +295,39 @@ static __attribute__((always_inline)) inline void trace_memory_reload(
   memory->last_mem_page = NO_LAST_PAGE;
   memory->mem_page_buf_len = t->mem_page_buf_len;
   memory->last_mem_leaf_mask = 0;
+  memory->last_mem_write_mask = 0;
   memory->mem_page_buf = t->mem_page_buf;
 }
 
 static __attribute__((always_inline)) inline void trace_memory_access_page(
-    TraceMemory* restrict memory, uint32_t page, uint64_t leaf_mask) {
+    TraceMemory* restrict memory, uint32_t page, uint64_t leaf_mask,
+    uint64_t write_mask) {
   /* Keep one pending AS_MEMORY page in registers for the current generated
    * block. Consecutive accesses to that page merge by OR-ing leaf masks. */
   if (likely(page == memory->last_mem_page)) {
     memory->last_mem_leaf_mask |= leaf_mask;
+    memory->last_mem_write_mask |= write_mask;
     return;
   }
   trace_memory_drain(memory);
   memory->last_mem_page = page;
   memory->last_mem_leaf_mask = leaf_mask;
+  memory->last_mem_write_mask = write_mask;
 }
 
-static __attribute__((always_inline)) inline void trace_memory_access_leaf(
+static __attribute__((always_inline)) inline void trace_memory_read_leaf(
     TraceMemory* restrict memory, uint64_t addr) {
   uint32_t leaf = byte_addr_to_local_leaf(addr);
   trace_memory_access_page(memory, leaf >> TRACER_PAGE_BITS,
-                           1ull << (leaf & ((1u << TRACER_PAGE_BITS) - 1u)));
+                           1ull << (leaf & ((1u << TRACER_PAGE_BITS) - 1u)), 0);
+}
+
+static __attribute__((always_inline)) inline void trace_memory_write_leaf(
+    TraceMemory* restrict memory, uint64_t addr) {
+  uint32_t leaf = byte_addr_to_local_leaf(addr);
+  uint64_t leaf_mask = 1ull << (leaf & ((1u << TRACER_PAGE_BITS) - 1u));
+  trace_memory_access_page(memory, leaf >> TRACER_PAGE_BITS, leaf_mask,
+                           leaf_mask);
 }
 
 /* ── Trace-only register access (no-ops in metered mode) ─────────── */
@@ -292,37 +341,37 @@ static __attribute__((always_inline)) inline void trace_reg_write(
 
 static __attribute__((always_inline)) inline void trace_rd_mem_u8(
     RvState* restrict state, uint64_t addr, uint8_t val) {
-  record_page(state->tracer, AS_MEMORY, addr, sizeof(uint8_t));
+  record_page_access(state->tracer, AS_MEMORY, addr, sizeof(uint8_t), 0);
 }
 
 static __attribute__((always_inline)) inline void trace_rd_mem_i8(
     RvState* restrict state, uint64_t addr, int8_t val) {
-  record_page(state->tracer, AS_MEMORY, addr, sizeof(int8_t));
+  record_page_access(state->tracer, AS_MEMORY, addr, sizeof(int8_t), 0);
 }
 
 static __attribute__((always_inline)) inline void trace_rd_mem_u16(
     RvState* restrict state, uint64_t addr, uint16_t val) {
-  record_page(state->tracer, AS_MEMORY, addr, sizeof(uint16_t));
+  record_page_access(state->tracer, AS_MEMORY, addr, sizeof(uint16_t), 0);
 }
 
 static __attribute__((always_inline)) inline void trace_rd_mem_i16(
     RvState* restrict state, uint64_t addr, int16_t val) {
-  record_page(state->tracer, AS_MEMORY, addr, sizeof(int16_t));
+  record_page_access(state->tracer, AS_MEMORY, addr, sizeof(int16_t), 0);
 }
 
 static __attribute__((always_inline)) inline void trace_rd_mem_u32(
     RvState* restrict state, uint64_t addr, uint32_t val) {
-  record_page(state->tracer, AS_MEMORY, addr, sizeof(uint32_t));
+  record_page_access(state->tracer, AS_MEMORY, addr, sizeof(uint32_t), 0);
 }
 
 static __attribute__((always_inline)) inline void trace_rd_mem_i32(
     RvState* restrict state, uint64_t addr, int32_t val) {
-  record_page(state->tracer, AS_MEMORY, addr, sizeof(int32_t));
+  record_page_access(state->tracer, AS_MEMORY, addr, sizeof(int32_t), 0);
 }
 
 static __attribute__((always_inline)) inline void trace_rd_mem_u64(
     RvState* restrict state, uint64_t addr, uint64_t val) {
-  record_page(state->tracer, AS_MEMORY, addr, sizeof(uint64_t));
+  record_page_access(state->tracer, AS_MEMORY, addr, sizeof(uint64_t), 0);
 }
 
 /* ── Trace-only memory writes (record page in metered mode) ──────── */
@@ -358,7 +407,7 @@ static __attribute__((always_inline)) inline void trace_rd_mem_u64_range(
     uint32_t num_words) {
   assume(num_words > 0);
   uint64_t last_addr = base_addr + num_words * sizeof(uint64_t) - 1u;
-  record_page_range(state->tracer, AS_MEMORY, base_addr, last_addr);
+  record_page_range_access(state->tracer, AS_MEMORY, base_addr, last_addr, 0);
 }
 
 static __attribute__((always_inline)) inline void trace_wr_mem_u64_range(

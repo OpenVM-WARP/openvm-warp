@@ -48,6 +48,10 @@ fn default_segmentation_max_memory() -> usize {
     DEFAULT_MAX_MEMORY
 }
 
+const fn default_native_warp_height_bucket_stride() -> u8 {
+    1
+}
+
 pub const OPENVM_DEFAULT_INIT_FILE_BASENAME: &str = "openvm_init";
 pub const OPENVM_DEFAULT_INIT_FILE_NAME: &str = "openvm_init.rs";
 
@@ -294,6 +298,23 @@ pub struct SystemConfig {
     #[serde(skip, default = "default_segmentation_max_memory")]
     #[getset(set = "pub")]
     pub segmentation_max_memory: usize,
+    /// Optional cap on padded main-trace cells in any one dynamic AIR trace.
+    ///
+    /// This is separate from the stacked PCS height: narrow and fixed traces
+    /// may remain tall, while a wide trace can be segmented before its
+    /// flattened message exceeds a downstream scalar-code domain.
+    #[serde(skip, default)]
+    #[getset(set = "pub")]
+    pub segmentation_max_trace_cells: Option<usize>,
+    /// Native-WARP-only logarithmic trace-height bucket stride.
+    ///
+    /// A value greater than one rounds each active AIR height up to one of a
+    /// verifier-owned set of levels anchored at that AIR's observed maximum.
+    /// This bounds History verifier shape polymorphism without changing the
+    /// continuation boundaries or exceeding the scalar-code cell cap.
+    #[serde(skip, default = "default_native_warp_height_bucket_stride")]
+    #[getset(set = "pub")]
+    pub native_warp_height_bucket_stride: u8,
 }
 
 impl SystemConfig {
@@ -313,6 +334,8 @@ impl SystemConfig {
             memory_config,
             num_public_values,
             segmentation_max_memory: DEFAULT_MAX_MEMORY,
+            segmentation_max_trace_cells: None,
+            native_warp_height_bucket_stride: default_native_warp_height_bucket_stride(),
         }
     }
 

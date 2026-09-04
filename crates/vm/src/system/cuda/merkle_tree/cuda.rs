@@ -7,6 +7,7 @@ use openvm_cuda_common::{
     error::CudaError,
     stream::{cudaStream_t, GpuDeviceCtx},
 };
+use openvm_stark_backend::prover::MatrixDimensions;
 use tracing::instrument;
 
 use super::{SharedBuffer, DIGEST_WIDTH, MERKLE_TOUCHED_BLOCK_WIDTH};
@@ -62,7 +63,8 @@ pub mod merkle_tree {
             tmp_storage: *mut u8,
             need_tmp_storage_bytes: usize,
             merkle_trace: *mut u32,
-            trace_height: usize,
+            unpadded_trace_height: usize,
+            padded_trace_height: usize,
             num_subtrees: usize,
             subtrees: *mut usize,        // is actually H**
             top_roots: *mut u32,         // are actually `H`s
@@ -198,6 +200,7 @@ pub mod merkle_tree {
             need_tmp_storage_bytes,
             trace.buffer().as_ptr() as *mut u32,
             unpadded_height,
+            trace.height(),
             num_subtrees,
             subtree_ptrs.as_mut_ptr(),
             top_roots.as_mut_ptr() as *mut u32,

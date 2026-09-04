@@ -63,6 +63,13 @@ pub enum UserPublicValuesProofError {
     UnexpectedLength(usize),
     #[error("incorrect proof length: {0} (expected {1})")]
     IncorrectProofLength(usize, usize),
+    #[error(
+        "public-values tree height {public_values_height} exceeds memory tree height {memory_height}"
+    )]
+    PublicValuesTreeTooTall {
+        public_values_height: usize,
+        memory_height: usize,
+    },
     #[error("user public values do not match commitment")]
     UserPublicValuesCommitMismatch,
     #[error("final memory root mismatch")]
@@ -123,7 +130,13 @@ impl<const DIGEST_WIDTH: usize, F: Field> UserPublicValuesProof<DIGEST_WIDTH, F>
             return Err(UserPublicValuesProofError::UnexpectedLength(pvs.len()));
         }
         let pv_height = log2_strict_usize(pvs.len() / DIGEST_WIDTH);
-        let proof_len = memory_dimensions.overall_height() - pv_height;
+        let memory_height = memory_dimensions.overall_height();
+        let proof_len = memory_height.checked_sub(pv_height).ok_or(
+            UserPublicValuesProofError::PublicValuesTreeTooTall {
+                public_values_height: pv_height,
+                memory_height,
+            },
+        )?;
         let idx_prefix = pv_start_idx >> pv_height;
         // 1.
         if self.proof.len() != proof_len {
@@ -269,10 +282,11 @@ mod tests {
     use openvm_stark_backend::p3_field::PrimeCharacteristicRing;
     use openvm_stark_sdk::p3_baby_bear::BabyBear;
 
-    use super::UserPublicValuesProof;
+    use super::{UserPublicValuesProof, UserPublicValuesProofError};
     use crate::{
         arch::{hasher::poseidon2::vm_poseidon2_hasher, MemoryConfig, SystemConfig},
         system::memory::{
+            dimensions::MemoryDimensions,
             merkle::{public_values::PUBLIC_VALUES_AS, tree::MerkleTree},
             online::GuestMemory,
             AddressMap, DIGEST_WIDTH,
@@ -319,6 +333,27 @@ mod tests {
         pv_proof
             .verify(&hasher, memory_dimensions, final_memory_root)
             .unwrap();
+    }
+
+    #[test]
+    fn oversized_public_values_tree_is_rejected_without_panicking() {
+        let proof = UserPublicValuesProof::<{ DIGEST_WIDTH }, F> {
+            proof: vec![],
+            public_values: F::zero_vec(DIGEST_WIDTH * 2),
+            public_values_commit: [F::ZERO; DIGEST_WIDTH],
+        };
+        let result = proof.verify(
+            &vm_poseidon2_hasher(),
+            MemoryDimensions::new(0, 0),
+            [F::ZERO; DIGEST_WIDTH],
+        );
+        assert!(matches!(
+            result,
+            Err(UserPublicValuesProofError::PublicValuesTreeTooTall {
+                public_values_height: 1,
+                memory_height: 0,
+            })
+        ));
     }
 
     #[test]

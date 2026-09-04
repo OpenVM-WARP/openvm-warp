@@ -24,6 +24,7 @@ pub fn generate_proving_ctx(
     proofs_type: ProofsType,
     child_is_app: bool,
     absent_trace_pvs: Option<(DeferralPvs<F>, bool)>,
+    required_height: Option<usize>,
 ) -> (
     AirProvingContext<CpuBackend<BabyBearPoseidon2Config>>,
     Vec<[F; POSEIDON2_WIDTH]>,
@@ -51,8 +52,13 @@ pub fn generate_proving_ctx(
         }
     };
 
+    let height = required_height.unwrap_or(num_rows);
+    assert_eq!(
+        height, num_rows,
+        "DeferralPvsAir has semantic row-count constraints and cannot be padded"
+    );
     let width = DeferralPvsCols::<u8>::width();
-    let mut trace = vec![F::ZERO; num_rows * width];
+    let mut trace = vec![F::ZERO; height * width];
     let mut chunks = trace.chunks_exact_mut(width);
 
     let mut child_pvs_vec = vec![];

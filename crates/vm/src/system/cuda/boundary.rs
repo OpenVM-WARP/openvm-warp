@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use openvm_circuit::{
     arch::BLOCK_FE_WIDTH, system::memory::persistent::PersistentBoundaryCols,
     utils::next_power_of_two_or_zero,
@@ -20,6 +22,8 @@ pub struct BoundaryChipGPU {
     pub records: Option<DeviceBuffer<u32>>,
     pub num_records: Option<usize>,
     pub trace_width: Option<usize>,
+    /// One-shot protocol-v19 shape pin. Zero retains the natural trace height.
+    forced_height: AtomicUsize,
 }
 
 const BLOCKS_PER_LEAF: usize = DIGEST_WIDTH / BLOCK_FE_WIDTH;
@@ -43,7 +47,16 @@ impl BoundaryChipGPU {
             records: None,
             num_records: None,
             trace_width: None,
+            forced_height: AtomicUsize::new(0),
         }
+    }
+
+    pub fn set_forced_height(&self, height: usize) {
+        assert!(
+            height.is_power_of_two(),
+            "forced Boundary height must be a power of two"
+        );
+        self.forced_height.store(height, Ordering::Release);
     }
 
     pub fn finalize_records<const DIGEST_WIDTH: usize>(
@@ -86,16 +99,28 @@ impl BoundaryChipGPU {
 impl<RA> Chip<RA, GpuBackend> for BoundaryChipGPU {
     fn generate_proving_ctx(&self, _: RA) -> AirProvingContext<GpuBackend> {
         let num_records = self.num_records.unwrap();
+        let forced_height = self.forced_height.swap(0, Ordering::AcqRel);
+        let natural_height = next_power_of_two_or_zero(2 * num_records).max(1);
+        let trace_height = if forced_height == 0 {
+            natural_height
+        } else {
+            assert!(
+                forced_height >= natural_height,
+                "forced Boundary height {forced_height} is below natural height {natural_height}"
+            );
+            forced_height
+        };
         if num_records == 0 {
             // Boundary AIR should always be present, so return a single zero-filled
-            // padding row.
-            let trace =
-                DeviceMatrix::<F>::with_capacity_on(1, self.trace_width(), &self.device_ctx);
+            // padding trace at the setup-owned height.
+            let trace = DeviceMatrix::<F>::with_capacity_on(
+                trace_height,
+                self.trace_width(),
+                &self.device_ctx,
+            );
             trace.buffer().fill_zero_on(&self.device_ctx).unwrap();
             return AirProvingContext::simple_no_pis(trace);
         }
-        let unpadded_height = 2 * num_records;
-        let trace_height = next_power_of_two_or_zero(unpadded_height);
         let trace =
             DeviceMatrix::<F>::with_capacity_on(trace_height, self.trace_width(), &self.device_ctx);
         trace.buffer().fill_zero_on(&self.device_ctx).unwrap();

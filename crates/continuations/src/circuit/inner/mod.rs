@@ -8,7 +8,7 @@ use openvm_verify_stark_host::pvs::{DeferralPvs, VmPvs, DEF_PVS_AIR_ID, VM_PVS_A
 use crate::{
     circuit::{
         inner::{
-            bus::PvsAirConsistencyBus,
+            bus::{PvsAirConsistencyBus, VerifierExecutionIdentityBus, VerifierLayerIdentityBus},
             def_pvs::DeferralPvsAir,
             unset::UnsetPvsAir,
             verifier::{VerifierDeferralConfig, VerifierPvsAir},
@@ -71,6 +71,10 @@ impl<SC: StarkProtocolConfig<F = F>, S: AggregationSubCircuit> Circuit<SC> for I
             pre_hash_bus,
             range_bus,
             pvs_air_consistency_bus,
+            verifier_layer_identity_bus: self
+                .verifier_circuit
+                .verifier_layer_identity_bus_idx()
+                .map(VerifierLayerIdentityBus::new),
             deferral_config,
         });
 
@@ -78,6 +82,14 @@ impl<SC: StarkProtocolConfig<F = F>, S: AggregationSubCircuit> Circuit<SC> for I
             public_values_bus,
             cached_commit_bus,
             pvs_air_consistency_bus,
+            verifier_execution_identity_bus: self
+                .verifier_circuit
+                .verifier_execution_identity_bus_idx()
+                .map(VerifierExecutionIdentityBus::new),
+            receive_leaf_program_cached_commit: self
+                .verifier_circuit
+                .verifier_execution_identity_bus_idx()
+                .is_none(),
             deferral_enabled,
         });
 

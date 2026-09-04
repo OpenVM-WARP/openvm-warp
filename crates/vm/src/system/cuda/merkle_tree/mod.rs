@@ -37,6 +37,10 @@ pub(crate) const OMITTED_BOTTOM_LEVELS: usize = 3;
 enum MemoryMerkleSubTreeLayout {
     Full = 0,
     OmitBottomLevels = 1,
+    /// The address space contains no allocated leaves. Its only physical
+    /// storage is the subtree root; every conceptual node below it is the
+    /// corresponding member of the canonical zero-hash chain.
+    Empty = 2,
 }
 
 /// A Merkle subtree stored in a single flat buffer, combining a vertical path and a heap-ordered
@@ -83,6 +87,7 @@ impl MemoryMerkleSubTree {
         let retained_height = match layout {
             MemoryMerkleSubTreeLayout::Full => height,
             MemoryMerkleSubTreeLayout::OmitBottomLevels => height - OMITTED_BOTTOM_LEVELS,
+            MemoryMerkleSubTreeLayout::Empty => 0,
         };
         2 * (1 << retained_height) - 1
     }
@@ -146,7 +151,7 @@ impl MemoryMerkleSubTree {
             height: 0,
             buf: DeviceBuffer::new(),
             path_len: 0,
-            layout: MemoryMerkleSubTreeLayout::Full,
+            layout: MemoryMerkleSubTreeLayout::Empty,
             initial_data: None,
         }
     }
@@ -159,6 +164,7 @@ impl MemoryMerkleSubTree {
         match self.layout {
             MemoryMerkleSubTreeLayout::Full => self.height,
             MemoryMerkleSubTreeLayout::OmitBottomLevels => self.height - OMITTED_BOTTOM_LEVELS,
+            MemoryMerkleSubTreeLayout::Empty => 0,
         }
     }
 
@@ -370,6 +376,24 @@ impl MemoryMerkleTree {
         d_touched_blocks: &DeviceBuffer<u32>,
         empty_touched_blocks: bool,
     ) -> AirProvingContext<GpuBackend> {
+        self.update_with_touched_blocks_at_height(
+            unpadded_height,
+            d_touched_blocks,
+            empty_touched_blocks,
+            None,
+        )
+    }
+
+    /// Protocol-v19 variant that pads the ordinary Merkle trace to a
+    /// setup-owned height. The kernel still writes only `unpadded_height` real
+    /// rows; the additional rows remain canonical zero padding.
+    pub fn update_with_touched_blocks_at_height(
+        &mut self,
+        unpadded_height: usize,
+        d_touched_blocks: &DeviceBuffer<u32>,
+        empty_touched_blocks: bool,
+        forced_height: Option<usize>,
+    ) -> AirProvingContext<GpuBackend> {
         let mut public_values = self.top_roots.to_host_on(&self.device_ctx).unwrap()[0].to_vec();
         // .to_host() calls cudaEventSynchronize on the D2H memcpy, which also means all subtree
         // events are now completed, so we can clean up the events.
@@ -378,7 +402,12 @@ impl MemoryMerkleTree {
         }
         let merkle_trace = {
             let width = MemoryMerkleCols::<u8, DIGEST_WIDTH>::width();
-            let padded_height = next_power_of_two_or_zero(unpadded_height);
+            let natural_height = next_power_of_two_or_zero(unpadded_height).max(1);
+            let padded_height = forced_height.unwrap_or(natural_height);
+            assert!(
+                padded_height.is_power_of_two() && padded_height >= natural_height,
+                "forced Merkle height {padded_height} is below natural height {natural_height}"
+            );
             let output =
                 DeviceMatrix::<F>::with_capacity_on(padded_height, width, &self.device_ctx);
             output.buffer().fill_zero_on(&self.device_ctx).unwrap();
@@ -924,6 +953,110 @@ mod tests {
         assert_eq!(
             gpu_rows, cpu_rows,
             "GPU merkle trace rows do not match the CPU reference trace"
+        );
+    }
+
+    /// The empty-memory update is represented by one artificial touch of the
+    /// leftmost leaf.  Its bottom interactions are suppressed inside the
+    /// Merkle trace (there is deliberately no persistent-boundary record), so
+    /// this path must agree exactly with the canonical CPU trace as well.
+    ///
+    /// Exercise a larger setup-owned height too: protocol-v19 pins the trace
+    /// shape, and padding must not change either row contents or interactions.
+    #[test]
+    fn test_cuda_merkle_tree_empty_trace_equivalence_with_padding() {
+        let mut addr_spaces = MemoryConfig::empty_address_space_configs(5);
+        // Keep the leftmost (register) address space empty. This is the shape
+        // used by the tiny terminate-only protocol-v19 test and exercises a
+        // dummy CUDA subtree rather than an allocated leaf buffer.
+        addr_spaces[RV64_MEMORY_AS as usize].num_cells = 2 * DIGEST_WIDTH;
+        let mem_config = MemoryConfig::new(2, addr_spaces, 4, 29, 17);
+        let initial_memory = GuestMemory::new(AddressMap::from_mem_config(&mem_config));
+
+        let device_ctx = GpuDeviceCtx {
+            device_id: get_device().unwrap() as u32,
+            stream: StreamGuard::new(CudaStream::new_non_blocking().unwrap()),
+        };
+        let gpu_hasher_chip = Arc::new(Poseidon2PeripheryChipGPU::new(1, device_ctx.clone()));
+        let mut gpu_merkle_tree = MemoryMerkleTree::new(
+            mem_config.clone(),
+            gpu_hasher_chip.clone(),
+            device_ctx.clone(),
+        );
+        let mem_slices = initial_memory
+            .memory
+            .get_memory()
+            .iter()
+            .map(|memory| {
+                let bytes = memory.as_slice();
+                Arc::new(if bytes.is_empty() {
+                    DeviceBuffer::new()
+                } else {
+                    bytes.to_device_on(&device_ctx).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        for (address_space, memory) in mem_slices.iter().enumerate() {
+            gpu_merkle_tree.build_async(memory.clone(), address_space);
+        }
+        gpu_merkle_tree.finalize();
+
+        let cpu_hasher_chip = Poseidon2PeripheryChip::new(vm_poseidon2_config(), 3);
+        let mut cpu_merkle_chip = MemoryMerkleChip::<DIGEST_WIDTH, F>::new(
+            mem_config.memory_dimensions(),
+            PermutationCheckBus::new(MEMORY_MERKLE_BUS),
+            PermutationCheckBus::new(POSEIDON2_DIRECT_BUS),
+        );
+        cpu_merkle_chip.finalize(&initial_memory.memory, &BTreeMap::new(), &cpu_hasher_chip);
+
+        let mut empty_touch = vec![0u32; MERKLE_TOUCHED_BLOCK_WIDTH];
+        // The record header is ordinary integer metadata, not a field element.
+        empty_touch[0] = openvm_circuit::arch::ADDR_SPACE_OFFSET;
+        let empty_touch = empty_touch.to_device_on(&device_ctx).unwrap();
+        let empty_partition = Vec::<((u32, u32), TimestampedValues<F, DIGEST_WIDTH>)>::new();
+        let unpadded_height = gpu_merkle_tree.calculate_unpadded_height(&empty_partition);
+        let forced_height = unpadded_height.next_power_of_two() * 2;
+        cpu_merkle_chip.set_overridden_height(forced_height);
+        gpu_hasher_chip.prepare_records(unpadded_height);
+
+        let cpu_ctx = cpu_merkle_chip.generate_proving_ctx::<SC>();
+        let gpu_ctx = gpu_merkle_tree.update_with_touched_blocks_at_height(
+            unpadded_height,
+            &empty_touch,
+            true,
+            Some(forced_height),
+        );
+
+        assert_eq!(gpu_ctx.public_values, cpu_ctx.public_values);
+        let width = cpu_ctx.common_main.width;
+        let height = cpu_ctx.common_main.height();
+        assert_eq!(gpu_ctx.common_main.width(), width);
+        assert_eq!(gpu_ctx.common_main.height(), height);
+        let cpu_values = &cpu_ctx.common_main.values;
+        let gpu_values = gpu_ctx
+            .common_main
+            .buffer()
+            .to_host_on(&device_ctx)
+            .unwrap();
+        let mut cpu_rows = (0..height)
+            .map(|row| {
+                (0..width)
+                    .map(|col| cpu_values[row * width + col].as_canonical_u32())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut gpu_rows = (0..height)
+            .map(|row| {
+                (0..width)
+                    .map(|col| gpu_values[col * height + row].as_canonical_u32())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        cpu_rows.sort_unstable();
+        gpu_rows.sort_unstable();
+        assert_eq!(
+            gpu_rows, cpu_rows,
+            "empty GPU Merkle trace differs from CPU"
         );
     }
 }

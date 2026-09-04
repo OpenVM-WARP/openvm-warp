@@ -6,15 +6,23 @@ use openvm_circuit::{
         hasher::poseidon2::{vm_poseidon2_hasher, Poseidon2Hasher},
         instructions::exe::VmExe,
         verify_segments, ContinuationVmProof, ContinuationVmProver, Executor, MeteredExecutor,
-        PreflightExecutor, VerifiedExecutionPayload, VirtualMachine, VirtualMachineError,
-        VmBuilder, VmExecutionConfig, VmInstance, VmVerificationError,
+        NativeWarpContinuationPlan, NativeWarpStreamError, PreflightExecutor,
+        VerifiedExecutionPayload, VirtualMachine, VirtualMachineError, VmBuilder,
+        VmExecutionConfig, VmInstance, VmVerificationError,
     },
     system::{
-        memory::dimensions::MemoryDimensions, program::trace::compute_exe_commit_from_mem_config,
+        memory::{
+            dimensions::MemoryDimensions, merkle::public_values::UserPublicValuesProof,
+            DIGEST_WIDTH,
+        },
+        program::trace::compute_exe_commit_from_mem_config,
+        SystemWithFixedTraceHeights,
     },
 };
 use openvm_stark_backend::{
-    keygen::types::MultiStarkVerifyingKey, p3_field::PrimeField32, prover::ProverBackend,
+    keygen::types::{MultiStarkProvingKey, MultiStarkVerifyingKey},
+    p3_field::PrimeField32,
+    prover::{CommittedTraceData, ProverBackend},
     StarkEngine, Val,
 };
 use openvm_stark_sdk::config::baby_bear_poseidon2::Digest;
@@ -22,7 +30,7 @@ use tracing::instrument;
 
 use crate::{
     keygen::AppVerifyingKey,
-    prover::vm::{new_local_prover, types::VmProvingKey},
+    prover::vm::{new_local_prover, new_local_prover_with_engine, types::VmProvingKey},
     util::check_max_constraint_degrees,
     SdkError, StdIn, F, SC,
 };
@@ -39,6 +47,18 @@ where
     #[getset(get = "pub")]
     app_vm_vk: MultiStarkVerifyingKey<E::SC>,
     app_exe_commit: OnceLock<Digest>,
+    /// The host proving key, retained so a prover can build a *second* device
+    /// key from it.
+    ///
+    /// [`VirtualMachine`] keeps only `DeviceMultiStarkProvingKey<E::PB>`, and
+    /// `transport_pk_to_device` starts from the host key, so without this there
+    /// is no way to put a phase on a different backend than the engine's.
+    /// Native WARP uses it to run its tagged LogUp on GPU while the openings
+    /// stay on host.
+    ///
+    /// `None` when built through [`Self::new_from_instance`], which never sees
+    /// the host key; that only costs the caller the accelerated path.
+    app_vm_pk: Option<Arc<MultiStarkProvingKey<SC>>>,
 }
 
 impl<E, VB> AppProver<E, VB>
@@ -60,7 +80,28 @@ where
     ) -> Result<Self, VirtualMachineError> {
         let instance = new_local_prover(vm_builder, app_vm_pk, app_exe)?;
         let app_vm_vk = app_vm_pk.vm_pk.get_vk();
-        Ok(Self::new_from_instance(instance, app_vm_vk))
+        let mut prover = Self::new_from_instance(instance, app_vm_vk);
+        prover.app_vm_pk = Some(app_vm_pk.vm_pk.clone());
+        Ok(prover)
+    }
+
+    /// Creates an application prover from an engine whose device policy was
+    /// configured before proving-key and cached-program commitments exist.
+    ///
+    /// This is required by no-reencode native accumulation: changing an RS
+    /// cache policy after [`Self::new`] would force a second commitment merely
+    /// to recover the backing codeword.
+    pub fn new_with_engine(
+        engine: E,
+        vm_builder: VB,
+        app_vm_pk: &VmProvingKey<VB::VmConfig>,
+        app_exe: Arc<VmExe<Val<E::SC>>>,
+    ) -> Result<Self, VirtualMachineError> {
+        let instance = new_local_prover_with_engine(engine, vm_builder, app_vm_pk, app_exe)?;
+        let app_vm_vk = app_vm_pk.vm_pk.get_vk();
+        let mut prover = Self::new_from_instance(instance, app_vm_vk);
+        prover.app_vm_pk = Some(app_vm_pk.vm_pk.clone());
+        Ok(prover)
     }
 
     pub fn new_from_instance(
@@ -72,7 +113,16 @@ where
             instance,
             app_vm_vk,
             app_exe_commit: OnceLock::new(),
+            app_vm_pk: None,
         }
+    }
+
+    /// The host proving key, if this prover was built from one.
+    ///
+    /// See the field docs: this exists so a caller can transport a second
+    /// device key onto another backend.
+    pub fn host_proving_key(&self) -> Option<&Arc<MultiStarkProvingKey<SC>>> {
+        self.app_vm_pk.as_ref()
     }
 
     pub fn set_program_name(&mut self, program_name: impl AsRef<str>) -> &mut Self {
@@ -85,8 +135,23 @@ where
         self
     }
 
+    /// Use a native metering artifact that the SDK has already validated against this executable
+    /// and VM shape. Both recursive continuation proving and native-WARP planning consume it.
+    #[cfg(feature = "rvr")]
+    pub fn set_metered_artifact_path(&mut self, path: impl Into<std::path::PathBuf>) -> &mut Self {
+        self.instance.set_metered_artifact_path(path);
+        self
+    }
+
     pub fn app_program_commit(&self) -> <E::PB as ProverBackend>::Commitment {
         *self.instance().program_commitment()
+    }
+
+    /// Exact cached program PCS allocation already owned by the segment
+    /// prover. Verifier-WARP HLeaves reuse this object instead of committing a
+    /// second copy of the app program.
+    pub fn cached_program_trace(&self) -> Option<&CommittedTraceData<E::PB>> {
+        self.instance.vm.cached_program_trace()
     }
 
     /// Returns commitment to the executable
@@ -142,6 +207,93 @@ where
         )
         .expect("app proof verification failed");
         Ok(proof)
+    }
+
+    /// Plans exact segment shapes and streams original AIR contexts into the
+    /// native WARP backend without constructing deferred SWIRL proofs.
+    pub fn prove_warp_stream_with_plan<SegmentError>(
+        &mut self,
+        input: StdIn<Val<E::SC>>,
+        plan_segments: impl FnOnce(&[Vec<u32>]) -> Result<(), SegmentError>,
+        consume_segment: impl FnMut(
+            usize,
+            &E,
+            &openvm_stark_backend::prover::DeviceMultiStarkProvingKey<E::PB>,
+            openvm_stark_backend::prover::ProvingContext<E::PB>,
+        ) -> Result<(), SegmentError>,
+    ) -> Result<
+        UserPublicValuesProof<{ DIGEST_WIDTH }, Val<E::SC>>,
+        NativeWarpStreamError<SegmentError>,
+    >
+    where
+        VB::SystemChipInventory: SystemWithFixedTraceHeights,
+        <VB::VmConfig as VmExecutionConfig<Val<E::SC>>>::Executor: Executor<Val<E::SC>>
+            + MeteredExecutor<Val<E::SC>>
+            + PreflightExecutor<Val<E::SC>, VB::RecordArena>,
+    {
+        check_max_constraint_degrees(
+            self.vm_config().as_ref(),
+            self.app_vm_vk.inner.max_constraint_degree(),
+        );
+        self.instance
+            .prove_continuations_native_warp_stream_with_plan(
+                input,
+                |_, _| {},
+                plan_segments,
+                consume_segment,
+            )
+    }
+
+    /// Performs the exact shape-only preflight used by native WARP setup.
+    pub fn plan_warp_stream(
+        &mut self,
+        input: StdIn<Val<E::SC>>,
+    ) -> Result<NativeWarpContinuationPlan, VirtualMachineError>
+    where
+        <VB::VmConfig as VmExecutionConfig<Val<E::SC>>>::Executor: Executor<Val<E::SC>>
+            + MeteredExecutor<Val<E::SC>>
+            + PreflightExecutor<Val<E::SC>, VB::RecordArena>,
+    {
+        check_max_constraint_degrees(
+            self.vm_config().as_ref(),
+            self.app_vm_vk.inner.max_constraint_degree(),
+        );
+        self.instance.plan_continuations_native_warp(input)
+    }
+
+    /// Streams original AIR contexts using an exact native-WARP plan prepared
+    /// during setup.
+    pub fn prove_warp_stream_prepared<SegmentError>(
+        &mut self,
+        input: StdIn<Val<E::SC>>,
+        plan: NativeWarpContinuationPlan,
+        consume_segment: impl FnMut(
+            usize,
+            &E,
+            &openvm_stark_backend::prover::DeviceMultiStarkProvingKey<E::PB>,
+            openvm_stark_backend::prover::ProvingContext<E::PB>,
+        ) -> Result<(), SegmentError>,
+    ) -> Result<
+        UserPublicValuesProof<{ DIGEST_WIDTH }, Val<E::SC>>,
+        NativeWarpStreamError<SegmentError>,
+    >
+    where
+        VB::SystemChipInventory: SystemWithFixedTraceHeights,
+        <VB::VmConfig as VmExecutionConfig<Val<E::SC>>>::Executor: Executor<Val<E::SC>>
+            + MeteredExecutor<Val<E::SC>>
+            + PreflightExecutor<Val<E::SC>, VB::RecordArena>,
+    {
+        check_max_constraint_degrees(
+            self.vm_config().as_ref(),
+            self.app_vm_vk.inner.max_constraint_degree(),
+        );
+        self.instance
+            .prove_continuations_native_warp_stream_prepared(
+                input,
+                plan,
+                |_, _| {},
+                consume_segment,
+            )
     }
 
     /// App Exe

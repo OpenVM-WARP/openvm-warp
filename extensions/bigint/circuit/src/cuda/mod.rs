@@ -1,7 +1,7 @@
 use std::{mem::size_of, sync::Arc};
 
 use derive_new::new;
-use openvm_circuit::{arch::DenseRecordArena, utils::next_power_of_two_or_zero};
+use openvm_circuit::arch::DenseRecordArena;
 use openvm_circuit_primitives::{
     bitwise_op_lookup::BitwiseOperationLookupChipGPU, cuda_abi::UInt2,
     range_tuple::RangeTupleCheckerChipGPU, var_range::VariableRangeCheckerChipGPU, Chip,
@@ -44,7 +44,8 @@ impl Chip<DenseRecordArena, GpuBackend> for AddSub256ChipGpu {
     fn generate_proving_ctx(&self, arena: DenseRecordArena) -> AirProvingContext<GpuBackend> {
         const RECORD_SIZE: usize = size_of::<(AddSub256AdapterRecord, AddSub256CoreRecord)>();
         let records = arena.allocated();
-        if records.is_empty() {
+        let trace_height = arena.trace_height(RECORD_SIZE);
+        if trace_height == 0 {
             return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
         }
         debug_assert_eq!(records.len() % RECORD_SIZE, 0);
@@ -56,7 +57,6 @@ impl Chip<DenseRecordArena, GpuBackend> for AddSub256ChipGpu {
                 INT256_NUM_MEMORY_BLOCKS,
                 INT256_NUM_MEMORY_BLOCKS,
             >::width();
-        let trace_height = next_power_of_two_or_zero(records.len() / RECORD_SIZE);
         let device_ctx = &self.range_checker.device_ctx;
 
         let d_records = records.to_device_on(device_ctx).unwrap();
@@ -99,7 +99,8 @@ impl Chip<DenseRecordArena, GpuBackend> for BitwiseLogic256ChipGpu {
         const RECORD_SIZE: usize =
             size_of::<(BitwiseLogic256AdapterRecord, BitwiseLogic256CoreRecord)>();
         let records = arena.allocated();
-        if records.is_empty() {
+        let trace_height = arena.trace_height(RECORD_SIZE);
+        if trace_height == 0 {
             return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
         }
         debug_assert_eq!(records.len() % RECORD_SIZE, 0);
@@ -111,7 +112,6 @@ impl Chip<DenseRecordArena, GpuBackend> for BitwiseLogic256ChipGpu {
                 INT256_NUM_MEMORY_BLOCKS,
                 INT256_NUM_MEMORY_BLOCKS,
             >::width();
-        let trace_height = next_power_of_two_or_zero(records.len() / RECORD_SIZE);
         let device_ctx = &self.range_checker.device_ctx;
 
         let d_records = records.to_device_on(device_ctx).unwrap();
@@ -154,14 +154,14 @@ impl Chip<DenseRecordArena, GpuBackend> for BranchEqual256ChipGpu {
         const RECORD_SIZE: usize =
             size_of::<(BranchEqual256AdapterRecord, BranchEqual256CoreRecord)>();
         let records = arena.allocated();
-        if records.is_empty() {
+        let trace_height = arena.trace_height(RECORD_SIZE);
+        if trace_height == 0 {
             return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
         }
         debug_assert_eq!(records.len() % RECORD_SIZE, 0);
 
         let trace_width = BranchEqualCoreCols::<F, INT256_NUM_U16_LIMBS>::width()
             + Rv64VecHeapBranchU16AdapterCols::<F, NUM_READS, INT256_NUM_MEMORY_BLOCKS>::width();
-        let trace_height = next_power_of_two_or_zero(records.len() / RECORD_SIZE);
         let device_ctx = &self.range_checker.device_ctx;
 
         let d_records = records.to_device_on(device_ctx).unwrap();
@@ -205,7 +205,8 @@ impl Chip<DenseRecordArena, GpuBackend> for LessThan256ChipGpu {
     fn generate_proving_ctx(&self, arena: DenseRecordArena) -> AirProvingContext<GpuBackend> {
         const RECORD_SIZE: usize = size_of::<(LessThan256AdapterRecord, LessThan256CoreRecord)>();
         let records = arena.allocated();
-        if records.is_empty() {
+        let trace_height = arena.trace_height(RECORD_SIZE);
+        if trace_height == 0 {
             return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
         }
         debug_assert_eq!(records.len() % RECORD_SIZE, 0);
@@ -217,7 +218,6 @@ impl Chip<DenseRecordArena, GpuBackend> for LessThan256ChipGpu {
                 INT256_NUM_MEMORY_BLOCKS,
                 INT256_NUM_MEMORY_BLOCKS,
             >::width();
-        let trace_height = next_power_of_two_or_zero(records.len() / RECORD_SIZE);
         let device_ctx = &self.range_checker.device_ctx;
 
         let d_records = records.to_device_on(device_ctx).unwrap();
@@ -259,14 +259,14 @@ impl Chip<DenseRecordArena, GpuBackend> for BranchLessThan256ChipGpu {
         const RECORD_SIZE: usize =
             size_of::<(BranchLessThan256AdapterRecord, BranchLessThan256CoreRecord)>();
         let records = arena.allocated();
-        if records.is_empty() {
+        let trace_height = arena.trace_height(RECORD_SIZE);
+        if trace_height == 0 {
             return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
         }
         debug_assert_eq!(records.len() % RECORD_SIZE, 0);
 
         let trace_width = BranchLessThanCoreCols::<F, INT256_NUM_U16_LIMBS, U16_BITS>::width()
             + Rv64VecHeapBranchU16AdapterCols::<F, NUM_READS, INT256_NUM_MEMORY_BLOCKS>::width();
-        let trace_height = next_power_of_two_or_zero(records.len() / RECORD_SIZE);
         let device_ctx = &self.range_checker.device_ctx;
 
         let d_records = records.to_device_on(device_ctx).unwrap();
@@ -318,7 +318,8 @@ impl Chip<DenseRecordArena, GpuBackend> for ShiftLogical256ChipGpu {
         const RECORD_SIZE: usize =
             size_of::<(ShiftLogical256U16AdapterRecord, ShiftLogical256CoreRecord)>();
         let records = arena.allocated();
-        if records.is_empty() {
+        let trace_height = arena.trace_height(RECORD_SIZE);
+        if trace_height == 0 {
             return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
         }
         debug_assert_eq!(records.len() % RECORD_SIZE, 0);
@@ -330,7 +331,6 @@ impl Chip<DenseRecordArena, GpuBackend> for ShiftLogical256ChipGpu {
                 INT256_NUM_MEMORY_BLOCKS,
                 INT256_NUM_MEMORY_BLOCKS,
             >::width();
-        let trace_height = next_power_of_two_or_zero(records.len() / RECORD_SIZE);
         let device_ctx = &self.range_checker.device_ctx;
 
         let d_records = records.to_device_on(device_ctx).unwrap();
@@ -360,7 +360,8 @@ impl Chip<DenseRecordArena, GpuBackend> for ShiftRightArithmetic256ChipGpu {
             ShiftRightArithmetic256CoreRecord,
         )>();
         let records = arena.allocated();
-        if records.is_empty() {
+        let trace_height = arena.trace_height(RECORD_SIZE);
+        if trace_height == 0 {
             return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
         }
         debug_assert_eq!(records.len() % RECORD_SIZE, 0);
@@ -373,7 +374,6 @@ impl Chip<DenseRecordArena, GpuBackend> for ShiftRightArithmetic256ChipGpu {
                     INT256_NUM_MEMORY_BLOCKS,
                     INT256_NUM_MEMORY_BLOCKS,
                 >::width();
-        let trace_height = next_power_of_two_or_zero(records.len() / RECORD_SIZE);
         let device_ctx = &self.range_checker.device_ctx;
 
         let d_records = records.to_device_on(device_ctx).unwrap();
@@ -418,7 +418,8 @@ impl Chip<DenseRecordArena, GpuBackend> for Multiplication256ChipGpu {
         const RECORD_SIZE: usize =
             size_of::<(Multiplication256AdapterRecord, Multiplication256CoreRecord)>();
         let records = arena.allocated();
-        if records.is_empty() {
+        let trace_height = arena.trace_height(RECORD_SIZE);
+        if trace_height == 0 {
             return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
         }
         debug_assert_eq!(records.len() % RECORD_SIZE, 0);
@@ -430,7 +431,6 @@ impl Chip<DenseRecordArena, GpuBackend> for Multiplication256ChipGpu {
                 INT256_NUM_MEMORY_BLOCKS,
                 INT256_NUM_MEMORY_BLOCKS,
             >::width();
-        let trace_height = next_power_of_two_or_zero(records.len() / RECORD_SIZE);
         let device_ctx = &self.range_checker.device_ctx;
 
         let d_records = records.to_device_on(device_ctx).unwrap();

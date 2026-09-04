@@ -22,6 +22,8 @@ use openvm_verify_stark_host::{
     VmStarkProof,
 };
 
+#[cfg(feature = "rvr")]
+use crate::{compiled::metered_artifact_metadata_path, MeteredArtifactCacheStatus};
 use crate::{
     config::{AggregationConfig, AggregationSystemParams, AppConfig, DEFAULT_APP_L_SKIP},
     prover::{DeferralPathProver, DeferralProof, DeferralProver},
@@ -51,7 +53,6 @@ fn make_fib_sdk() -> (Sdk, SystemParams, AggregationSystemParams) {
     (sdk, app_params, agg_params)
 }
 
-/// Generates a fibonacci VM STARK proof using the given SDK.
 fn generate_fib_vm_stark_proof(fib_sdk: &Sdk) -> Result<(VmStarkProof, VerificationBaseline)> {
     let fib_elf = Elf::decode(
         include_bytes!("../programs/examples/fibonacci.elf"),
@@ -340,8 +341,68 @@ fn test_sdk_compiled_metered_save_load_roundtrip() -> Result<()> {
     let (baseline_pv, baseline_segments) = sdk.execute_metered(&compiled_a, stdin.clone())?;
 
     let tmp = tempfile::tempdir()?;
+
+    // Populate the exact layout used by `compile_or_load_metered_cached` without paying for a
+    // second native compilation, then prove that the checked cache path is a real hit.
+    let cache_key = compiled_a.artifact_identity.cache_key()?;
+    let cached_lib_path = tmp.path().join("cache").join(cache_key).join(format!(
+        "openvm-metered.{}",
+        std::env::consts::DLL_EXTENSION
+    ));
+    compiled_a.save_to_path(&cached_lib_path)?;
+    let (cached, cache_status) =
+        sdk.compile_or_load_metered_cached(&tmp.path().join("cache"), exe.clone())?;
+    assert_eq!(cache_status, MeteredArtifactCacheStatus::Hit);
+    let (cached_pv, cached_segments) = sdk.execute_metered(&cached, stdin.clone())?;
+    assert_eq!(baseline_pv, cached_pv);
+    assert_eq!(baseline_segments.len(), cached_segments.len());
+    drop(cached);
+
     let lib_path = compiled_a.save(tmp.path())?;
     drop(compiled_a);
+
+    let mut wrong_exe = (*exe).clone();
+    wrong_exe.pc_start = wrong_exe.pc_start.wrapping_add(4);
+    let wrong_exe_error = sdk
+        .load_compiled_metered(&lib_path, wrong_exe)
+        .err()
+        .expect("a cache entry for a different executable must be rejected");
+    assert!(wrong_exe_error
+        .to_string()
+        .contains("executable, VM shape, or toolchain changed"));
+
+    let metadata_path = metered_artifact_metadata_path(&lib_path);
+    let original_metadata = std::fs::read(&metadata_path)?;
+    let mut invalid_metadata: serde_json::Value = serde_json::from_slice(&original_metadata)?;
+    invalid_metadata["format_version"] = serde_json::json!(u32::MAX);
+    std::fs::write(
+        &metadata_path,
+        serde_json::to_vec_pretty(&invalid_metadata)?,
+    )?;
+    let version_error = sdk
+        .load_compiled_metered(&lib_path, exe.clone())
+        .err()
+        .expect("an unknown cache format must be rejected");
+    assert!(version_error
+        .to_string()
+        .contains("unsupported metered artifact format"));
+    std::fs::write(&metadata_path, &original_metadata)?;
+
+    let original_library = std::fs::read(&lib_path)?;
+    let mut corrupt_library = original_library.clone();
+    let last = corrupt_library
+        .last_mut()
+        .expect("the compiled shared library must not be empty");
+    *last ^= 1;
+    std::fs::write(&lib_path, &corrupt_library)?;
+    let digest_error = sdk
+        .load_compiled_metered(&lib_path, exe.clone())
+        .err()
+        .expect("a corrupted shared library must be rejected before loading");
+    assert!(digest_error
+        .to_string()
+        .contains("shared-library digest mismatch"));
+    std::fs::write(&lib_path, &original_library)?;
 
     let compiled_b = sdk.load_compiled_metered(&lib_path, exe)?;
     let (reloaded_pv, reloaded_segments) = sdk.execute_metered(&compiled_b, stdin)?;

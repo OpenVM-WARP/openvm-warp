@@ -315,6 +315,38 @@ fn test_exp_bits_len_rejects_nonzero_terminal_tail_on_last_row() {
     assert!(result.is_err());
 }
 
+#[test]
+fn merged_request_trace_matches_sequential_registration() {
+    let first = [
+        (F::from_u32(3), F::from_u32(5), 3usize, 0usize, 0u32),
+        (F::from_u32(7), F::from_u32(9), 4, 1, 2),
+    ];
+    let second = [
+        (F::from_u32(11), F::from_u32(13), 5usize, 2usize, 3u32),
+        (F::from_u32(17), F::from_u32(19), 6, 0, 0),
+    ];
+
+    let sequential = ExpBitsLenCpuTraceGenerator::default();
+    sequential.add_requests_with_shift(first.into_iter().chain(second));
+
+    let merged = ExpBitsLenCpuTraceGenerator::default();
+    merged.add_requests_with_shift(first);
+    let suffix = ExpBitsLenCpuTraceGenerator::default();
+    suffix.add_requests_with_shift(second);
+    merged.merge_from(suffix);
+
+    assert_eq!(
+        merged
+            .generate_trace_row_major(None)
+            .expect("merged trace")
+            .values,
+        sequential
+            .generate_trace_row_major(None)
+            .expect("sequential trace")
+            .values
+    );
+}
+
 #[cfg(feature = "cuda")]
 mod cuda_tests {
     use std::sync::Arc;

@@ -168,3 +168,17 @@ fn poseidon2_periphery_empty_trace() {
         );
     }
 }
+
+#[test]
+fn poseidon2_periphery_forced_height_pads_once_and_resets() {
+    let chip = Poseidon2PeripheryBaseChip::<BabyBear, 1>::new(Poseidon2Config::default());
+    let input = [BabyBear::ZERO; PERIPHERY_POSEIDON2_CHUNK_SIZE];
+    let _ = chip.compress_and_record(&input, &input);
+    chip.set_forced_height(128);
+
+    let padded: AirProvingContext<CpuBackend<TestSC>> = chip.generate_proving_ctx(());
+    assert_eq!(padded.common_main.height(), 128);
+
+    let reset: AirProvingContext<CpuBackend<TestSC>> = chip.generate_proving_ctx(());
+    assert_eq!(reset.common_main.height(), 0);
+}

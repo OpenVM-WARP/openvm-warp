@@ -19,7 +19,7 @@ use crate::{
         FinalPolyMleEvalBus, FinalPolyMleEvalMessage, FinalPolyQueryEvalBus,
         FinalPolyQueryEvalMessage, VerifyQueriesBus, VerifyQueriesBusMessage, WhirGammaBus,
         WhirGammaMessage, WhirQueryBus, WhirQueryBusMessage, WhirSumcheckBus,
-        WhirSumcheckBusMessage,
+        WhirSumcheckBusMessage, WhirTerminalBus, WhirTerminalMessage,
     },
 };
 
@@ -59,11 +59,21 @@ pub struct WhirRoundAir {
     pub verify_queries_bus: VerifyQueriesBus,
     pub final_poly_mle_eval_bus: FinalPolyMleEvalBus,
     pub final_poly_query_eval_bus: FinalPolyQueryEvalBus,
+    /// Enabled only by the multi-constraint owner.  Keeping this optional
+    /// preserves the legacy single-opening interaction multiset exactly.
+    pub terminal_bus: Option<WhirTerminalBus>,
     pub exp_bits_len_bus: ExpBitsLenBus,
 
     pub k: usize,
     pub num_rounds: usize,
     pub initial_log_domain_size: usize,
+    /// The initial oracle is the physical interleaving of a subgroup and one
+    /// multiplicative coset of that subgroup.  Its first fold therefore
+    /// leaves the subgroup generator unchanged; subsequent folds square it
+    /// exactly as in ordinary WHIR.
+    ///
+    /// This is setup-fixed verifier geometry, never proof metadata.
+    pub coefficient_two_coset_initial_domain: bool,
     pub final_poly_len: usize,
     pub pow_bits: usize,
     pub folding_pow_bits: usize,
@@ -150,9 +160,11 @@ impl WhirRoundAir {
             .when(is_enabled)
             .assert_eq(local.num_queries, expected_num_queries);
 
+        let initial_omega_log =
+            self.initial_log_domain_size - usize::from(self.coefficient_two_coset_initial_domain);
         let initial_omega = AB::Expr::from_prime_subfield(
             <<AB::Expr as PrimeCharacteristicRing>::PrimeSubfield as TwoAdicField>::two_adic_generator(
-                self.initial_log_domain_size,
+                initial_omega_log,
             ),
         );
         builder
@@ -162,9 +174,20 @@ impl WhirRoundAir {
         // Use the column (degree 1) instead of decoded expression (high degree) for constraints
         let whir_round: AB::Expr = local.whir_round.into();
         let is_same_proof = next.is_enabled - next.is_first_in_proof;
-        builder
-            .when(is_same_proof.clone())
-            .assert_eq(next.omega, local.omega * local.omega);
+        if self.coefficient_two_coset_initial_domain {
+            // The first physical domain is H union gH.  Folding the coset bit
+            // maps it to H, so rounds zero and one use the same generator.
+            builder
+                .when(is_same_proof.clone() * is_proof_start)
+                .assert_eq(next.omega, local.omega);
+            builder
+                .when(is_same_proof.clone() - is_proof_start)
+                .assert_eq(next.omega, local.omega * local.omega);
+        } else {
+            builder
+                .when(is_same_proof.clone())
+                .assert_eq(next.omega, local.omega * local.omega);
+        }
 
         NestedForLoopSubAir.eval(
             builder,
@@ -348,7 +371,7 @@ impl WhirRoundAir {
             local.gamma,
             is_enabled,
         );
-        builder.when(is_same_proof).assert_eq(
+        builder.when(is_same_proof.clone()).assert_eq(
             next.tidx,
             pow_tidx.clone() + AB::Expr::from_usize(query_pow_offset + D_EF) + local.num_queries,
         );
@@ -361,5 +384,21 @@ impl WhirRoundAir {
             },
             is_enabled,
         );
+
+        if let Some(terminal_bus) = self.terminal_bus {
+            let is_last_round = local.is_enabled - is_same_proof;
+            terminal_bus.send(
+                builder,
+                proof_idx,
+                WhirTerminalMessage {
+                    end_tidx: pow_tidx
+                        + AB::Expr::from_usize(query_pow_offset + D_EF)
+                        + local.num_queries,
+                    final_claim: local.next_claim.map(Into::into),
+                    final_aggregate: local.final_poly_mle_eval.map(Into::into),
+                },
+                is_last_round,
+            );
+        }
     }
 }

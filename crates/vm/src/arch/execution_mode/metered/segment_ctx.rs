@@ -20,6 +20,8 @@ pub struct Segment {
 #[derive(Clone, Copy, Debug)]
 pub struct SegmentationLimits {
     pub max_trace_height_bits: u8,
+    /// Optional maximum padded main-trace cells for each non-constant AIR.
+    pub max_trace_cells: Option<usize>,
     pub max_memory: usize,
     pub max_interactions: u32,
 }
@@ -41,7 +43,7 @@ pub struct SegmentationConfig {
     widths: Vec<usize>,
     interactions: Vec<usize>,
     need_rot: Vec<bool>,
-    max_trace_height: u32,
+    max_trace_heights: Vec<u32>,
     max_memory: usize,
     max_interactions: u32,
     #[serde(with = "ProvingMemoryConfigSerde")]
@@ -67,20 +69,39 @@ impl SegmentationConfig {
             u32::BITS
         );
 
-        let max_trace_height = 1u32
+        let global_max_trace_height = 1u32
             .checked_shl(u32::from(limits.max_trace_height_bits))
             .expect("max_trace_height_bits must fit in u32 trace height");
         assert!(
-            u64::from(max_trace_height) >= 2 * DEFAULT_SEGMENT_CHECK_INSNS,
+            u64::from(global_max_trace_height) >= 2 * DEFAULT_SEGMENT_CHECK_INSNS,
             "max_trace_height must be at least twice DEFAULT_SEGMENT_CHECK_INSNS"
         );
+        let max_trace_heights = widths
+            .iter()
+            .map(|&width| {
+                let cell_limited = limits.max_trace_cells.map_or(global_max_trace_height, |cells| {
+                    assert!(cells != 0, "max_trace_cells must be nonzero");
+                    if width == 0 {
+                        global_max_trace_height
+                    } else {
+                        let rows = (cells / width).min(global_max_trace_height as usize);
+                        assert!(
+                            rows >= 2 * DEFAULT_SEGMENT_CHECK_INSNS as usize,
+                            "max_trace_cells must permit at least twice DEFAULT_SEGMENT_CHECK_INSNS rows for every AIR"
+                        );
+                        1u32 << rows.ilog2()
+                    }
+                });
+                global_max_trace_height.min(cell_limited)
+            })
+            .collect();
 
         Self {
             air_names,
             widths,
             interactions,
             need_rot,
-            max_trace_height,
+            max_trace_heights,
             max_memory: limits.max_memory,
             max_interactions: limits.max_interactions,
             memory_config,
@@ -293,6 +314,8 @@ impl SegmentationCtx {
         debug_assert_eq!(trace_heights.len(), self.config.widths.len());
         debug_assert_eq!(trace_heights.len(), self.config.interactions.len());
         debug_assert_eq!(trace_heights.len(), self.config.need_rot.len());
+        debug_assert_eq!(trace_heights.len(), self.config.max_trace_heights.len());
+        debug_assert_eq!(trace_heights.len(), self.config.max_trace_heights.len());
 
         let mut counts = MeteredCounts::default();
         for (((&height, &width), &interactions), &need_rot) in trace_heights
@@ -447,13 +470,14 @@ impl SegmentationCtx {
         {
             // Only segment if the height is not constant and exceeds the maximum height after
             // padding
-            if !is_constant && padded_height > self.config.max_trace_height {
+            let max_trace_height = unsafe { *self.config.max_trace_heights.get_unchecked(i) };
+            if !is_constant && padded_height > max_trace_height {
                 let air_name = unsafe { self.config.air_names.get_unchecked(i) };
                 tracing::info!(
                     "overshoot: instret {:10} | height ({:8}) > max ({:8}) | chip {:3} ({}) ",
                     instret,
                     padded_height,
-                    self.config.max_trace_height,
+                    max_trace_height,
                     i,
                     air_name,
                 );
@@ -809,6 +833,7 @@ mod tests {
     fn small_segmentation_ctx() -> SegmentationCtx {
         let limits = SegmentationLimits {
             max_trace_height_bits: 11,
+            max_trace_cells: None,
             max_memory: 1,
             max_interactions: u32::MAX,
         };
@@ -828,6 +853,37 @@ mod tests {
             limits,
             memory_config,
         )
+    }
+
+    #[test]
+    fn per_air_cell_limit_caps_wide_dynamic_traces_without_lowering_global_height() {
+        let limits = SegmentationLimits {
+            max_trace_height_bits: 21,
+            max_trace_cells: Some(1 << 26),
+            max_memory: usize::MAX,
+            max_interactions: u32::MAX,
+        };
+        let memory_config = ProvingMemoryConfig {
+            base_field_size: 4,
+            extension_degree: 4,
+            log_blowup: 1,
+            l_skip: 4,
+            max_constraint_degree: 4,
+            cache_rs_code_matrix: false,
+        };
+        let ctx = SegmentationCtx::new(
+            vec!["wide".to_owned(), "narrow".to_owned()],
+            vec![2634, 10],
+            vec![0, 0],
+            vec![false, false],
+            limits,
+            memory_config,
+        );
+
+        assert_eq!(ctx.config.max_trace_heights, vec![1 << 14, 1 << 21]);
+        assert!(!ctx.should_segment(1, &[1 << 14, 1 << 21], &[false, false]));
+        assert!(ctx.should_segment(1, &[(1 << 14) + 1, 1], &[false, false]));
+        assert!(!ctx.should_segment(1, &[(1 << 14) + 1, 1], &[true, false]));
     }
 
     #[test]

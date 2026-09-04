@@ -11,7 +11,9 @@ autoexamples = false
 [dependencies]
 openvm-stark-backend = { workspace = true }
 openvm-stark-sdk = { workspace = true, features = ["cpu-backend"] }
+openvm-cpu-backend = { workspace = true }
 openvm-cuda-backend = { workspace = true, optional = true }
+openvm-cuda-common = { workspace = true, optional = true }
 
 openvm-build = { workspace = true }
 openvm-circuit = { workspace = true }
@@ -44,12 +46,19 @@ itertools = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_with = { workspace = true, features = ["hex"] }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+zstd = { workspace = true }
+libc = "0.2"
 metrics = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+openvm-stark-backend = { workspace = true, features = ["test-utils"] }
+openvm-circuit-primitives = { workspace = true }
+openvm-riscv-circuit = { workspace = true, features = ["test-utils"] }
+openvm-riscv-transpiler = { workspace = true }
 
 [features]
 default = ["parallel", "jemalloc"]
@@ -109,6 +118,7 @@ jemalloc-prof = ["openvm-circuit/jemalloc-prof"]
 
 cuda = [
     "dep:openvm-cuda-backend",
+    "dep:openvm-cuda-common",
     "openvm-circuit/cuda",
     "openvm-sdk-config/cuda",
     "openvm-continuations/cuda",

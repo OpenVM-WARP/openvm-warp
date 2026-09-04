@@ -117,6 +117,7 @@ pub struct SymbolicExpressionAir<F: Field> {
 
     pub cnt_proofs: usize,
     pub dag_commit_subair: Option<Arc<DagCommitSubAir<F>>>,
+    pub includes_air: bool,
 }
 // No columns provided: width is dynamic, depending on `cnt_proofs` and on whether
 // `dag_commit_subair` is present, and mixes several column structs.
@@ -130,7 +131,12 @@ impl<F: Field> SymbolicExpressionAir<F> {
 
 impl<F: Field> BaseAirWithPublicValues<F> for SymbolicExpressionAir<F> {
     fn num_public_values(&self) -> usize {
-        if self.has_cached() {
+        if self.has_cached()
+            || self
+                .dag_commit_subair
+                .as_ref()
+                .is_some_and(|subair| !subair.exposes_public_commit())
+        {
             0
         } else {
             DagCommitPvs::<F>::width()
@@ -466,16 +472,18 @@ where
                 },
                 is_bus_index * air_present.clone(),
             );
-            self.constraints_folding_bus.send(
-                builder,
-                proof_idx,
-                ConstraintsFoldingMessage {
-                    air_idx: cached_cols.air_idx.into(),
-                    constraint_idx: cached_cols.constraint_idx.into(),
-                    value: value.clone(),
-                },
-                cached_cols.is_constraint * air_present,
-            );
+            if self.includes_air {
+                self.constraints_folding_bus.send(
+                    builder,
+                    proof_idx,
+                    ConstraintsFoldingMessage {
+                        air_idx: cached_cols.air_idx.into(),
+                        constraint_idx: cached_cols.constraint_idx.into(),
+                        value: value.clone(),
+                    },
+                    cached_cols.is_constraint * air_present,
+                );
+            }
         }
     }
 }

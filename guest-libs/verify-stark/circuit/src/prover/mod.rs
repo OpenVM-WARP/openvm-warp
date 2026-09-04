@@ -141,6 +141,7 @@ where
                 continuations_enabled: true,
                 final_state_bus_enabled: true,
                 has_cached: true,
+                tail_mode: openvm_recursion_circuit::system::VerifierTailMode::Complete,
             },
         );
         let engine = E::new(system_params);
@@ -193,6 +194,7 @@ where
                 continuations_enabled: true,
                 final_state_bus_enabled: true,
                 has_cached: true,
+                tail_mode: openvm_recursion_circuit::system::VerifierTailMode::Complete,
             },
         );
         let def_hook_commit = def_hook_commit.map(Into::into);

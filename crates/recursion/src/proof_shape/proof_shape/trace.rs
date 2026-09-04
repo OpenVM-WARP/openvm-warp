@@ -8,8 +8,15 @@ use p3_matrix::dense::RowMajorMatrix;
 
 use crate::{
     primitives::{pow::PowerCheckerCpuTraceGenerator, range::RangeCheckerCpuTraceGenerator},
-    proof_shape::proof_shape::air::{
-        borrow_var_cols_mut, decompose_f, decompose_usize, ProofShapeCols, ProofShapeVarColsMut,
+    proof_shape::{
+        proof_shape::{
+            air::{
+                borrow_var_cols_mut, decompose_f, decompose_usize, ProofShapeCols,
+                ProofShapeVarColsMut,
+            },
+            fill_metadata_cols, ProofShapeMetadataCols,
+        },
+        AirMetadata,
     },
     system::{Preflight, POW_CHECKER_HEIGHT},
     tracegen::RowMajorChip,
@@ -36,12 +43,78 @@ pub(crate) fn compute_air_shape_lookup_counts(
         .collect::<Vec<_>>()
 }
 
+/// Gap between consecutive equal-height AIR indices, checked against what the AIR can carry.
+///
+/// `ProofShapeAir` range-checks this against its dedicated gap-width bus, so a gap past
+/// `2^gap_bits - 1` cannot be proven. That bound -- not the AIR *count* -- is the real limit,
+/// which is why large child keys are valid when their equal-height runs stay inside the selected
+/// envelope.
+///
+/// Panicking here names the two indices. The alternative is an unprovable circuit that keys
+/// perfectly well and fails much later as an unbalanced LogUp sum on the range bus.
+///
+/// The CUDA path is bounded structurally: both indices are below
+/// the configured maximum child AIR count, whose power-of-two value matches the largest histogram
+/// width.
+fn air_idx_gap(idx: usize, next_idx: usize, gap_bits: usize) -> usize {
+    let gap = next_idx - idx - 1;
+    let max_gap = (1usize << gap_bits) - 1;
+    assert!(
+        gap <= max_gap,
+        "AIR-index gap {gap} between {idx} and {next_idx} exceeds the {max_gap} \
+         that ProofShapeAir's gap range check can carry"
+    );
+    gap
+}
+
+#[derive(Clone)]
+pub(in crate::proof_shape) enum ProofShapeGapRangeCheckerCpu {
+    Bits10(Arc<RangeCheckerCpuTraceGenerator<10>>),
+    Bits12(Arc<RangeCheckerCpuTraceGenerator<12>>),
+}
+
+impl ProofShapeGapRangeCheckerCpu {
+    pub fn new(bits: usize) -> Self {
+        match bits {
+            10 => Self::Bits10(Arc::new(RangeCheckerCpuTraceGenerator::default())),
+            12 => Self::Bits12(Arc::new(RangeCheckerCpuTraceGenerator::default())),
+            _ => panic!("unsupported proof-shape AIR-index gap width {bits}"),
+        }
+    }
+
+    fn bits(&self) -> usize {
+        match self {
+            Self::Bits10(_) => 10,
+            Self::Bits12(_) => 12,
+        }
+    }
+
+    fn add_count(&self, value: usize) {
+        match self {
+            Self::Bits10(generator) => generator.add_count(value),
+            Self::Bits12(generator) => generator.add_count(value),
+        }
+    }
+
+    pub fn generate_trace_row_major(&self) -> RowMajorMatrix<F> {
+        match self {
+            Self::Bits10(generator) => generator.generate_trace_row_major(),
+            Self::Bits12(generator) => generator.generate_trace_row_major(),
+        }
+    }
+}
+
 #[derive(derive_new::new)]
 pub(in crate::proof_shape) struct ProofShapeChip<const NUM_LIMBS: usize, const LIMB_BITS: usize> {
     idx_encoder: Arc<Encoder>,
+    metadata: Option<Arc<[AirMetadata]>>,
     min_cached_idx: usize,
     max_cached: usize,
     range_checker: Arc<RangeCheckerCpuTraceGenerator<LIMB_BITS>>,
+    /// Separate table for the AIR-index gap, which is checked at
+    /// the selected AIR-index gap width rather than `LIMB_BITS`. The range bus is keyed
+    /// `(value, max_bits)` and a table publishes only its own width, so the two cannot share.
+    gap_range_checker: ProofShapeGapRangeCheckerCpu,
     pow_checker: Arc<PowerCheckerCpuTraceGenerator<2, POW_CHECKER_HEIGHT>>,
 }
 
@@ -71,13 +144,19 @@ impl<const NUM_LIMBS: usize, const LIMB_BITS: usize> RowMajorChip<F>
             num_valid_rows.next_power_of_two()
         };
         let idx_encoder = &self.idx_encoder;
+        let metadata = self.metadata.as_deref();
         let min_cached_idx = self.min_cached_idx;
         let max_cached = self.max_cached;
         let range_checker = &self.range_checker;
+        let gap_range_checker = &self.gap_range_checker;
         let pow_checker = &self.pow_checker;
         let num_airs = child_vk.inner.per_air.len();
         let cols_width = ProofShapeCols::<usize, NUM_LIMBS>::width();
-        let total_width = self.idx_encoder.width() + cols_width + self.max_cached * DIGEST_SIZE;
+        let selector_width = metadata.map_or_else(
+            || self.idx_encoder.width(),
+            |_| ProofShapeMetadataCols::<F>::width(),
+        );
+        let total_width = selector_width + cols_width + self.max_cached * DIGEST_SIZE;
         let l_skip = child_vk.inner.params.l_skip;
 
         debug_assert_eq!(proofs.len(), preflights.len());
@@ -126,7 +205,11 @@ impl<const NUM_LIMBS: usize, const LIMB_BITS: usize> RowMajorChip<F>
                     let diff = vdata.log_height - next_vdata.log_height;
                     cols.is_height_equal_to_next = F::from_bool(diff == 0);
                     if diff == 0 {
-                        range_checker.add_count(*next_idx - *idx - 1);
+                        gap_range_checker.add_count(air_idx_gap(
+                            *idx,
+                            *next_idx,
+                            gap_range_checker.bits(),
+                        ));
                     } else {
                         pow_checker.add_range(diff - 1);
                     }
@@ -150,19 +233,21 @@ impl<const NUM_LIMBS: usize, const LIMB_BITS: usize> RowMajorChip<F>
                 cols.n_max = F::from_usize(preflight.proof_shape.n_max);
                 cols.num_air_id_lookups = F::from_usize(bc_air_shape_lookups[*idx]);
 
-                let vcols: &mut ProofShapeVarColsMut<'_, F> = &mut borrow_var_cols_mut(
-                    &mut chunk[cols_width..],
-                    idx_encoder.width(),
-                    max_cached,
-                );
+                let vcols: &mut ProofShapeVarColsMut<'_, F> =
+                    &mut borrow_var_cols_mut(&mut chunk[cols_width..], selector_width, max_cached);
 
-                for (i, flag) in idx_encoder
-                    .get_flag_pt(*idx)
-                    .iter()
-                    .map(|x| F::from_u32(*x))
-                    .enumerate()
-                {
-                    vcols.idx_flags[i] = flag;
+                if let Some(metadata) = metadata {
+                    let selected: &mut ProofShapeMetadataCols<F> = vcols.selector.borrow_mut();
+                    fill_metadata_cols(selected, *idx, &metadata[*idx], l_skip, min_cached_idx)?;
+                } else {
+                    for (i, flag) in idx_encoder
+                        .get_flag_pt(*idx)
+                        .iter()
+                        .map(|x| F::from_u32(*x))
+                        .enumerate()
+                    {
+                        vcols.selector[i] = flag;
+                    }
                 }
 
                 for (i, commit) in vdata.cached_commitments.iter().enumerate() {
@@ -231,26 +316,32 @@ impl<const NUM_LIMBS: usize, const LIMB_BITS: usize> RowMajorChip<F>
                     let next_idx = (idx + 1..num_airs)
                         .find(|next_idx| proof.trace_vdata[*next_idx].is_none())
                         .unwrap();
-                    range_checker.add_count(next_idx - idx - 1);
+                    gap_range_checker.add_count(air_idx_gap(
+                        idx,
+                        next_idx,
+                        gap_range_checker.bits(),
+                    ));
                 }
 
                 cols.total_interactions_limbs = total_interactions_f;
                 cols.n_max = F::from_usize(preflight.proof_shape.n_max);
                 cols.num_air_id_lookups = F::from_usize(bc_air_shape_lookups[idx]);
 
-                let vcols: &mut ProofShapeVarColsMut<'_, F> = &mut borrow_var_cols_mut(
-                    &mut chunk[cols_width..],
-                    idx_encoder.width(),
-                    max_cached,
-                );
+                let vcols: &mut ProofShapeVarColsMut<'_, F> =
+                    &mut borrow_var_cols_mut(&mut chunk[cols_width..], selector_width, max_cached);
 
-                for (i, flag) in idx_encoder
-                    .get_flag_pt(idx)
-                    .iter()
-                    .map(|x| F::from_u32(*x))
-                    .enumerate()
-                {
-                    vcols.idx_flags[i] = flag;
+                if let Some(metadata) = metadata {
+                    let selected: &mut ProofShapeMetadataCols<F> = vcols.selector.borrow_mut();
+                    fill_metadata_cols(selected, idx, &metadata[idx], l_skip, min_cached_idx)?;
+                } else {
+                    for (i, flag) in idx_encoder
+                        .get_flag_pt(idx)
+                        .iter()
+                        .map(|x| F::from_u32(*x))
+                        .enumerate()
+                    {
+                        vcols.selector[i] = flag;
+                    }
                 }
 
                 if idx == min_cached_idx {
@@ -351,11 +442,8 @@ impl<const NUM_LIMBS: usize, const LIMB_BITS: usize> RowMajorChip<F>
                 pow_checker.add_range(preflight.proof_shape.n_max.abs_diff(n_logup));
 
                 // We store the pre-hash of the child vk in the summary row
-                let vcols: &mut ProofShapeVarColsMut<'_, F> = &mut borrow_var_cols_mut(
-                    &mut chunk[cols_width..],
-                    idx_encoder.width(),
-                    max_cached,
-                );
+                let vcols: &mut ProofShapeVarColsMut<'_, F> =
+                    &mut borrow_var_cols_mut(&mut chunk[cols_width..], selector_width, max_cached);
                 vcols.cached_commits[max_cached - 1] = child_vk.pre_hash;
             }
         }

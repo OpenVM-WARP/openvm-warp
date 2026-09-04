@@ -4,7 +4,7 @@ use openvm_circuit::{
     arch::{AddressSpaceHostLayout, MemoryConfig, ADDR_SPACE_OFFSET, BLOCK_FE_WIDTH},
     system::{
         memory::{persistent::BLOCKS_PER_LEAF, AddressMap},
-        TouchedMemory,
+        TouchedMemory, BOUNDARY_AIR_ID,
     },
 };
 use openvm_circuit_primitives::Chip;
@@ -15,7 +15,10 @@ use openvm_cuda_common::{
     memory_manager::MemTracker,
     stream::GpuDeviceCtx,
 };
-use openvm_stark_backend::{p3_field::PrimeCharacteristicRing, prover::AirProvingContext};
+use openvm_stark_backend::{
+    p3_field::{PrimeCharacteristicRing, PrimeField32},
+    prover::AirProvingContext,
+};
 use tracing::instrument;
 
 use super::{
@@ -40,6 +43,8 @@ pub struct MemoryInventoryGPU {
     pub hasher_chip: Arc<Poseidon2PeripheryChipGPU>,
     pub initial_memory: Vec<Arc<DeviceBuffer<u8>>>,
     pub merkle_records: Option<DeviceBuffer<u32>>,
+    /// One-shot setup-owned Merkle trace height for protocol-v19 segments.
+    forced_merkle_height: Option<usize>,
     #[cfg(feature = "metrics")]
     pub(super) unpadded_merkle_height: usize,
 }
@@ -80,6 +85,7 @@ impl MemoryInventoryGPU {
             hasher_chip,
             initial_memory: Vec::new(),
             merkle_records: None,
+            forced_merkle_height: None,
             #[cfg(feature = "metrics")]
             unpadded_merkle_height: 0,
         }
@@ -146,10 +152,22 @@ impl MemoryInventoryGPU {
     ) -> Vec<AirProvingContext<GpuBackend>> {
         let mem = MemTracker::start("generate mem proving ctxs");
         let partition = touched_memory;
+        if std::env::var_os("OPENVM_WARP_DEBUG_SEGMENT").is_some() {
+            eprintln!(
+                "WARP CUDA memory inventory: touched_blocks={} first_address={:?}",
+                partition.len(),
+                partition.first().map(|record| record.0)
+            );
+        }
         let boundary_records = if partition.is_empty() {
             let leftmost_values = 'left: {
                 let mut res = [F::ZERO; DIGEST_WIDTH];
                 if self.initial_memory[ADDR_SPACE_OFFSET as usize].is_empty() {
+                    if std::env::var_os("OPENVM_WARP_DEBUG_SEGMENT").is_some() {
+                        eprintln!(
+                            "WARP CUDA empty memory: leftmost address space has no allocated cells"
+                        );
+                    }
                     break 'left res;
                 }
                 let layout =
@@ -171,6 +189,15 @@ impl MemoryInventoryGPU {
                 }
                 res
             };
+            if std::env::var_os("OPENVM_WARP_DEBUG_SEGMENT").is_some() {
+                eprintln!(
+                    "WARP CUDA empty memory: leftmost_values={:?}",
+                    leftmost_values
+                        .iter()
+                        .map(|value| value.as_canonical_u32())
+                        .collect::<Vec<_>>()
+                );
+            }
 
             let values_u32 = leftmost_values.map(Self::field_to_raw_u32);
             let merkle_record = MemoryMerkleRecord {
@@ -303,12 +330,13 @@ impl MemoryInventoryGPU {
         self.prepare_poseidon2_records(boundary_records, unpadded_merkle_height);
         mem.tracing_info("merkle update");
         self.merkle_tree.finalize();
-        let merkle_proof_ctx = self.merkle_tree.update_with_touched_blocks(
+        let merkle_proof_ctx = self.merkle_tree.update_with_touched_blocks_at_height(
             unpadded_merkle_height,
             self.merkle_records
                 .as_ref()
                 .expect("missing merkle records"),
             partition.is_empty(),
+            self.forced_merkle_height.take(),
         );
         mem.tracing_info("boundary tracegen");
         let ret = vec![self.boundary.generate_proving_ctx(()), merkle_proof_ctx];
@@ -317,6 +345,29 @@ impl MemoryInventoryGPU {
         self.initial_memory = Vec::new();
         mem.emit_metrics();
         ret
+    }
+
+    /// Pins the heights of the memory system's variable-height AIRs for the next segment.
+    ///
+    /// `heights` is the whole AIR-ordered height vector. The Poseidon2 periphery sits at
+    /// `len - 2`, which is where metered execution accounts for it
+    /// (`execution_mode::metered::memory_ctx`); reading it from the same end keeps one
+    /// convention rather than two that can drift apart.
+    ///
+    /// The metered plan is an upper bound, not necessarily the natural CUDA
+    /// trace height. Pin Boundary, Merkle, and Poseidon2 exactly as the CPU
+    /// inventory does so setup and proving use one homogeneous shard key.
+    pub fn set_override_trace_heights(&mut self, heights: &[u32]) {
+        let boundary = heights[BOUNDARY_AIR_ID] as usize;
+        let merkle = heights[BOUNDARY_AIR_ID + 1] as usize;
+        let poseidon2 = heights[heights.len() - 2];
+        self.boundary.set_forced_height(boundary);
+        assert!(
+            merkle.is_power_of_two(),
+            "forced Merkle height must be a power of two"
+        );
+        self.forced_merkle_height = Some(merkle);
+        self.hasher_chip.set_forced_height(poseidon2 as usize);
     }
 
     fn prepare_poseidon2_records(&self, boundary_records: usize, merkle_height: usize) {

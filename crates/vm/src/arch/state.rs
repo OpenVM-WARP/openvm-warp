@@ -168,7 +168,7 @@ where
     /// linear storage. Returns `N` bytes.
     #[inline(always)]
     pub fn vm_read_bytes<const N: usize>(&mut self, addr_space: u32, byte_ptr: u32) -> [u8; N] {
-        self.ctx.on_memory_operation(addr_space, byte_ptr, N as u32);
+        self.ctx.on_memory_read(addr_space, byte_ptr, N as u32);
         self.host_read_bytes(addr_space, byte_ptr)
     }
 
@@ -192,7 +192,7 @@ where
         addr_space: u32,
         ptr: u32,
     ) -> [T; N] {
-        self.ctx.on_memory_operation(addr_space, ptr, N as u32);
+        self.ctx.on_memory_read(addr_space, ptr, N as u32);
         self.host_read(addr_space, ptr)
     }
 
@@ -215,7 +215,7 @@ where
         ptr: u32,
         len: usize,
     ) -> &[T] {
-        self.ctx.on_memory_operation(addr_space, ptr, len as u32);
+        self.ctx.on_memory_read(addr_space, ptr, len as u32);
         self.host_read_slice(addr_space, ptr, len)
     }
 

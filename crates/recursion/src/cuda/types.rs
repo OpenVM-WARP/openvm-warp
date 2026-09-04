@@ -1,4 +1,4 @@
-use openvm_stark_sdk::config::baby_bear_poseidon2::F;
+use openvm_stark_sdk::config::baby_bear_poseidon2::{Digest, F};
 
 #[repr(C)]
 #[derive(Debug, Default)]
@@ -33,6 +33,13 @@ pub struct AirData {
     pub num_interactions_per_row: usize,
     pub total_width: usize,
     pub has_preprocessed: bool,
+    pub is_required: bool,
+    pub need_rot: bool,
+    pub num_public_values: usize,
+    pub common_main_width: usize,
+    pub preprocessed_width: usize,
+    pub preprocessed_log_height: usize,
+    pub preprocessed_commit: Digest,
 }
 
 #[repr(C)]

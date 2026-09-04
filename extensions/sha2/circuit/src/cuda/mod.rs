@@ -3,10 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use openvm_circuit::{
-    arch::{DenseRecordArena, RecordSeeker},
-    utils::next_power_of_two_or_zero,
-};
+use openvm_circuit::arch::{DenseRecordArena, RecordSeeker};
 use openvm_circuit_primitives::{
     bitwise_op_lookup::BitwiseOperationLookupChipGPU, var_range::VariableRangeCheckerChipGPU, Chip,
 };
@@ -55,10 +52,8 @@ where
     C: Sha2Config,
 {
     fn generate_proving_ctx(&self, mut arena: DenseRecordArena) -> AirProvingContext<GpuBackend> {
+        let forced_height = arena.forced_height();
         let records = arena.allocated_mut();
-        if records.is_empty() {
-            return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
-        }
 
         let mut record_offsets = Vec::<usize>::new();
         let mut offset = 0usize;
@@ -72,7 +67,11 @@ where
         }
 
         let num_records = record_offsets.len();
-        let trace_height = next_power_of_two_or_zero(num_records);
+        let trace_height = DenseRecordArena::resolve_trace_height(forced_height, num_records);
+        if trace_height == 0 {
+            *self.records.lock().unwrap() = None;
+            return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
+        }
         let device_ctx = &self.range_checker.device_ctx;
         let trace =
             DeviceMatrix::<F>::with_capacity_on(trace_height, C::MAIN_CHIP_WIDTH, device_ctx);
@@ -133,31 +132,32 @@ pub struct Sha2BlockHasherChipGpu<C: Sha2Config> {
     _marker: PhantomData<C>,
 }
 
-impl<C, R> Chip<R, GpuBackend> for Sha2BlockHasherChipGpu<C>
+impl<C> Chip<DenseRecordArena, GpuBackend> for Sha2BlockHasherChipGpu<C>
 where
     C: Sha2Config,
 {
     /// We don't use the record arena associated with this chip. Instead, we will use the record
     /// arena provided by the main chip, which will be passed to this chip after the main chip's
     /// tracegen is done.
-    fn generate_proving_ctx(&self, _: R) -> AirProvingContext<GpuBackend> {
+    fn generate_proving_ctx(&self, arena: DenseRecordArena) -> AirProvingContext<GpuBackend> {
         let mut records = self.records.lock().unwrap();
-        if records.is_none() {
+        let shared = records.take();
+        let num_records = shared.as_ref().map_or(0, |shared| shared.num_records);
+        let rows_used = num_records * C::ROWS_PER_BLOCK;
+        let trace_height = arena.trace_height_for_rows(rows_used);
+        if trace_height == 0 {
             return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
         }
-
         let Sha2SharedRecordsGpu {
             d_records,
             d_record_offsets,
             num_records,
-        } = records.take().unwrap();
+        } = shared.unwrap_or_else(|| Sha2SharedRecordsGpu {
+            d_records: DeviceBuffer::new(),
+            d_record_offsets: DeviceBuffer::new(),
+            num_records: 0,
+        });
 
-        if num_records == 0 {
-            return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
-        }
-
-        let rows_used = num_records * C::ROWS_PER_BLOCK;
-        let trace_height = next_power_of_two_or_zero(rows_used);
         let device_ctx = &self.bitwise_lookup.device_ctx;
         let trace =
             DeviceMatrix::<F>::with_capacity_on(trace_height, C::BLOCK_HASHER_WIDTH, device_ctx);

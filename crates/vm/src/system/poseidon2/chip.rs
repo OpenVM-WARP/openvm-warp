@@ -1,6 +1,6 @@
 use std::{
     array,
-    sync::atomic::{AtomicBool, AtomicU32},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
 };
 
 use dashmap::DashMap;
@@ -18,6 +18,11 @@ pub struct Poseidon2PeripheryBaseChip<F: VmField, const SBOX_REGISTERS: usize> {
     pub subchip: Poseidon2SubChip<F, SBOX_REGISTERS>,
     pub records: DashMap<[F; PERIPHERY_POSEIDON2_WIDTH], AtomicU32, FxBuildHasher>,
     pub nonempty: AtomicBool,
+    /// Optional exact trace height for the next proving context. Native-WARP
+    /// plans from metered execution are conservative because duplicate hash
+    /// inputs are coalesced here; pinning preserves the setup-owned shard
+    /// shape while retaining zero-multiplicity padding rows.
+    pub forced_height: AtomicUsize,
 }
 
 impl<F: VmField, const SBOX_REGISTERS: usize> Poseidon2PeripheryBaseChip<F, SBOX_REGISTERS> {
@@ -27,7 +32,20 @@ impl<F: VmField, const SBOX_REGISTERS: usize> Poseidon2PeripheryBaseChip<F, SBOX
             subchip,
             records: DashMap::default(),
             nonempty: AtomicBool::new(false),
+            forced_height: AtomicUsize::new(0),
         }
+    }
+
+    pub fn set_forced_height(&self, height: usize) {
+        assert!(
+            height == 0 || height.is_power_of_two(),
+            "forced Poseidon2 trace height {height} must be zero or a power of two"
+        );
+        self.forced_height.store(height, Ordering::Release);
+    }
+
+    pub(crate) fn take_forced_height(&self) -> usize {
+        self.forced_height.swap(0, Ordering::AcqRel)
     }
 }
 

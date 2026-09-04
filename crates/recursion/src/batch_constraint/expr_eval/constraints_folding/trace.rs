@@ -48,7 +48,7 @@ impl ConstraintsFoldingBlob {
         for (pidx, preflight) in preflights.iter().enumerate() {
             let lambda_tidx = preflight.batch_constraint.lambda_tidx;
             let lambda = EF::from_basis_coefficients_slice(
-                &preflight.transcript.values()[lambda_tidx..lambda_tidx + D_EF],
+                preflight.transcript_values_at(lambda_tidx, D_EF),
             )
             .unwrap();
 
@@ -125,7 +125,7 @@ impl RowMajorChip<F> for ConstraintsFoldingTraceGenerator {
         let mut cur_height = 0;
         for (pidx, preflight) in preflights.iter().enumerate() {
             let lambda_tidx = preflight.batch_constraint.lambda_tidx;
-            let lambda_slice = &preflight.transcript.values()[lambda_tidx..lambda_tidx + D_EF];
+            let lambda_slice = preflight.transcript_values_at(lambda_tidx, D_EF);
             let records = &blob.records[pidx];
 
             trace[cur_height * width..(cur_height + records.len()) * width]
@@ -231,7 +231,7 @@ pub(in crate::batch_constraint) mod cuda {
             for (pidx, preflight) in preflights.iter().enumerate() {
                 let lambda_tidx = preflight.cpu.batch_constraint.lambda_tidx;
                 let lambda = EF::from_basis_coefficients_slice(
-                    &preflight.cpu.transcript.values()[lambda_tidx..lambda_tidx + D_EF],
+                    preflight.cpu.transcript_values_at(lambda_tidx, D_EF),
                 )
                 .unwrap();
 

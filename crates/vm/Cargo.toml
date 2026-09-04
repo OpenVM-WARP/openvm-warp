@@ -31,6 +31,7 @@ openvm-cuda-backend = { workspace = true, optional = true }
 
 itertools.workspace = true
 tracing.workspace = true
+libc = "0.2"
 derive-new.workspace = true
 derive_more = { workspace = true, features = ["from"] }
 backtrace.workspace = true

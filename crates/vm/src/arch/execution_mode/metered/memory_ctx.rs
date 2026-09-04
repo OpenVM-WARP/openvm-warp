@@ -156,6 +156,11 @@ pub struct PageAccess {
     pub page_id: u32,
     /// Bit `i` is set when leaf `i` inside this 64-leaf page was touched.
     pub leaf_mask: u64,
+    /// Subset of `leaf_mask` whose leaves may have been modified.
+    ///
+    /// A zero mask identifies a read-only access. Unknown/custom accesses are recorded as writes
+    /// so this metadata can only overestimate the Poseidon2 trace height.
+    pub write_mask: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -319,11 +324,14 @@ fn local_merkle_nodes_added_leaf(old_mask: u64, leaf: u32) -> u32 {
 pub struct MemoryCtx {
     memory_dimensions: MemoryDimensions,
     pub page_tracker: MemoryPageTracker,
+    written_page_tracker: MemoryPageTracker,
     pub page_indices_since_checkpoint: Vec<PageAccess>,
     pub page_indices_since_checkpoint_len: usize,
     page_indices_applied_len: usize,
     pending_leaves: u32,
     pending_merkle_nodes: u32,
+    pending_written_leaves: u32,
+    pending_written_merkle_nodes: u32,
 }
 
 impl MemoryCtx {
@@ -337,11 +345,14 @@ impl MemoryCtx {
         Self {
             memory_dimensions,
             page_tracker: MemoryPageTracker::new(upper_height),
+            written_page_tracker: MemoryPageTracker::new(upper_height),
             page_indices_since_checkpoint: Vec::with_capacity(checkpoint_capacity),
             page_indices_since_checkpoint_len: 0,
             page_indices_applied_len: 0,
             pending_leaves: 0,
             pending_merkle_nodes: 0,
+            pending_written_leaves: 0,
+            pending_written_merkle_nodes: 0,
         }
     }
 
@@ -356,6 +367,7 @@ impl MemoryCtx {
             RV64_REGISTER_AS,
             0,
             (RV64_NUM_REGISTERS * RV64_REGISTER_NUM_LIMBS) as u32,
+            true,
         );
     }
 
@@ -368,6 +380,7 @@ impl MemoryCtx {
         address_space: u32,
         ptr: u32,
         size: u32,
+        is_write: bool,
     ) {
         let end_ptr = ptr + size - 1;
         let leaf_bits = if address_space == DEFERRAL_AS {
@@ -393,6 +406,7 @@ impl MemoryCtx {
             self.record_page_access_no_len_update(
                 start_page_id,
                 1u64 << (start_leaf_id & ((1 << PAGE_BITS) - 1)),
+                is_write,
             );
             self.page_indices_since_checkpoint_len = self.page_indices_since_checkpoint.len();
             return;
@@ -414,13 +428,13 @@ impl MemoryCtx {
             let start = start_leaf_id.max(page_start) - page_start;
             let end = end_leaf_id.min(page_end) - page_start;
             let leaf_mask = leaf_mask_range(start, end);
-            self.record_page_access_no_len_update(page_id, leaf_mask);
+            self.record_page_access_no_len_update(page_id, leaf_mask, is_write);
         }
         self.page_indices_since_checkpoint_len = self.page_indices_since_checkpoint.len();
     }
 
     #[inline(always)]
-    fn record_page_access_no_len_update(&mut self, page_id: u32, leaf_mask: u64) {
+    fn record_page_access_no_len_update(&mut self, page_id: u32, leaf_mask: u64, is_write: bool) {
         debug_assert!(leaf_mask != 0);
         let len = self.page_indices_since_checkpoint.len();
         if len != 0 {
@@ -429,10 +443,15 @@ impl MemoryCtx {
                 self.page_indices_since_checkpoint
                     .get_unchecked_mut(len - 1)
             };
-            if prev.page_id == page_id {
+            if prev.page_id == page_id && len > self.page_indices_applied_len {
                 // Consecutive accesses to the same page merge in-place; the
-                // tracker later deduplicates non-consecutive repeats.
+                // tracker later deduplicates non-consecutive repeats. Do not mutate an already
+                // applied entry: a later read can add touched leaves and a later write can add a
+                // write mask even when the touched mask was already present.
                 prev.leaf_mask |= leaf_mask;
+                if is_write {
+                    prev.write_mask |= leaf_mask;
+                }
                 return;
             }
         }
@@ -446,7 +465,11 @@ impl MemoryCtx {
             self.page_indices_since_checkpoint
                 .as_mut_ptr()
                 .add(len)
-                .write(PageAccess { page_id, leaf_mask });
+                .write(PageAccess {
+                    page_id,
+                    leaf_mask,
+                    write_mask: if is_write { leaf_mask } else { 0 },
+                });
             self.page_indices_since_checkpoint.set_len(len + 1);
         }
     }
@@ -464,11 +487,19 @@ impl MemoryCtx {
             // SAFETY: i is bounded by accesses.len().
             let access = unsafe { *ptr.add(i) };
             debug_assert!(access.leaf_mask != 0);
+            debug_assert_eq!(access.write_mask & !access.leaf_mask, 0);
             let page_id = page_offset + access.page_id;
             let (leaves, merkle_nodes) =
                 self.page_tracker.insert(page_id as usize, access.leaf_mask);
             self.pending_leaves += leaves;
             self.pending_merkle_nodes += merkle_nodes;
+            if access.write_mask != 0 {
+                let (written_leaves, written_merkle_nodes) = self
+                    .written_page_tracker
+                    .insert(page_id as usize, access.write_mask);
+                self.pending_written_leaves += written_leaves;
+                self.pending_written_merkle_nodes += written_merkle_nodes;
+            }
         }
     }
 
@@ -476,11 +507,14 @@ impl MemoryCtx {
     #[inline(always)]
     pub(crate) fn reset_segment_without_replay(&mut self, trace_heights: &mut [u32]) {
         self.page_tracker.clear();
+        self.written_page_tracker.clear();
         self.page_indices_since_checkpoint.clear();
         self.page_indices_since_checkpoint_len = 0;
         self.page_indices_applied_len = 0;
         self.pending_leaves = 0;
         self.pending_merkle_nodes = 0;
+        self.pending_written_leaves = 0;
+        self.pending_written_merkle_nodes = 0;
 
         // Reset trace heights for memory chips as 0
         // SAFETY: BOUNDARY_AIR_ID and MERKLE_AIR_ID are compile-time constants within bounds
@@ -499,9 +533,12 @@ impl MemoryCtx {
     #[inline(always)]
     pub(crate) fn initialize_segment(&mut self, trace_heights: &mut [u32]) {
         self.page_tracker.clear();
+        self.written_page_tracker.clear();
         self.page_indices_applied_len = 0;
         self.pending_leaves = 0;
         self.pending_merkle_nodes = 0;
+        self.pending_written_leaves = 0;
+        self.pending_written_merkle_nodes = 0;
 
         // Reset trace heights for memory chips as 0
         // SAFETY: BOUNDARY_AIR_ID and MERKLE_AIR_ID are compile-time constants within bounds
@@ -530,6 +567,8 @@ impl MemoryCtx {
         self.page_indices_applied_len = 0;
         self.pending_leaves = 0;
         self.pending_merkle_nodes = 0;
+        self.pending_written_leaves = 0;
+        self.pending_written_merkle_nodes = 0;
     }
 
     /// Applies boundary and Merkle height deltas for the page/leaf masks recorded
@@ -548,31 +587,46 @@ impl MemoryCtx {
     ///  L  ..  L                  PAGE_BITS levels inside a 64-leaf page
     /// ```
     ///
-    /// `MemoryPageTracker` counts each newly touched leaf once, each newly
-    /// required internal node inside that page once, and each shared ancestor
-    /// above the page once across all pages in the segment. Each segment has an
-    /// initial and final memory tree, so boundary and Merkle row counts are
-    /// doubled.
+    /// `MemoryPageTracker` counts each newly touched leaf once, each newly required internal node
+    /// inside that page once, and each shared ancestor above the page once across all pages in the
+    /// segment. Boundary and Merkle AIRs contain both the initial and final rows, so those counts
+    /// are doubled. Poseidon2 deduplicates identical permutation inputs by value: the initial hash
+    /// is required for every touched leaf/node, while a distinct final hash is possible only on a
+    /// written leaf or an ancestor of one. A second tracker therefore supplies a tighter, still
+    /// conservative bound without inspecting runtime values.
     ///
     /// - BOUNDARY_AIR: `2 * new_leaves` rows
     /// - MERKLE_AIR:   `2 * new_merkle_nodes` rows
-    /// - Poseidon2:    `2 * new_leaves + 2 * new_merkle_nodes` hashes
+    /// - Poseidon2:    `new_touched_leaves + new_touched_nodes
+    ///                  + new_written_leaves + new_written_nodes` hashes
     ///
-    /// The Poseidon2 count is still an upper bound because tracegen may
-    /// deduplicate equal hash inputs by value.
+    /// The Poseidon2 count remains an upper bound because a write may restore the initial value,
+    /// and unrelated hash inputs can also be equal by value.
     #[inline(always)]
     pub(crate) fn apply_height_updates(&mut self, trace_heights: &mut [u32]) {
         let mut leaves = self.pending_leaves;
         let mut merkle_nodes = self.pending_merkle_nodes;
+        let mut written_leaves = self.pending_written_leaves;
+        let mut written_merkle_nodes = self.pending_written_merkle_nodes;
         self.pending_leaves = 0;
         self.pending_merkle_nodes = 0;
+        self.pending_written_leaves = 0;
+        self.pending_written_merkle_nodes = 0;
 
         for &access in &self.page_indices_since_checkpoint[self.page_indices_applied_len..] {
+            debug_assert_eq!(access.write_mask & !access.leaf_mask, 0);
             let (new_leaves, new_merkle_nodes) = self
                 .page_tracker
                 .insert(access.page_id as usize, access.leaf_mask);
             leaves += new_leaves;
             merkle_nodes += new_merkle_nodes;
+            if access.write_mask != 0 {
+                let (new_written_leaves, new_written_merkle_nodes) = self
+                    .written_page_tracker
+                    .insert(access.page_id as usize, access.write_mask);
+                written_leaves += new_written_leaves;
+                written_merkle_nodes += new_written_merkle_nodes;
+            }
         }
         self.page_indices_applied_len = self.page_indices_since_checkpoint.len();
 
@@ -581,8 +635,10 @@ impl MemoryCtx {
         // SAFETY: BOUNDARY_AIR_ID, MERKLE_AIR_ID, and poseidon2_idx are all within bounds
         unsafe {
             *trace_heights.get_unchecked_mut(BOUNDARY_AIR_ID) += leaves * 2;
-            // Poseidon2: 2 hashes per leaf (compression) + 2 per internal node (init + final tree)
-            *trace_heights.get_unchecked_mut(poseidon2_idx) += leaves * 2 + merkle_nodes * 2;
+            // One initial hash for every touched leaf/node. Only written leaves and their
+            // ancestors can require a distinct final hash after value-based deduplication.
+            *trace_heights.get_unchecked_mut(poseidon2_idx) +=
+                leaves + merkle_nodes + written_leaves + written_merkle_nodes;
             // Merkle AIR: 2 rows per internal node (init + final tree)
             *trace_heights.get_unchecked_mut(MERKLE_AIR_ID) += merkle_nodes * 2;
         }
@@ -761,9 +817,9 @@ mod tests {
         let mut range_ctx = MemoryCtx::new(&system_config, 1);
         let mut explicit_ctx = MemoryCtx::new(&system_config, 1);
 
-        range_ctx.update_boundary_merkle_heights(2, 0, 17);
+        range_ctx.update_boundary_merkle_heights(2, 0, 17, true);
         for ptr in [0, 16] {
-            explicit_ctx.update_boundary_merkle_heights(2, ptr, 1);
+            explicit_ctx.update_boundary_merkle_heights(2, ptr, 1, true);
         }
 
         let mut range_heights = vec![0; 6];
@@ -771,5 +827,58 @@ mod tests {
         range_ctx.apply_height_updates(&mut range_heights);
         explicit_ctx.apply_height_updates(&mut explicit_heights);
         assert_eq!(range_heights, explicit_heights);
+    }
+
+    #[test]
+    fn test_read_only_poseidon_bound_counts_one_tree() {
+        let system_config = crate::utils::test_system_config();
+        let mut read_ctx = MemoryCtx::new(&system_config, 1);
+        let mut write_ctx = MemoryCtx::new(&system_config, 1);
+
+        read_ctx.update_boundary_merkle_heights(2, 0, 1, false);
+        write_ctx.update_boundary_merkle_heights(2, 0, 1, true);
+
+        let mut read_heights = vec![0; 6];
+        let mut write_heights = vec![0; 6];
+        read_ctx.apply_height_updates(&mut read_heights);
+        write_ctx.apply_height_updates(&mut write_heights);
+
+        assert_eq!(
+            read_heights[BOUNDARY_AIR_ID],
+            write_heights[BOUNDARY_AIR_ID]
+        );
+        assert_eq!(read_heights[MERKLE_AIR_ID], write_heights[MERKLE_AIR_ID]);
+        let poseidon2_idx = read_heights.len() - 2;
+        assert_eq!(
+            read_heights[poseidon2_idx] * 2,
+            write_heights[poseidon2_idx]
+        );
+        assert_eq!(
+            write_heights[poseidon2_idx],
+            write_heights[BOUNDARY_AIR_ID] + write_heights[MERKLE_AIR_ID]
+        );
+    }
+
+    #[test]
+    fn test_late_write_adds_only_second_tree_poseidon_bound() {
+        let system_config = crate::utils::test_system_config();
+        let mut ctx = MemoryCtx::new(&system_config, 1);
+        let mut heights = vec![0; 6];
+        let poseidon2_idx = heights.len() - 2;
+
+        ctx.update_boundary_merkle_heights(2, 0, 1, false);
+        ctx.apply_height_updates(&mut heights);
+        let initial_tree_hashes = heights[poseidon2_idx];
+
+        ctx.update_boundary_merkle_heights(2, 0, 1, true);
+        ctx.apply_height_updates(&mut heights);
+        assert_eq!(heights[poseidon2_idx], initial_tree_hashes * 2);
+        assert_eq!(heights[BOUNDARY_AIR_ID], 2);
+    }
+
+    #[test]
+    fn test_page_access_c_abi_size() {
+        assert_eq!(std::mem::size_of::<PageAccess>(), 24);
+        assert_eq!(std::mem::align_of::<PageAccess>(), 8);
     }
 }

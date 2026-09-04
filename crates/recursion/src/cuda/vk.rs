@@ -27,11 +27,27 @@ impl VerifyingKeyGpu {
             .inner
             .per_air
             .iter()
-            .map(|vk| AirData {
-                num_cached: vk.num_cached_mains(),
-                num_interactions_per_row: vk.num_interactions(),
-                total_width: vk.params.width.total_width(),
-                has_preprocessed: vk.preprocessed_data.is_some(),
+            .map(|air_vk| AirData {
+                num_cached: air_vk.num_cached_mains(),
+                num_interactions_per_row: air_vk.num_interactions(),
+                total_width: air_vk.params.width.total_width(),
+                has_preprocessed: air_vk.preprocessed_data.is_some(),
+                is_required: air_vk.is_required,
+                need_rot: air_vk.params.need_rot,
+                num_public_values: air_vk.params.num_public_values,
+                common_main_width: air_vk.params.width.common_main,
+                preprocessed_width: air_vk.params.width.preprocessed.unwrap_or(0),
+                preprocessed_log_height: air_vk.preprocessed_data.as_ref().map_or(0, |data| {
+                    vk.inner
+                        .params
+                        .l_skip
+                        .checked_add_signed(data.hypercube_dim)
+                        .expect("preprocessed hypercube dimension")
+                }),
+                preprocessed_commit: air_vk
+                    .preprocessed_data
+                    .as_ref()
+                    .map_or_else(Digest::default, |data| data.commit),
             })
             .collect_vec()
             .to_device_on(device_ctx)

@@ -4,7 +4,7 @@ use itertools::Itertools;
 use openvm_cpu_backend::CpuBackend;
 use openvm_stark_backend::{
     keygen::types::{MultiStarkProvingKey, MultiStarkVerifyingKey},
-    prover::{AirProvingContext, ProvingContext},
+    prover::{AirProvingContext, MatrixDimensions, ProvingContext},
     test_utils::{
         default_test_params_small, test_system_params_small,
         test_system_params_small_with_poly_len, CachedFixture11, FibFixture, InteractionsFixture11,
@@ -16,15 +16,17 @@ use openvm_stark_backend::{
 use openvm_stark_sdk::{
     config::baby_bear_poseidon2::{
         default_duplex_sponge_recorder, default_duplex_sponge_validator, BabyBearPoseidon2Config,
-        BabyBearPoseidon2CpuEngine, DuplexSponge, DuplexSpongeRecorder,
+        BabyBearPoseidon2CpuEngine, DuplexSponge, DuplexSpongeRecorder, F,
     },
     utils::setup_tracing_with_log_level,
 };
+use p3_field::PrimeCharacteristicRing;
 use test_case::{test_case, test_matrix};
 use tracing::Level;
 
 use crate::system::{
-    AggregationSubCircuit, CachedTraceCtx, VerifierConfig, VerifierSubCircuit, VerifierTraceGen,
+    AggregationSubCircuit, BusIndexManager, CachedTraceCtx, RetainedStackingProof, VerifierConfig,
+    VerifierSubCircuit, VerifierTraceGen,
 };
 
 pub const MAX_CONSTRAINT_DEGREE: usize = 4;
@@ -54,6 +56,26 @@ fn verifier_circuit_keygen<const MAX_NUM_PROOFS: usize>(
     let circuit = VerifierSubCircuit::new(Arc::new(child_vk.clone()));
     let (pk, _vk) = engine.keygen(&circuit.airs());
     (circuit, pk)
+}
+
+#[test]
+fn verifier_sub_circuit_respects_starting_bus_index() {
+    let params = test_system_params_small(3, 5, 3);
+    let child_engine = BabyBearPoseidon2CpuEngine::<DuplexSponge>::new(params);
+    let (child_vk, _) = FibFixture::new(0, 1, 1 << 3).keygen_and_prove(&child_engine);
+    let config = VerifierConfig::default();
+
+    let zero_based =
+        VerifierSubCircuit::<1>::new_with_options(Arc::new(child_vk.clone()), config.clone());
+    let verifier_bus_count = zero_based.next_bus_idx();
+    let first_bus_idx = verifier_bus_count + 17;
+    let offset = VerifierSubCircuit::<1>::new_with_options_from_bus_idx_manager(
+        Arc::new(child_vk),
+        config,
+        BusIndexManager::from_next_bus_idx(first_bus_idx),
+    );
+
+    assert_eq!(offset.next_bus_idx(), first_bus_idx + verifier_bus_count);
 }
 
 fn debug(
@@ -450,6 +472,121 @@ fn test_recursion_circuit_two_interactions() {
 }
 
 #[test]
+fn test_deferred_opening_verifier_stops_after_stacking_and_exports_checkpoint() {
+    setup_tracing_with_log_level(Level::ERROR);
+    let params = default_test_params_small();
+    let child_engine = BabyBearPoseidon2CpuEngine::<DuplexSponge>::new(params);
+    let parent_engine = test_engine_small();
+    let (vk, proof) = InteractionsFixture11.keygen_and_prove(&child_engine);
+    let retained = RetainedStackingProof::from(&proof);
+    let deferred_input = retained.with_deferred_whir_input(Clone::clone);
+
+    let circuit = VerifierSubCircuit::<2>::new_with_options(
+        Arc::new(vk.clone()),
+        VerifierConfig {
+            tail_mode: crate::system::VerifierTailMode::DeferredWhir,
+            ..Default::default()
+        },
+    );
+    let full = VerifierSubCircuit::<2>::new(Arc::new(vk.clone()));
+    assert!(
+        circuit.airs::<BabyBearPoseidon2Config>().len()
+            < full.airs::<BabyBearPoseidon2Config>().len()
+    );
+
+    let vk_commit_data = circuit.commit_child_vk(&parent_engine, &vk);
+    let ctxs = circuit.generate_proving_ctxs_base(
+        &vk,
+        CachedTraceCtx::PcsData(vk_commit_data),
+        &[deferred_input],
+        &(),
+        default_duplex_sponge_recorder(),
+    );
+    assert_eq!(ctxs.len(), circuit.airs::<BabyBearPoseidon2Config>().len());
+    let checkpoint_index = circuit
+        .deferred_opening_checkpoint_air_index()
+        .expect("deferred checkpoint AIR");
+    assert_eq!(checkpoint_index, ctxs.len() - 3);
+    let checkpoint = &ctxs[checkpoint_index];
+    assert_eq!(checkpoint.common_main.height(), 1);
+    assert_eq!(
+        checkpoint.public_values.len(),
+        crate::system::DeferredOpeningCheckpointAir::<2>::public_width()
+    );
+    assert_eq!(checkpoint.public_values[0], F::ONE);
+    assert_eq!(
+        checkpoint.public_values
+            [crate::system::DeferredOpeningCheckpointAir::<2>::public_width() / 2],
+        F::ZERO
+    );
+    let decoded = crate::system::DeferredOpeningCheckpointAir::<2>::decode_public_values(
+        &checkpoint.public_values,
+    )
+    .expect("typed deferred checkpoint");
+    let private =
+        crate::system::DeferredOpeningCheckpointAir::<2>::decode_trace(&checkpoint.common_main)
+            .expect("typed private deferred checkpoint");
+    assert_eq!(decoded.len(), 1);
+    assert_eq!(private.len(), 1);
+    assert_eq!(private[0].checkpoint, decoded[0]);
+    assert!(decoded[0].transcript_index > 0);
+    debug(&parent_engine, &circuit.airs(), ctxs);
+}
+
+#[test]
+fn test_deferred_stacking_verifier_exports_compact_transcript_checkpoint() {
+    setup_tracing_with_log_level(Level::ERROR);
+    let params = default_test_params_small();
+    let child_engine = BabyBearPoseidon2CpuEngine::<DuplexSponge>::new(params);
+    let parent_engine = test_engine_small();
+    let (vk, proof) = InteractionsFixture11.keygen_and_prove(&child_engine);
+
+    let circuit = VerifierSubCircuit::<2>::new_with_options(
+        Arc::new(vk.clone()),
+        VerifierConfig {
+            tail_mode: crate::system::VerifierTailMode::DeferredStacking,
+            ..Default::default()
+        },
+    );
+    let post_stacking = VerifierSubCircuit::<2>::new_with_options(
+        Arc::new(vk.clone()),
+        VerifierConfig {
+            tail_mode: crate::system::VerifierTailMode::DeferredWhir,
+            ..Default::default()
+        },
+    );
+    assert!(
+        circuit.airs::<BabyBearPoseidon2Config>().len()
+            < post_stacking.airs::<BabyBearPoseidon2Config>().len()
+    );
+
+    let vk_commit_data = circuit.commit_child_vk(&parent_engine, &vk);
+    let ctxs = circuit.generate_proving_ctxs_base(
+        &vk,
+        CachedTraceCtx::PcsData(vk_commit_data),
+        &[proof],
+        &(),
+        default_duplex_sponge_recorder(),
+    );
+    assert_eq!(ctxs.len(), circuit.airs::<BabyBearPoseidon2Config>().len());
+    let claims = &ctxs[ctxs.len() - 4];
+    assert!(claims.common_main.height() > 1);
+    assert!(claims.public_values.is_empty());
+    let checkpoint = &ctxs[ctxs.len() - 3];
+    assert_eq!(checkpoint.common_main.height(), 1);
+    assert_eq!(
+        checkpoint.public_values.len(),
+        crate::system::ConstraintReductionCheckpointAir::<2>::public_width()
+    );
+    assert_eq!(checkpoint.public_values[0], F::ONE);
+    assert_eq!(
+        checkpoint.public_values[checkpoint.public_values.len() / 2],
+        F::ZERO
+    );
+    debug(&parent_engine, &circuit.airs(), ctxs);
+}
+
+#[test]
 fn test_recursion_circuit_multiple_interactions() {
     let params = default_test_params_small();
     let child_engine = BabyBearPoseidon2CpuEngine::<DuplexSponge>::new(params);
@@ -506,6 +643,49 @@ fn test_recursion_circuit_dag_commit_subair() {
         default_duplex_sponge_recorder(),
     );
     assert!(ctxs[0].cached_mains.is_empty());
+    debug(&parent_engine, &circuit.airs(), ctxs);
+}
+
+#[test]
+fn test_recursion_circuit_fixed_dag_commit_has_no_public_values() {
+    let params = test_system_params_small(3, 5, 3);
+    let child_engine = BabyBearPoseidon2CpuEngine::<DuplexSponge>::new(params.clone());
+    let parent_engine = test_engine_small();
+    let fx = MixtureFixture::standard(
+        5,
+        BabyBearPoseidon2Config::default_from_params(params.clone()),
+    );
+    let (vk, proof) = fx.keygen_and_prove(&child_engine);
+
+    let mut circuit = VerifierSubCircuit::<2>::new_with_options(
+        Arc::new(vk.clone()),
+        VerifierConfig {
+            has_cached: false,
+            ..Default::default()
+        },
+    );
+    let cached_trace_record = circuit.cached_trace_record_for_child(&vk);
+    let expected = cached_trace_record
+        .dag_commit_info
+        .as_ref()
+        .expect("no-cached verifier must reconstruct a DAG commitment")
+        .commit;
+    circuit.bind_fixed_dag_commit(expected).unwrap();
+    assert!(circuit.bind_fixed_dag_commit(expected).is_err());
+    assert_eq!(
+        circuit.airs::<BabyBearPoseidon2Config>()[0].num_public_values(),
+        0
+    );
+
+    let ctxs = circuit.generate_proving_ctxs_base(
+        &vk,
+        CachedTraceCtx::Records(cached_trace_record),
+        &[proof],
+        &(),
+        default_duplex_sponge_recorder(),
+    );
+    assert!(ctxs[0].cached_mains.is_empty());
+    assert!(ctxs[0].public_values.is_empty());
     debug(&parent_engine, &circuit.airs(), ctxs);
 }
 

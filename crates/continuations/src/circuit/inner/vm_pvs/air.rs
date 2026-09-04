@@ -20,7 +20,10 @@ use p3_matrix::Matrix;
 
 use crate::circuit::inner::{
     app::*,
-    bus::{PvsAirConsistencyBus, PvsAirConsistencyMessage},
+    bus::{
+        PvsAirConsistencyBus, PvsAirConsistencyMessage, VerifierExecutionIdentityBus,
+        VerifierExecutionIdentityMessage,
+    },
 };
 
 #[repr(C)]
@@ -39,6 +42,14 @@ pub struct VmPvsAir {
     pub public_values_bus: PublicValuesBus,
     pub cached_commit_bus: CachedCommitBus,
     pub pvs_air_consistency_bus: PvsAirConsistencyBus,
+    /// Enabled only by History-v4 recursive sub-circuits. The message is
+    /// derived from the same authenticated child `VmPvs` used by this AIR.
+    pub verifier_execution_identity_bus: Option<VerifierExecutionIdentityBus>,
+    /// Ordinary application children source `program_commit` from the cached
+    /// ProgramAir commitment. History-v4 prefixes instead source the complete
+    /// execution identity from their authenticated History projection and
+    /// must not require a foreign-layout cached program commitment.
+    pub receive_leaf_program_cached_commit: bool,
     pub deferral_enabled: bool,
 }
 
@@ -273,17 +284,19 @@ impl<AB: AirBuilder + InteractionBuilder + AirBuilderWithPublicValues> Air<AB> f
          * At the leaf level, this AIR is responsible for receiving the cached trace commit
          * program_commit.
          */
-        self.cached_commit_bus.receive(
-            builder,
-            local.proof_idx,
-            CachedCommitBusMessage {
-                air_idx: AB::Expr::from_usize(PROGRAM_AIR_ID),
-                cached_idx: AB::Expr::from_usize(PROGRAM_CACHED_TRACE_INDEX),
-                global_cached_idx: AB::Expr::ZERO,
-                cached_commit: local.child_pvs.program_commit.map(Into::into),
-            },
-            local.is_valid * is_leaf,
-        );
+        if self.receive_leaf_program_cached_commit {
+            self.cached_commit_bus.receive(
+                builder,
+                local.proof_idx,
+                CachedCommitBusMessage {
+                    air_idx: AB::Expr::from_usize(PROGRAM_AIR_ID),
+                    cached_idx: AB::Expr::from_usize(PROGRAM_CACHED_TRACE_INDEX),
+                    global_cached_idx: AB::Expr::ZERO,
+                    cached_commit: local.child_pvs.program_commit.map(Into::into),
+                },
+                local.is_valid * is_leaf,
+            );
+        }
 
         /*
          * We look up proof metadata from VerifierPvsAir here to ensure consistency on each row.
@@ -297,6 +310,22 @@ impl<AB: AirBuilder + InteractionBuilder + AirBuilderWithPublicValues> Air<AB> f
             },
             local.is_valid,
         );
+        if let Some(bus) = self.verifier_execution_identity_bus {
+            bus.add_key_with_lookups(
+                builder,
+                local.proof_idx,
+                VerifierExecutionIdentityMessage {
+                    program_commit: local.child_pvs.program_commit.map(Into::into),
+                    initial_pc: local.child_pvs.initial_pc.into(),
+                    final_pc: local.child_pvs.final_pc.into(),
+                    exit_code: local.child_pvs.exit_code.into(),
+                    is_terminate: local.child_pvs.is_terminate.into(),
+                    initial_root: local.child_pvs.initial_root.map(Into::into),
+                    final_root: local.child_pvs.final_root.map(Into::into),
+                },
+                local.is_valid,
+            );
+        }
 
         /*
          * Finally, we need to constrain that the public values this AIR produces are consistent

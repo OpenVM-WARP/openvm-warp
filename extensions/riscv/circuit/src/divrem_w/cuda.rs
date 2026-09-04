@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use derive_new::new;
-use openvm_circuit::{arch::DenseRecordArena, utils::next_power_of_two_or_zero};
+use openvm_circuit::arch::DenseRecordArena;
 use openvm_circuit_primitives::{
     bitwise_op_lookup::BitwiseOperationLookupChipGPU, range_tuple::RangeTupleCheckerChipGPU,
     var_range::VariableRangeCheckerChipGPU, Chip,
@@ -33,16 +33,14 @@ impl Chip<DenseRecordArena, GpuBackend> for Rv64DivRemWChipGpu {
             DivRemCoreRecord<RV64_WORD_NUM_LIMBS>,
         )>();
         let records = arena.allocated();
-        if records.is_empty() {
+        let padded_height = arena.trace_height(RECORD_SIZE);
+        if padded_height == 0 {
             return AirProvingContext::simple_no_pis(DeviceMatrix::dummy());
         }
         debug_assert_eq!(records.len() % RECORD_SIZE, 0);
 
         let trace_width = DivRemCoreCols::<F, RV64_WORD_NUM_LIMBS, RV64_BYTE_BITS>::width()
             + Rv64MultWAdapterCols::<F>::width();
-        let height = records.len() / RECORD_SIZE;
-        let padded_height = next_power_of_two_or_zero(height);
-
         let tuple_checker_sizes = self.range_tuple_checker.sizes;
         let tuple_checker_sizes = UInt2::new(tuple_checker_sizes[0], tuple_checker_sizes[1]);
         let device_ctx = &self.range_checker.device_ctx;

@@ -46,6 +46,12 @@ pub struct DagCommitPvs<T> {
 /// that uses it to have DagCommitPvs as its public value representation.
 pub struct DagCommitSubAir<F: Field> {
     pub subair: Arc<Poseidon2SubAir<F, SBOX_REGISTERS>>,
+    /// Optional verifier-key-owned terminal digest. When present, the DAG
+    /// commitment is a relation constant instead of an AIR public value.
+    /// This is the sound no-cached mode for a direct outer proof: the trace
+    /// still reconstructs and hashes the symbolic DAG, while the prover has
+    /// no authority over either the expected digest or a cached PCS root.
+    pub expected_commit: Option<[F; DIGEST_SIZE]>,
 }
 
 // No columns provided: `DagCommitCols` embeds external `Poseidon2SubCols` which doesn't derive
@@ -56,6 +62,21 @@ impl<F: PrimeField + InjectiveMonomial<BABY_BEAR_POSEIDON2_SBOX_DEGREE>> DagComm
     pub fn new() -> Self {
         Self::default()
     }
+
+    #[must_use]
+    pub fn new_with_expected_commit(expected_commit: [F; DIGEST_SIZE]) -> Self {
+        Self {
+            subair: default_poseidon2_sub_chip().air,
+            expected_commit: Some(expected_commit),
+        }
+    }
+}
+
+impl<F: Field> DagCommitSubAir<F> {
+    #[must_use]
+    pub const fn exposes_public_commit(&self) -> bool {
+        self.expected_commit.is_none()
+    }
 }
 
 impl<F: PrimeField + InjectiveMonomial<BABY_BEAR_POSEIDON2_SBOX_DEGREE>> Default
@@ -64,6 +85,7 @@ impl<F: PrimeField + InjectiveMonomial<BABY_BEAR_POSEIDON2_SBOX_DEGREE>> Default
     fn default() -> Self {
         Self {
             subair: default_poseidon2_sub_chip().air,
+            expected_commit: None,
         }
     }
 }
@@ -119,7 +141,11 @@ impl<AB: AirBuilder + InteractionBuilder + AirBuilderWithPublicValues> SubAir<AB
             from_fn(|i| next.inner.inputs[i + DIGEST_SIZE]),
         );
 
-        let &DagCommitPvs::<_> { commit: pvs_commit } = builder.public_values().borrow();
+        let expected_commit = self.expected_commit.map(|commit| commit.map(Into::into));
+        let pvs_commit = expected_commit.unwrap_or_else(|| {
+            let &DagCommitPvs::<_> { commit } = builder.public_values().borrow();
+            commit.map(Into::into)
+        });
 
         assert_array_eq::<_, _, _, DIGEST_SIZE>(
             &mut builder.when_last_row(),
