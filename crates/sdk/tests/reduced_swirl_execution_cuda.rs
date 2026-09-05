@@ -32,8 +32,8 @@ use openvm_sdk::{
             reduced_swirl_manifest_digest, verify_reduced_swirl_native_recorded,
         },
         reduced_swirl_production_cuda::prove_reduced_swirl_production_cuda,
-        reduced_swirl_source_leaf::{
-            reduced_swirl_source_tree_params, ReducedSwirlSourceTreeCudaProver,
+        reduced_swirl_transition_tree::{
+            reduced_swirl_transition_tree_params, ReducedSwirlTransitionTreeCudaProver,
         },
     },
     StdIn, F,
@@ -117,19 +117,9 @@ fn segmented_cuda_vm_reuses_original_stacking_codewords_for_every_source() -> Re
     execution
         .native
         .telemetry
-        .assert_no_duplicate_payload_pipeline()
+        .assert_resident_terminal_contract()
         .map_err(eyre::Report::msg)?;
-    assert_eq!(execution.native.telemetry.fresh_reencodes, 0);
-    assert_eq!(execution.native.telemetry.fresh_recommits, 0);
-    assert_eq!(execution.native.telemetry.accumulator_spill_count, 0);
-    assert_eq!(execution.native.telemetry.accumulator_restore_count, 0);
     assert_eq!(execution.native.telemetry.terminal_reused_initial_roots, 1);
-    assert_eq!(execution.native.telemetry.terminal_accumulator_reencodes, 0);
-    assert_eq!(execution.native.telemetry.terminal_accumulator_recommits, 0);
-    assert_eq!(
-        execution.native.telemetry.terminal_full_message_d2h_bytes,
-        0
-    );
 
     let verification = verify_reduced_swirl_native_recorded(
         execution.setup.cpu_setup(),
@@ -334,7 +324,7 @@ fn segmented_cuda_vm_emits_one_recursively_normalized_reduced_warp_proof() -> Re
 /// internal layers. This regression used to enter the shape-unstable generic
 /// `RecursiveSelf` route after 28 transition leaves.
 #[test]
-fn segmented_cuda_vm_source_tree_accepts_long_fixed_fan_in() -> Result<()> {
+fn segmented_cuda_vm_transition_tree_accepts_long_fixed_fan_in() -> Result<()> {
     // This fixture deliberately emits enough VM rows to create at least 28
     // transition leaves.  Give those rows a setup-fixed application envelope
     // large enough to reach the source-tree code under test instead of
@@ -360,8 +350,8 @@ fn segmented_cuda_vm_source_tree_accepts_long_fixed_fan_in() -> Result<()> {
         "fixture must exceed the former ternary source-tree capacity"
     );
 
-    let tree_params = reduced_swirl_source_tree_params(&leaf_params_with_100_bits_security())?;
-    ReducedSwirlSourceTreeCudaProver::new(execution.transition_leaf_vk, tree_params).prove(
+    let tree_params = reduced_swirl_transition_tree_params(&leaf_params_with_100_bits_security())?;
+    ReducedSwirlTransitionTreeCudaProver::new(execution.transition_leaf_vk, tree_params).prove(
         execution.transition_leaf_proofs,
         execution.recursive_app_vk_commit,
     )?;

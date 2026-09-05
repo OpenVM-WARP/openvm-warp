@@ -21,11 +21,7 @@ eyre.workspace = true
 tracing.workspace = true
 metrics.workspace = true
 zstd.workspace = true
-bitcode.workspace = true
 p3-field = { workspace = true }
-serde.workspace = true
-serde_json.workspace = true
-sha2.workspace = true
 
 # for ecrecover benchmark
 rand_chacha = { version = "0.3", default-features = false }
@@ -33,9 +29,6 @@ k256 = { workspace = true, features = ["ecdsa"] }
 tiny-keccak.workspace = true
 
 [dev-dependencies]
-
-[target.'cfg(all())'.dependencies]
-openvm-cuda-common = { workspace = true, optional = true }
 
 [features]
 default = ["parallel", "jemalloc", "metrics"]
@@ -53,7 +46,6 @@ jemalloc-prof = ["openvm-sdk/jemalloc-prof"]
 cuda = [
     "openvm-circuit/cuda",
     "openvm-sdk/cuda",
-    "dep:openvm-cuda-common",
 ]
 
 [[bin]]

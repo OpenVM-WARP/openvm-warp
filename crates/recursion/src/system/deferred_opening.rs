@@ -197,46 +197,6 @@ impl<const MAX_NUM_PROOFS: usize> DeferredOpeningCheckpointAir<MAX_NUM_PROOFS> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn checkpoint_values() -> Vec<F> {
-        let mut values = F::zero_vec(DeferredOpeningCheckpointAir::<2>::public_width());
-        values[0] = F::ONE;
-        values[1] = F::from_u32(19);
-        for (index, value) in values[2..2 + POSEIDON2_WIDTH].iter_mut().enumerate() {
-            *value = F::from_usize(index + 1);
-        }
-        values
-    }
-
-    #[test]
-    fn decodes_canonical_active_prefix() {
-        let values = checkpoint_values();
-        let decoded = DeferredOpeningCheckpointAir::<2>::decode_public_values(&values).unwrap();
-        assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].transcript_index, 19);
-        assert_eq!(decoded[0].transcript_state[0], F::ONE);
-    }
-
-    #[test]
-    fn rejects_non_prefix_and_nonzero_inactive_slots() {
-        let mut non_prefix = checkpoint_values();
-        non_prefix[0] = F::ZERO;
-        non_prefix[1] = F::ZERO;
-        non_prefix[2..2 + POSEIDON2_WIDTH].fill(F::ZERO);
-        non_prefix[SLOT_PUBLIC_WIDTH] = F::ONE;
-        assert!(DeferredOpeningCheckpointAir::<2>::decode_public_values(&non_prefix).is_err());
-
-        let mut nonzero_inactive = checkpoint_values();
-        nonzero_inactive[SLOT_PUBLIC_WIDTH + 1] = F::ONE;
-        assert!(
-            DeferredOpeningCheckpointAir::<2>::decode_public_values(&nonzero_inactive).is_err()
-        );
-    }
-}
-
 impl<const MAX_NUM_PROOFS: usize> BaseAir<F> for DeferredOpeningCheckpointAir<MAX_NUM_PROOFS> {
     fn width(&self) -> usize {
         MAX_NUM_PROOFS * SLOT_WIDTH
@@ -313,5 +273,45 @@ where
                 active,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn checkpoint_values() -> Vec<F> {
+        let mut values = F::zero_vec(DeferredOpeningCheckpointAir::<2>::public_width());
+        values[0] = F::ONE;
+        values[1] = F::from_u32(19);
+        for (index, value) in values[2..2 + POSEIDON2_WIDTH].iter_mut().enumerate() {
+            *value = F::from_usize(index + 1);
+        }
+        values
+    }
+
+    #[test]
+    fn decodes_canonical_active_prefix() {
+        let values = checkpoint_values();
+        let decoded = DeferredOpeningCheckpointAir::<2>::decode_public_values(&values).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].transcript_index, 19);
+        assert_eq!(decoded[0].transcript_state[0], F::ONE);
+    }
+
+    #[test]
+    fn rejects_non_prefix_and_nonzero_inactive_slots() {
+        let mut non_prefix = checkpoint_values();
+        non_prefix[0] = F::ZERO;
+        non_prefix[1] = F::ZERO;
+        non_prefix[2..2 + POSEIDON2_WIDTH].fill(F::ZERO);
+        non_prefix[SLOT_PUBLIC_WIDTH] = F::ONE;
+        assert!(DeferredOpeningCheckpointAir::<2>::decode_public_values(&non_prefix).is_err());
+
+        let mut nonzero_inactive = checkpoint_values();
+        nonzero_inactive[SLOT_PUBLIC_WIDTH + 1] = F::ONE;
+        assert!(
+            DeferredOpeningCheckpointAir::<2>::decode_public_values(&nonzero_inactive).is_err()
+        );
     }
 }

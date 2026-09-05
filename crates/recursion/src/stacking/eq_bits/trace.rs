@@ -117,7 +117,7 @@ impl RowMajorChip<F> for EqBitsTraceGenerator {
                     first_cols.external_mult = F::from_usize(base_external_mult);
                 }
 
-                // WARP's regenerative source path may execute this fixed verifier trace
+                // WARP's reduced source path may execute this fixed verifier trace
                 // generator more than once for the same proof.  `HashMap` iteration order is
                 // randomized per map, so emitting rows directly from `iter()` makes the
                 // systematic message, commitment root, and Fiat--Shamir transcript change

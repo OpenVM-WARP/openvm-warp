@@ -1,4 +1,4 @@
-use std::{borrow::Borrow, sync::Arc};
+use std::borrow::Borrow;
 
 use openvm_circuit_primitives::{
     utils::{and, assert_array_eq, not, or},
@@ -9,9 +9,9 @@ use openvm_stark_backend::{
     interaction::InteractionBuilder, BaseAirWithPublicValues, PartitionedBaseAir,
 };
 use openvm_stark_sdk::config::baby_bear_poseidon2::{D_EF, F};
-use p3_air::{Air, AirBuilder, BaseAir, PairBuilder};
+use p3_air::{Air, AirBuilder, BaseAir};
 use p3_field::{extension::BinomiallyExtendable, PrimeCharacteristicRing, PrimeField32};
-use p3_matrix::{dense::RowMajorMatrix, Matrix};
+use p3_matrix::Matrix;
 
 use crate::{
     bus::{
@@ -19,13 +19,10 @@ use crate::{
         LiftedHeightsBus, LiftedHeightsBusMessage, StackingModuleBus, StackingModuleMessage,
         TranscriptBus, TranscriptBusMessage,
     },
-    stacking::{
-        bus::{
-            ClaimCoefficientsBus, ClaimCoefficientsMessage, EqBitsLookupBus, EqBitsLookupMessage,
-            EqKernelLookupBus, EqKernelLookupMessage, StackingModuleTidxBus,
-            StackingModuleTidxMessage, SumcheckClaimsBus, SumcheckClaimsMessage,
-        },
-        ordered::{OrderedOpeningClaimsPrepCols, OrderedStackingProfile},
+    stacking::bus::{
+        ClaimCoefficientsBus, ClaimCoefficientsMessage, EqBitsLookupBus, EqBitsLookupMessage,
+        EqKernelLookupBus, EqKernelLookupMessage, StackingModuleTidxBus, StackingModuleTidxMessage,
+        SumcheckClaimsBus, SumcheckClaimsMessage,
     },
     subairs::nested_for_loop::{NestedForLoopIoCols, NestedForLoopSubAir},
     utils::{assert_one_ext, ext_field_add, ext_field_multiply, ext_field_multiply_scalar},
@@ -107,33 +104,19 @@ pub struct OpeningClaimsAir {
     // Other fields
     pub n_stack: usize,
     pub l_skip: usize,
-    /// In ordered authority mode all reductions consume one global transcript
-    /// under this verifier-owned proof key. `proof_idx` in the trace remains
-    /// the reduction index for ColumnClaims and stacking-internal buses.
-    pub authority_transcript_proof_idx: Option<usize>,
-    /// In ordered authority mode this verifier-owned profile replaces the child proof-shape
-    /// tables for claim identity and stacked-layout metadata.
-    pub ordered_profile: Option<Arc<OrderedStackingProfile>>,
 }
 
 impl BaseAirWithPublicValues<F> for OpeningClaimsAir {}
 impl PartitionedBaseAir<F> for OpeningClaimsAir {}
 
-impl BaseAir<F> for OpeningClaimsAir {
+impl<F> BaseAir<F> for OpeningClaimsAir {
     fn width(&self) -> usize {
         OpeningClaimsCols::<F>::width()
     }
-
-    fn preprocessed_trace(&self) -> Option<RowMajorMatrix<F>> {
-        self.ordered_profile
-            .as_deref()
-            .map(OrderedStackingProfile::opening_preprocessed_trace)
-    }
 }
 
-impl<AB> Air<AB> for OpeningClaimsAir
+impl<AB: AirBuilder + InteractionBuilder> Air<AB> for OpeningClaimsAir
 where
-    AB: AirBuilder<F = F> + PairBuilder + InteractionBuilder,
     AB::F: PrimeField32,
     <AB::Expr as PrimeCharacteristicRing>::PrimeSubfield: BinomiallyExtendable<{ D_EF }>,
 {
@@ -146,37 +129,6 @@ where
 
         let local: &OpeningClaimsCols<AB::Var> = (*local).borrow();
         let next: &OpeningClaimsCols<AB::Var> = (*next).borrow();
-
-        if self.ordered_profile.is_some() {
-            let preprocessed = builder.preprocessed();
-            let prep = preprocessed
-                .row_slice(0)
-                .expect("ordered stacking preprocessed row");
-            let prep: &OrderedOpeningClaimsPrepCols<AB::Var> = (*prep).borrow();
-            builder.assert_bool(prep.active);
-            builder.assert_eq(local.is_valid, prep.active);
-            let mut when_active = builder.when(prep.active);
-            for (actual, expected) in [
-                (local.proof_idx, prep.proof_idx),
-                (local.is_first, prep.is_first),
-                (local.is_last, prep.is_last),
-                (local.sort_idx, prep.sort_idx),
-                (local.part_idx, prep.part_idx),
-                (local.col_idx, prep.col_idx),
-                (local.need_rot, prep.need_rot),
-                (local.is_main, prep.is_main),
-                (local.is_transition_main, prep.is_transition_main),
-                (local.commit_idx, prep.commit_idx),
-                (local.stacked_col_idx, prep.stacked_col_idx),
-                (local.row_idx, prep.row_idx),
-                (local.is_last_for_claim, prep.is_last_for_claim),
-                (local.hypercube_dim, prep.hypercube_dim),
-                (local.log_lifted_height, prep.log_lifted_height),
-                (local.lifted_height, prep.lifted_height),
-            ] {
-                when_active.assert_eq(actual, expected);
-            }
-        }
 
         NestedForLoopSubAir::<1> {}.eval(
             builder,
@@ -216,68 +168,72 @@ where
          * be sorted by sort_idx, then part_idx, and finally col_idx. Note that each proof must
          * have at least one main claim.
          */
-        if self.ordered_profile.is_none() {
-            builder.assert_bool(local.is_main);
-            builder.when(local.is_main).assert_one(local.is_valid);
-            builder.when(local.is_main).assert_zero(local.part_idx);
-            builder.when(local.is_main).assert_zero(local.commit_idx);
+        builder.assert_bool(local.is_main);
+        builder.when(local.is_main).assert_one(local.is_valid);
+        builder.when(local.is_main).assert_zero(local.part_idx);
+        builder.when(local.is_main).assert_zero(local.commit_idx);
 
-            builder.when(local.is_first).assert_one(local.is_main);
-            builder.when(local.is_first).assert_zero(local.sort_idx);
-            builder.when(local.is_first).assert_zero(local.col_idx);
+        builder.when(local.is_first).assert_one(local.is_main);
+        builder.when(local.is_first).assert_zero(local.sort_idx);
+        builder.when(local.is_first).assert_zero(local.col_idx);
 
-            builder.assert_bool(local.is_transition_main);
-            builder
-                .when(local.is_transition_main)
-                .assert_eq(local.is_main, next.is_main);
-            builder
-                .when(local.is_transition_main)
-                .assert_one(and(local.is_valid, next.is_valid));
-            builder
-                .when(and::<AB::Expr>(
-                    and(local.is_main, next.is_main),
-                    not(local.is_last),
-                ))
-                .assert_one(local.is_transition_main);
-            builder
-                .when(and(
-                    and::<AB::Expr>(not(local.is_main), not(next.is_main)),
-                    next.is_valid,
-                ))
-                .assert_one(local.is_transition_main);
-            builder
-                .when(local.is_transition_main)
-                .assert_zero(local.is_last);
-            builder
-                .when(and(not(local.is_main), next.is_main))
-                .assert_one(local.is_last);
+        builder.assert_bool(local.is_transition_main);
+        builder
+            .when(local.is_transition_main)
+            .assert_eq(local.is_main, next.is_main);
+        builder
+            .when(local.is_transition_main)
+            .assert_one(and(local.is_valid, next.is_valid));
+        builder
+            .when(and::<AB::Expr>(
+                and(local.is_main, next.is_main),
+                not(local.is_last),
+            ))
+            .assert_one(local.is_transition_main);
+        builder
+            .when(and(
+                and::<AB::Expr>(not(local.is_main), not(next.is_main)),
+                next.is_valid,
+            ))
+            .assert_one(local.is_transition_main);
+        builder
+            .when(local.is_transition_main)
+            .assert_zero(local.is_last);
+        builder
+            .when(and(not(local.is_main), next.is_main))
+            .assert_one(local.is_last);
 
-            let mut when_both_main = builder.when(and(local.is_main, local.is_transition_main));
-            when_both_main.assert_bool(next.sort_idx - local.sort_idx);
-            when_both_main
-                .when_ne(local.sort_idx, next.sort_idx)
-                .assert_zero(next.col_idx);
-            when_both_main
-                .when_ne(local.sort_idx + AB::F::ONE, next.sort_idx)
-                .assert_one(next.col_idx - local.col_idx);
+        let mut when_both_main = builder.when(and(local.is_main, local.is_transition_main));
+        when_both_main.assert_bool(next.sort_idx - local.sort_idx);
+        when_both_main
+            .when_ne(local.sort_idx, next.sort_idx)
+            .assert_zero(next.col_idx);
+        when_both_main
+            .when_ne(local.sort_idx + AB::F::ONE, next.sort_idx)
+            .assert_one(next.col_idx - local.col_idx);
 
-            let mut when_last_main =
-                builder.when(and(local.is_main, not(local.is_transition_main)));
-            when_last_main.assert_zero((next.part_idx - AB::F::ONE) * not(local.is_last));
-            when_last_main.assert_zero(next.col_idx * not(local.is_last));
+        let mut when_last_main = builder.when(and(local.is_main, not(local.is_transition_main)));
+        when_last_main.assert_zero((next.part_idx - AB::F::ONE) * not(local.is_last));
+        when_last_main.assert_zero(next.col_idx * not(local.is_last));
 
-            builder
-                .when(and(local.is_valid, not(local.is_last)))
-                .assert_bool(next.commit_idx - local.commit_idx);
-            builder
-                .when(and(local.is_transition_main, not(local.is_main)))
-                .when_ne(local.commit_idx + AB::F::ONE, next.commit_idx)
-                .assert_one(next.col_idx - local.col_idx);
-            builder
-                .when(and(local.is_transition_main, not(local.is_main)))
-                .when_ne(local.commit_idx, next.commit_idx)
-                .assert_zero(next.col_idx);
-        }
+        /*
+         * Note that we utilize the LiftedHeightsBus interaction to constrain the (sort_idx,
+         * part_idx) sorting for non-main commits. Each non-zero commit_idx is constrained to
+         * its exact sort_idx and part_idx, so we only need to constrain that (a) commit_idx
+         * increases by 0/1 within a proof and (b) col_idx increases by 1 within a commit and
+         * is reset between commits.
+         */
+        builder
+            .when(and(local.is_valid, not(local.is_last)))
+            .assert_bool(next.commit_idx - local.commit_idx);
+        builder
+            .when(and(local.is_transition_main, not(local.is_main)))
+            .when_ne(local.commit_idx + AB::F::ONE, next.commit_idx)
+            .assert_one(next.col_idx - local.col_idx);
+        builder
+            .when(and(local.is_transition_main, not(local.is_main)))
+            .when_ne(local.commit_idx, next.commit_idx)
+            .assert_zero(next.col_idx);
 
         /*
          * Compute col_claim[0] + lambda * rot_claim + ... (i.e. RLC of column/rotation claims)
@@ -504,21 +460,19 @@ where
          * from ProofShapeAir, while eq(u, r), k_rot(u, r), and eq_>(u, b) values are
          * computed and provided via lookup by other stacking module AIRs.
          */
-        if self.ordered_profile.is_none() {
-            self.lifted_heights_bus.lookup_key(
-                builder,
-                local.proof_idx,
-                LiftedHeightsBusMessage {
-                    sort_idx: local.sort_idx,
-                    part_idx: local.part_idx,
-                    commit_idx: local.commit_idx,
-                    hypercube_dim: local.hypercube_dim,
-                    lifted_height: local.lifted_height,
-                    log_lifted_height: local.log_lifted_height,
-                },
-                local.is_valid,
-            );
-        }
+        self.lifted_heights_bus.lookup_key(
+            builder,
+            local.proof_idx,
+            LiftedHeightsBusMessage {
+                sort_idx: local.sort_idx,
+                part_idx: local.part_idx,
+                commit_idx: local.commit_idx,
+                hypercube_dim: local.hypercube_dim,
+                lifted_height: local.lifted_height,
+                log_lifted_height: local.log_lifted_height,
+            },
+            local.is_valid,
+        );
 
         self.eq_kernel_lookup_bus.lookup_key(
             builder,
@@ -549,45 +503,37 @@ where
             local.is_valid,
         );
 
-        if self.ordered_profile.is_none() {
-            self.air_shape_bus.lookup_key(
-                builder,
-                local.proof_idx,
-                AirShapeBusMessage {
-                    sort_idx: local.sort_idx.into(),
-                    property_idx: AirShapeProperty::NeedRot.to_field(),
-                    value: local.need_rot.into(),
-                },
-                local.is_valid,
-            );
-        }
+        self.air_shape_bus.lookup_key(
+            builder,
+            local.proof_idx,
+            AirShapeBusMessage {
+                sort_idx: local.sort_idx.into(),
+                property_idx: AirShapeProperty::NeedRot.to_field(),
+                value: local.need_rot.into(),
+            },
+            local.is_valid,
+        );
 
         /*
          * Constrain transcript operations and send the final tidx to UnivariateRoundAir.
          */
-        if self.ordered_profile.is_none() {
-            self.stacking_module_bus.receive(
-                builder,
-                local.proof_idx,
-                StackingModuleMessage {
-                    tidx: local.tidx.into(),
-                },
-                and(local.is_first, local.is_valid),
-            );
-        }
+        self.stacking_module_bus.receive(
+            builder,
+            local.proof_idx,
+            StackingModuleMessage {
+                tidx: local.tidx.into(),
+            },
+            and(local.is_first, local.is_valid),
+        );
 
         builder
             .when(and(local.is_valid, not(local.is_last)))
             .assert_eq(local.tidx + AB::Expr::from_usize(2 * D_EF), next.tidx);
 
         for i in 0..D_EF {
-            let transcript_proof_idx = self
-                .authority_transcript_proof_idx
-                .map(AB::Expr::from_usize)
-                .unwrap_or_else(|| local.proof_idx.into());
             self.transcript_bus.receive(
                 builder,
-                transcript_proof_idx.clone(),
+                local.proof_idx,
                 TranscriptBusMessage {
                     tidx: local.tidx + AB::Expr::from_usize(i),
                     value: local.col_claim[i].into(),
@@ -598,7 +544,7 @@ where
 
             self.transcript_bus.receive(
                 builder,
-                transcript_proof_idx.clone(),
+                local.proof_idx,
                 TranscriptBusMessage {
                     tidx: local.tidx + AB::Expr::from_usize(D_EF + i),
                     value: local.rot_claim[i].into(),
@@ -609,7 +555,7 @@ where
 
             self.transcript_bus.receive(
                 builder,
-                transcript_proof_idx,
+                local.proof_idx,
                 TranscriptBusMessage {
                     tidx: AB::Expr::from_usize(2 * D_EF + i) + local.tidx,
                     value: local.lambda[i].into(),

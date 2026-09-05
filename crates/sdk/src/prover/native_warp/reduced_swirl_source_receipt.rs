@@ -13,8 +13,8 @@ use openvm_continuations::circuit::{
     reduced_swirl_source_receipt::{
         canonicalize_reduced_swirl_source_receipt_block, ReducedSwirlReceiptLayoutEntry,
         ReducedSwirlReceiptVmBoundary, ReducedSwirlSourceReceiptBlock,
-        ReducedSwirlSourceReceiptComponent, ReducedSwirlSourceReceiptMode,
-        ReducedSwirlSourceReceiptProfile, ReducedSwirlSourceReceiptRecord,
+        ReducedSwirlSourceReceiptComponent, ReducedSwirlSourceReceiptProfile,
+        ReducedSwirlSourceReceiptRecord,
     },
     reduced_swirl_warp::ReducedSwirlSourceReceiptBus,
 };
@@ -54,7 +54,6 @@ use super::{
         AuthoritativeSwirlConstrainedRsClaim, PendingConstrainedCodePublicClaim,
         ReducedSwirlSourceManifestPrefix,
     },
-    reduced_swirl_native::ReducedSwirlNativeStatement,
     reduced_swirl_params::reduced_swirl_system_params_digest,
     reduced_swirl_wrapper_components::ReducedSwirlVerifierComponent,
 };
@@ -86,10 +85,6 @@ pub enum ReducedSwirlSourceReceiptAdapterError {
     },
     #[error("source {source_index} canonical SDK digest differs from receipt AIR")]
     CanonicalDigest { source_index: usize },
-    #[error("native reduced-SWIRL source bindings differ from the ordered receipt")]
-    NativeSourceBindings,
-    #[error("native reduced-SWIRL manifest digest differs from the ordered receipt")]
-    NativeManifest,
     #[error(
         "source range [{source_offset}, {source_offset}+{source_count}) exceeds native source count {native_sources}"
     )]
@@ -102,8 +97,6 @@ pub enum ReducedSwirlSourceReceiptAdapterError {
     InFlightBindingCount { sources: usize, bindings: usize },
     #[error("in-flight reduced-SWIRL source bindings differ from the derived ordered receipt")]
     InFlightSourceBindings,
-    #[error("native reduced-SWIRL statement is malformed: {0}")]
-    NativeStatement(String),
     #[error("ordinary deferred verifier trace generation failed")]
     VerifierTrace,
     #[error("reduced-SWIRL source auxiliary trace failed: {0}")]
@@ -116,9 +109,8 @@ pub enum ReducedSwirlSourceReceiptAdapterError {
     VkCommit(String),
 }
 
-/// CPU proving contexts in component-local AIR coordinates. They can be
-/// appended directly to `ReducedSwirlWrapperWitness::component_contexts` by
-/// the complete source/VACC/terminal component provider.
+/// CPU proving contexts in component-local AIR coordinates. The transition
+/// leaf assigns these contexts to its setup-fixed AIR inventory.
 pub struct ReducedSwirlSourceReceiptCpuPacket {
     pub contexts: Vec<(usize, AirProvingContext<CpuBackend<SC>>)>,
     pub block: ReducedSwirlSourceReceiptBlock,
@@ -137,9 +129,8 @@ pub struct ReducedSwirlSourceReceiptCudaPacket {
 const SOURCE_RECEIPT_COMPONENT_DIGEST_TAG: &[u8] =
     b"openvm.native-warp.reduced-swirl.source-receipt-component.v5";
 
-/// Production source component accepted by
-/// [`super::reduced_swirl_wrapper_components::ReducedSwirlProductionComponents`].
-/// Its digest is derived from the child VK and actual AIR inventory; callers
+/// Production source component used by the bounded transition leaf. Its
+/// digest is derived from the child VK and actual AIR inventory; callers
 /// cannot substitute an opaque setup identifier.
 pub struct ProductionReducedSwirlSourceReceiptComponent<
     const MAX_SOURCES: usize = REDUCED_SWIRL_SOURCE_RECEIPT_CAPACITY,
@@ -157,49 +148,6 @@ impl<const MAX_SOURCES: usize> ProductionReducedSwirlSourceReceiptComponent<MAX_
         authority_bus: ReducedSwirlSourceAuthorityBus,
         bus_idx_manager: BusIndexManager,
     ) -> Result<Self, ReducedSwirlSourceReceiptAdapterError> {
-        Self::new_with_mode(
-            child_vk,
-            profile,
-            wrapper_params,
-            receipt_bus,
-            authority_bus,
-            bus_idx_manager,
-            ReducedSwirlSourceReceiptMode::Inline,
-        )
-    }
-
-    /// Setup-fixed source-leaf component. The receipt is the only source
-    /// export consumer and no authority records are emitted for a sibling
-    /// VACC component.
-    pub fn new_detached(
-        child_vk: Arc<MultiStarkVerifyingKey<SC>>,
-        profile: ReducedSwirlSourceReceiptProfile,
-        wrapper_params: SystemParams,
-        receipt_bus: ReducedSwirlSourceReceiptBus,
-        authority_bus: ReducedSwirlSourceAuthorityBus,
-        bus_idx_manager: BusIndexManager,
-    ) -> Result<Self, ReducedSwirlSourceReceiptAdapterError> {
-        Self::new_with_mode(
-            child_vk,
-            profile,
-            wrapper_params,
-            receipt_bus,
-            authority_bus,
-            bus_idx_manager,
-            ReducedSwirlSourceReceiptMode::Detached,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn new_with_mode(
-        child_vk: Arc<MultiStarkVerifyingKey<SC>>,
-        profile: ReducedSwirlSourceReceiptProfile,
-        wrapper_params: SystemParams,
-        receipt_bus: ReducedSwirlSourceReceiptBus,
-        authority_bus: ReducedSwirlSourceAuthorityBus,
-        bus_idx_manager: BusIndexManager,
-        mode: ReducedSwirlSourceReceiptMode,
-    ) -> Result<Self, ReducedSwirlSourceReceiptAdapterError> {
         if receipt_bus.index() == authority_bus.index()
             || receipt_bus.index() >= bus_idx_manager.next_bus_idx()
             || authority_bus.index() >= bus_idx_manager.next_bus_idx()
@@ -208,26 +156,14 @@ impl<const MAX_SOURCES: usize> ProductionReducedSwirlSourceReceiptComponent<MAX_
                 "source receipt buses were not allocated from the supplied manager".to_owned(),
             ));
         }
-        let inner = match mode {
-            ReducedSwirlSourceReceiptMode::Inline => ReducedSwirlSourceReceiptComponent::new(
-                Arc::clone(&child_vk),
-                profile.clone(),
-                wrapper_params,
-                receipt_bus,
-                authority_bus,
-                bus_idx_manager,
-            ),
-            ReducedSwirlSourceReceiptMode::Detached => {
-                ReducedSwirlSourceReceiptComponent::new_detached(
-                    Arc::clone(&child_vk),
-                    profile.clone(),
-                    wrapper_params,
-                    receipt_bus,
-                    authority_bus,
-                    bus_idx_manager,
-                )
-            }
-        }
+        let inner = ReducedSwirlSourceReceiptComponent::new(
+            Arc::clone(&child_vk),
+            profile.clone(),
+            wrapper_params,
+            receipt_bus,
+            authority_bus,
+            bus_idx_manager,
+        )
         .map_err(ReducedSwirlSourceReceiptAdapterError::Profile)?;
         let protocol_digest = reduced_swirl_source_receipt_component_digest(
             child_vk.as_ref(),
@@ -252,64 +188,8 @@ impl<const MAX_SOURCES: usize> ProductionReducedSwirlSourceReceiptComponent<MAX_
         &self.inner
     }
 
-    #[must_use]
-    pub const fn mode(&self) -> ReducedSwirlSourceReceiptMode {
-        self.inner.mode()
-    }
-
-    pub fn generate_cpu_contexts(
-        &self,
-        app_vk: &MultiStarkVerifyingKey<SC>,
-        prefixes: &[RetainedStackingProof],
-        claims: &[AuthoritativeSwirlConstrainedRsClaim],
-        native_statement: &ReducedSwirlNativeStatement,
-    ) -> Result<Vec<AirProvingContext<CpuBackend<SC>>>, ReducedSwirlSourceReceiptAdapterError> {
-        let packet = generate_reduced_swirl_source_receipt_cpu_packet(
-            &self.inner,
-            app_vk,
-            prefixes,
-            claims,
-            native_statement,
-        )?;
-        validate_component_contexts(&self.inner, &packet.contexts)?;
-        Ok(packet
-            .contexts
-            .into_iter()
-            .map(|(_, context)| context)
-            .collect())
-    }
-
-    /// Generate one bounded source interval for a combined source/VACC leaf.
-    ///
-    /// Unlike the detached source-leaf API, this requires an
-    /// [`ReducedSwirlSourceReceiptMode::Inline`] setup. Consequently the
-    /// returned contexts retain the setup-fixed fanout-two source exports and
-    /// emit the per-source authority records consumed by the sibling VACC component.
-    /// `source_offset` is global and is preserved in the canonical receipt;
-    /// proof indices inside this bounded verifier packet remain leaf-local.
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate_cpu_inline_range_packet(
-        &self,
-        app_vk: &MultiStarkVerifyingKey<SC>,
-        prefixes: &[RetainedStackingProof],
-        claims: &[AuthoritativeSwirlConstrainedRsClaim],
-        native_statement: &ReducedSwirlNativeStatement,
-        source_offset: u32,
-        external_poseidon2_compression_inputs: &[[F; POSEIDON2_WIDTH]],
-    ) -> Result<ReducedSwirlSourceReceiptCpuPacket, ReducedSwirlSourceReceiptAdapterError> {
-        generate_reduced_swirl_source_receipt_cpu_inline_range_packet(
-            &self.inner,
-            app_vk,
-            prefixes,
-            claims,
-            native_statement,
-            source_offset,
-            external_poseidon2_compression_inputs,
-        )
-    }
-
-    /// Generate an Inline source packet while the native stream is still in
-    /// flight and therefore has no final flat block manifest.
+    /// Generate a source packet while the native stream is still in flight
+    /// and therefore has no final flat block manifest.
     ///
     /// `total_source_count` is the setup-fixed source count for this proving
     /// run. `local_source_bindings` must be the exact ordered entry digests
@@ -317,7 +197,7 @@ impl<const MAX_SOURCES: usize> ProductionReducedSwirlSourceReceiptComponent<MAX_
     /// global `source_offset`. Every digest is independently re-derived from
     /// `prefixes` and `claims`; no caller-supplied success bit is accepted.
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_cpu_in_flight_inline_packet(
+    pub fn generate_cpu_in_flight_packet(
         &self,
         app_vk: &MultiStarkVerifyingKey<SC>,
         prefixes: &[RetainedStackingProof],
@@ -327,7 +207,7 @@ impl<const MAX_SOURCES: usize> ProductionReducedSwirlSourceReceiptComponent<MAX_
         local_source_bindings: &[Digest],
         external_poseidon2_compression_inputs: &[[F; POSEIDON2_WIDTH]],
     ) -> Result<ReducedSwirlSourceReceiptCpuPacket, ReducedSwirlSourceReceiptAdapterError> {
-        generate_reduced_swirl_source_receipt_cpu_in_flight_inline_packet(
+        generate_reduced_swirl_source_receipt_cpu_in_flight_packet(
             &self.inner,
             app_vk,
             prefixes,
@@ -336,64 +216,6 @@ impl<const MAX_SOURCES: usize> ProductionReducedSwirlSourceReceiptComponent<MAX_
             source_offset,
             local_source_bindings,
             external_poseidon2_compression_inputs,
-        )
-    }
-
-    /// CUDA counterpart of [`Self::generate_cpu_inline_range_packet`]. Large
-    /// verifier matrices are generated directly on `engine` and remain device
-    /// resident in the returned packet. Only the bounded checkpoint table is
-    /// copied to the host to construct and differentially validate the receipt.
-    #[cfg(feature = "cuda")]
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate_cuda_inline_range_packet(
-        &self,
-        app_vk: &MultiStarkVerifyingKey<SC>,
-        prefixes: &[RetainedStackingProof],
-        claims: &[AuthoritativeSwirlConstrainedRsClaim],
-        native_statement: &ReducedSwirlNativeStatement,
-        source_offset: u32,
-        external_poseidon2_compression_inputs: &[[F; POSEIDON2_WIDTH]],
-        engine: &BabyBearPoseidon2GpuEngine,
-    ) -> Result<ReducedSwirlSourceReceiptCudaPacket, ReducedSwirlSourceReceiptAdapterError> {
-        generate_reduced_swirl_source_receipt_cuda_inline_range_packet(
-            &self.inner,
-            app_vk,
-            prefixes,
-            claims,
-            native_statement,
-            source_offset,
-            external_poseidon2_compression_inputs,
-            engine,
-        )
-    }
-
-    /// CUDA counterpart of
-    /// [`Self::generate_cpu_in_flight_inline_packet`]. The verifier matrices
-    /// remain device resident and only the bounded checkpoint table is copied
-    /// back for canonical receipt construction and differential validation.
-    #[cfg(feature = "cuda")]
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate_cuda_in_flight_inline_packet(
-        &self,
-        app_vk: &MultiStarkVerifyingKey<SC>,
-        prefixes: &[RetainedStackingProof],
-        claims: &[AuthoritativeSwirlConstrainedRsClaim],
-        total_source_count: usize,
-        source_offset: u32,
-        local_source_bindings: &[Digest],
-        external_poseidon2_compression_inputs: &[[F; POSEIDON2_WIDTH]],
-        engine: &BabyBearPoseidon2GpuEngine,
-    ) -> Result<ReducedSwirlSourceReceiptCudaPacket, ReducedSwirlSourceReceiptAdapterError> {
-        generate_reduced_swirl_source_receipt_cuda_in_flight_inline_packet(
-            &self.inner,
-            app_vk,
-            prefixes,
-            claims,
-            total_source_count,
-            source_offset,
-            local_source_bindings,
-            external_poseidon2_compression_inputs,
-            engine,
         )
     }
 
@@ -425,7 +247,7 @@ impl<const MAX_SOURCES: usize> ProductionReducedSwirlSourceReceiptComponent<MAX_
     /// the immutable cached trace is shared.
     #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_cuda_in_flight_inline_packet_with_cached_vk(
+    pub fn generate_cuda_in_flight_packet_with_cached_vk(
         &self,
         app_vk: &MultiStarkVerifyingKey<SC>,
         prefixes: &[RetainedStackingProof],
@@ -442,13 +264,10 @@ impl<const MAX_SOURCES: usize> ProductionReducedSwirlSourceReceiptComponent<MAX_
             app_vk,
             prefixes,
             claims,
-            ReducedSwirlSourceReceiptBinding::InFlight {
-                total_source_count,
-                local_source_bindings,
-            },
+            total_source_count,
             source_offset,
+            local_source_bindings,
             external_poseidon2_compression_inputs,
-            ReducedSwirlSourceReceiptPacketKind::BoundedInFlightInline,
             Some(cached_vk),
             engine,
         )
@@ -539,71 +358,7 @@ pub fn reduced_swirl_source_receipt_profile(
     Ok(profile)
 }
 
-/// Canonicalize all retained sources in segment order from checkpoint rows
-/// generated by the ordinary deferred verifier.
-pub fn build_reduced_swirl_source_receipt_block(
-    profile: &ReducedSwirlSourceReceiptProfile,
-    app_vk: &MultiStarkVerifyingKey<SC>,
-    prefixes: &[RetainedStackingProof],
-    claims: &[AuthoritativeSwirlConstrainedRsClaim],
-    checkpoints: &[DeferredOpeningCheckpointWitness],
-    native_statement: &ReducedSwirlNativeStatement,
-) -> Result<ReducedSwirlSourceReceiptBlock, ReducedSwirlSourceReceiptAdapterError> {
-    let block = build_reduced_swirl_source_receipt_range_block(
-        profile,
-        app_vk,
-        prefixes,
-        claims,
-        checkpoints,
-        native_statement,
-        0,
-    )?;
-    if prefixes.len() != native_statement.source_bindings.len() {
-        return Err(ReducedSwirlSourceReceiptAdapterError::NativeSourceBindings);
-    }
-    if native_statement.block_manifest_digest != block.manifest_digest {
-        return Err(ReducedSwirlSourceReceiptAdapterError::NativeManifest);
-    }
-    Ok(block)
-}
-
-/// Canonicalize one bounded global source interval. The supplied prefix,
-/// claim and checkpoint slices all begin at `source_offset`; every entry is
-/// differentially checked against the corresponding native-statement binding.
-/// The returned manifest commits to this interval only. Use
-/// [`build_reduced_swirl_source_receipt_block`] for the complete block and its
-/// global manifest check.
-pub fn build_reduced_swirl_source_receipt_range_block(
-    profile: &ReducedSwirlSourceReceiptProfile,
-    app_vk: &MultiStarkVerifyingKey<SC>,
-    prefixes: &[RetainedStackingProof],
-    claims: &[AuthoritativeSwirlConstrainedRsClaim],
-    checkpoints: &[DeferredOpeningCheckpointWitness],
-    native_statement: &ReducedSwirlNativeStatement,
-    source_offset: u32,
-) -> Result<ReducedSwirlSourceReceiptBlock, ReducedSwirlSourceReceiptAdapterError> {
-    native_statement.validate().map_err(|error| {
-        ReducedSwirlSourceReceiptAdapterError::NativeStatement(error.to_string())
-    })?;
-    let block = build_reduced_swirl_source_receipt_bounded_block(
-        profile,
-        app_vk,
-        prefixes,
-        claims,
-        checkpoints,
-        native_statement.source_bindings.len(),
-        source_offset,
-    )?;
-    let entry_digests = block
-        .sources
-        .iter()
-        .map(|source| source.entry_digest)
-        .collect::<Vec<_>>();
-    validate_native_source_binding_range(native_statement, source_offset, &entry_digests)?;
-    Ok(block)
-}
-
-/// Canonicalize a bounded Inline source interval before the final native
+/// Canonicalize a bounded source interval before the final native
 /// statement exists.
 ///
 /// This function deliberately has no block-manifest argument. Its
@@ -885,124 +640,14 @@ fn validate_in_flight_source_binding_range(
     Ok(())
 }
 
-fn validate_native_source_binding_range(
-    native_statement: &ReducedSwirlNativeStatement,
-    source_offset: u32,
-    entry_digests: &[Digest],
-) -> Result<(), ReducedSwirlSourceReceiptAdapterError> {
-    native_statement.validate().map_err(|error| {
-        ReducedSwirlSourceReceiptAdapterError::NativeStatement(error.to_string())
-    })?;
-    let source_start = source_offset as usize;
-    let source_end = source_start.checked_add(entry_digests.len()).ok_or(
-        ReducedSwirlSourceReceiptAdapterError::SourceRange {
-            source_offset,
-            source_count: entry_digests.len(),
-            native_sources: native_statement.source_bindings.len(),
-        },
-    )?;
-    if entry_digests.is_empty() || source_end > native_statement.source_bindings.len() {
-        return Err(ReducedSwirlSourceReceiptAdapterError::SourceRange {
-            source_offset,
-            source_count: entry_digests.len(),
-            native_sources: native_statement.source_bindings.len(),
-        });
-    }
-    if native_statement.source_bindings[source_start..source_end] != entry_digests[..] {
-        return Err(ReducedSwirlSourceReceiptAdapterError::NativeSourceBindings);
-    }
-    Ok(())
-}
-
-/// Generate the existing deferred-verifier traces and the source/receipt
-/// auxiliaries in one component-local inventory. The ordinary public
-/// checkpoint context is removed because the receipt AIR consumes the exact
-/// typed checkpoint and final-state buses privately.
-pub fn generate_reduced_swirl_source_receipt_cpu_packet<const MAX_SOURCES: usize>(
-    component: &ReducedSwirlSourceReceiptComponent<MAX_SOURCES>,
-    app_vk: &MultiStarkVerifyingKey<SC>,
-    prefixes: &[RetainedStackingProof],
-    claims: &[AuthoritativeSwirlConstrainedRsClaim],
-    native_statement: &ReducedSwirlNativeStatement,
-) -> Result<ReducedSwirlSourceReceiptCpuPacket, ReducedSwirlSourceReceiptAdapterError> {
-    generate_reduced_swirl_source_receipt_cpu_packet_impl(
-        component,
-        app_vk,
-        prefixes,
-        claims,
-        ReducedSwirlSourceReceiptBinding::Finalized(native_statement),
-        0,
-        &[],
-        ReducedSwirlSourceReceiptPacketKind::FullBlockInline,
-    )
-}
-
-/// Generate one bounded source-leaf interval on CPU. Boundary compression
-/// pre-states are serviced by the existing source-receipt Poseidon owner.
-#[allow(clippy::too_many_arguments)]
-pub fn generate_reduced_swirl_source_receipt_cpu_range_packet<const MAX_SOURCES: usize>(
-    component: &ReducedSwirlSourceReceiptComponent<MAX_SOURCES>,
-    app_vk: &MultiStarkVerifyingKey<SC>,
-    prefixes: &[RetainedStackingProof],
-    claims: &[AuthoritativeSwirlConstrainedRsClaim],
-    native_statement: &ReducedSwirlNativeStatement,
-    source_offset: u32,
-    external_poseidon2_compression_inputs: &[[F; POSEIDON2_WIDTH]],
-) -> Result<ReducedSwirlSourceReceiptCpuPacket, ReducedSwirlSourceReceiptAdapterError> {
-    generate_reduced_swirl_source_receipt_cpu_packet_impl(
-        component,
-        app_vk,
-        prefixes,
-        claims,
-        ReducedSwirlSourceReceiptBinding::Finalized(native_statement),
-        source_offset,
-        external_poseidon2_compression_inputs,
-        ReducedSwirlSourceReceiptPacketKind::BoundedRangeDetached,
-    )
-}
-
-/// Generate one bounded source interval under an inline, setup-fixed source
-/// component. This is the packet path for a combined source/VACC leaf: source
-/// exports have fanout two and the receipt AIR emits authority records for the
-/// sibling VACC AIRs. The existing detached range API remains detached-only.
-///
-/// The supplied slices contain only the interval beginning at the global
-/// `source_offset`. No full-block verifier matrix is generated or retained,
-/// while [`ReducedSwirlSourceReceiptBlock::source_offset`] and each canonical
-/// segment index retain their global values.
-#[allow(clippy::too_many_arguments)]
-pub fn generate_reduced_swirl_source_receipt_cpu_inline_range_packet<const MAX_SOURCES: usize>(
-    component: &ReducedSwirlSourceReceiptComponent<MAX_SOURCES>,
-    app_vk: &MultiStarkVerifyingKey<SC>,
-    prefixes: &[RetainedStackingProof],
-    claims: &[AuthoritativeSwirlConstrainedRsClaim],
-    native_statement: &ReducedSwirlNativeStatement,
-    source_offset: u32,
-    external_poseidon2_compression_inputs: &[[F; POSEIDON2_WIDTH]],
-) -> Result<ReducedSwirlSourceReceiptCpuPacket, ReducedSwirlSourceReceiptAdapterError> {
-    generate_reduced_swirl_source_receipt_cpu_packet_impl(
-        component,
-        app_vk,
-        prefixes,
-        claims,
-        ReducedSwirlSourceReceiptBinding::Finalized(native_statement),
-        source_offset,
-        external_poseidon2_compression_inputs,
-        ReducedSwirlSourceReceiptPacketKind::BoundedRangeInline,
-    )
-}
-
 /// Generate one bounded source/VACC leaf packet before the final native
 /// statement and flat block manifest exist.
 ///
-/// The component must be setup in [`ReducedSwirlSourceReceiptMode::Inline`].
 /// Exactly `1..=8` retained prefixes are admitted. `local_source_bindings`
 /// comes from the live native stream and is compared against independently
 /// derived canonical entry digests in global source order.
 #[allow(clippy::too_many_arguments)]
-pub fn generate_reduced_swirl_source_receipt_cpu_in_flight_inline_packet<
-    const MAX_SOURCES: usize,
->(
+pub fn generate_reduced_swirl_source_receipt_cpu_in_flight_packet<const MAX_SOURCES: usize>(
     component: &ReducedSwirlSourceReceiptComponent<MAX_SOURCES>,
     app_vk: &MultiStarkVerifyingKey<SC>,
     prefixes: &[RetainedStackingProof],
@@ -1017,54 +662,11 @@ pub fn generate_reduced_swirl_source_receipt_cpu_in_flight_inline_packet<
         app_vk,
         prefixes,
         claims,
-        ReducedSwirlSourceReceiptBinding::InFlight {
-            total_source_count,
-            local_source_bindings,
-        },
+        total_source_count,
         source_offset,
+        local_source_bindings,
         external_poseidon2_compression_inputs,
-        ReducedSwirlSourceReceiptPacketKind::BoundedInFlightInline,
     )
-}
-
-/// A named packet kind fixes both the source-export wiring and the manifest
-/// validation policy. Keeping this choice out of public boolean arguments
-/// prevents a detached proving key from being used as an inline authority (or
-/// vice versa).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReducedSwirlSourceReceiptPacketKind {
-    FullBlockInline,
-    BoundedRangeDetached,
-    BoundedRangeInline,
-    BoundedInFlightInline,
-}
-
-impl ReducedSwirlSourceReceiptPacketKind {
-    const fn expected_mode(self) -> ReducedSwirlSourceReceiptMode {
-        match self {
-            Self::FullBlockInline | Self::BoundedRangeInline | Self::BoundedInFlightInline => {
-                ReducedSwirlSourceReceiptMode::Inline
-            }
-            Self::BoundedRangeDetached => ReducedSwirlSourceReceiptMode::Detached,
-        }
-    }
-
-    const fn require_full_block(self) -> bool {
-        matches!(self, Self::FullBlockInline)
-    }
-
-    const fn is_in_flight(self) -> bool {
-        matches!(self, Self::BoundedInFlightInline)
-    }
-}
-
-#[derive(Clone, Copy)]
-enum ReducedSwirlSourceReceiptBinding<'a> {
-    Finalized(&'a ReducedSwirlNativeStatement),
-    InFlight {
-        total_source_count: usize,
-        local_source_bindings: &'a [Digest],
-    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1073,24 +675,19 @@ fn generate_reduced_swirl_source_receipt_cpu_packet_impl<const MAX_SOURCES: usiz
     app_vk: &MultiStarkVerifyingKey<SC>,
     prefixes: &[RetainedStackingProof],
     claims: &[AuthoritativeSwirlConstrainedRsClaim],
-    source_binding: ReducedSwirlSourceReceiptBinding<'_>,
+    total_source_count: usize,
     source_offset: u32,
+    local_source_bindings: &[Digest],
     external_poseidon2_compression_inputs: &[[F; POSEIDON2_WIDTH]],
-    packet_kind: ReducedSwirlSourceReceiptPacketKind,
 ) -> Result<ReducedSwirlSourceReceiptCpuPacket, ReducedSwirlSourceReceiptAdapterError> {
     if component.receipt_air().profile.source.maximum_sources != MAX_SOURCES {
         return Err(ReducedSwirlSourceReceiptAdapterError::Profile(
             "reduced-SWIRL source component capacity mismatch",
         ));
     }
-    if component.mode() != packet_kind.expected_mode() {
-        return Err(ReducedSwirlSourceReceiptAdapterError::Profile(
-            "reduced-SWIRL source packet/component mode mismatch",
-        ));
-    }
     if prefixes.is_empty()
         || prefixes.len() > MAX_SOURCES
-        || packet_kind.is_in_flight() && prefixes.len() > REDUCED_SWIRL_IN_FLIGHT_SOURCE_CAPACITY
+        || prefixes.len() > REDUCED_SWIRL_IN_FLIGHT_SOURCE_CAPACITY
         || prefixes.len() != claims.len()
     {
         return Err(ReducedSwirlSourceReceiptAdapterError::Count {
@@ -1165,10 +762,10 @@ fn generate_reduced_swirl_source_receipt_cpu_packet_impl<const MAX_SOURCES: usiz
         prefixes,
         claims,
         &checkpoints,
-        source_binding,
+        total_source_count,
         source_offset,
+        local_source_bindings,
         external_poseidon2_compression_inputs,
-        packet_kind.require_full_block(),
     )?;
     let mut contexts = verifier_contexts
         .into_iter()
@@ -1188,107 +785,9 @@ fn generate_reduced_swirl_source_receipt_cpu_packet_impl<const MAX_SOURCES: usiz
     Ok(ReducedSwirlSourceReceiptCpuPacket { contexts, block })
 }
 
-/// Generate the authoritative deferred-verifier witness directly on CUDA.
-///
-/// This is protocol-identical to
-/// [`generate_reduced_swirl_source_receipt_cpu_packet`].  The only D2H copy is
-/// the small checkpoint trace needed to construct and independently validate
-/// the canonical source receipt.  In particular, the large recursive
-/// verifier matrices are never materialized on the host and then uploaded a
-/// second time.
-#[cfg(feature = "cuda")]
-pub fn generate_reduced_swirl_source_receipt_cuda_packet<const MAX_SOURCES: usize>(
-    component: &ReducedSwirlSourceReceiptComponent<MAX_SOURCES>,
-    app_vk: &MultiStarkVerifyingKey<SC>,
-    prefixes: &[RetainedStackingProof],
-    claims: &[AuthoritativeSwirlConstrainedRsClaim],
-    native_statement: &ReducedSwirlNativeStatement,
-    engine: &BabyBearPoseidon2GpuEngine,
-) -> Result<ReducedSwirlSourceReceiptCudaPacket, ReducedSwirlSourceReceiptAdapterError> {
-    generate_reduced_swirl_source_receipt_cuda_packet_impl(
-        component,
-        app_vk,
-        prefixes,
-        claims,
-        ReducedSwirlSourceReceiptBinding::Finalized(native_statement),
-        0,
-        &[],
-        ReducedSwirlSourceReceiptPacketKind::FullBlockInline,
-        None,
-        engine,
-    )
-}
-
-/// CUDA counterpart of
-/// [`generate_reduced_swirl_source_receipt_cpu_range_packet`]. The large
-/// deferred-verifier traces remain device resident; only the compact
-/// checkpoint table is copied to the host for differential validation.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
-pub fn generate_reduced_swirl_source_receipt_cuda_range_packet<const MAX_SOURCES: usize>(
-    component: &ReducedSwirlSourceReceiptComponent<MAX_SOURCES>,
-    app_vk: &MultiStarkVerifyingKey<SC>,
-    prefixes: &[RetainedStackingProof],
-    claims: &[AuthoritativeSwirlConstrainedRsClaim],
-    native_statement: &ReducedSwirlNativeStatement,
-    source_offset: u32,
-    external_poseidon2_compression_inputs: &[[F; POSEIDON2_WIDTH]],
-    engine: &BabyBearPoseidon2GpuEngine,
-) -> Result<ReducedSwirlSourceReceiptCudaPacket, ReducedSwirlSourceReceiptAdapterError> {
-    generate_reduced_swirl_source_receipt_cuda_packet_impl(
-        component,
-        app_vk,
-        prefixes,
-        claims,
-        ReducedSwirlSourceReceiptBinding::Finalized(native_statement),
-        source_offset,
-        external_poseidon2_compression_inputs,
-        ReducedSwirlSourceReceiptPacketKind::BoundedRangeDetached,
-        None,
-        engine,
-    )
-}
-
-/// CUDA counterpart of
-/// [`generate_reduced_swirl_source_receipt_cpu_inline_range_packet`]. The
-/// packet preserves inline source-authority exports for a sibling VACC in the
-/// same combined leaf while retaining only this bounded interval's matrices.
-#[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
-pub fn generate_reduced_swirl_source_receipt_cuda_inline_range_packet<const MAX_SOURCES: usize>(
-    component: &ReducedSwirlSourceReceiptComponent<MAX_SOURCES>,
-    app_vk: &MultiStarkVerifyingKey<SC>,
-    prefixes: &[RetainedStackingProof],
-    claims: &[AuthoritativeSwirlConstrainedRsClaim],
-    native_statement: &ReducedSwirlNativeStatement,
-    source_offset: u32,
-    external_poseidon2_compression_inputs: &[[F; POSEIDON2_WIDTH]],
-    engine: &BabyBearPoseidon2GpuEngine,
-) -> Result<ReducedSwirlSourceReceiptCudaPacket, ReducedSwirlSourceReceiptAdapterError> {
-    generate_reduced_swirl_source_receipt_cuda_packet_impl(
-        component,
-        app_vk,
-        prefixes,
-        claims,
-        ReducedSwirlSourceReceiptBinding::Finalized(native_statement),
-        source_offset,
-        external_poseidon2_compression_inputs,
-        ReducedSwirlSourceReceiptPacketKind::BoundedRangeInline,
-        None,
-        engine,
-    )
-}
-
-/// CUDA counterpart of
-/// [`generate_reduced_swirl_source_receipt_cpu_in_flight_inline_packet`].
-/// Large verifier matrices stay on the target device; the bounded checkpoint
-/// table alone is copied back for canonical digest derivation and comparison
-/// with the live source bindings.
-#[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
-pub fn generate_reduced_swirl_source_receipt_cuda_in_flight_inline_packet<
-    const MAX_SOURCES: usize,
->(
+fn generate_reduced_swirl_source_receipt_cuda_packet_impl<const MAX_SOURCES: usize>(
     component: &ReducedSwirlSourceReceiptComponent<MAX_SOURCES>,
     app_vk: &MultiStarkVerifyingKey<SC>,
     prefixes: &[RetainedStackingProof],
@@ -1297,36 +796,6 @@ pub fn generate_reduced_swirl_source_receipt_cuda_in_flight_inline_packet<
     source_offset: u32,
     local_source_bindings: &[Digest],
     external_poseidon2_compression_inputs: &[[F; POSEIDON2_WIDTH]],
-    engine: &BabyBearPoseidon2GpuEngine,
-) -> Result<ReducedSwirlSourceReceiptCudaPacket, ReducedSwirlSourceReceiptAdapterError> {
-    generate_reduced_swirl_source_receipt_cuda_packet_impl(
-        component,
-        app_vk,
-        prefixes,
-        claims,
-        ReducedSwirlSourceReceiptBinding::InFlight {
-            total_source_count,
-            local_source_bindings,
-        },
-        source_offset,
-        external_poseidon2_compression_inputs,
-        ReducedSwirlSourceReceiptPacketKind::BoundedInFlightInline,
-        None,
-        engine,
-    )
-}
-
-#[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
-fn generate_reduced_swirl_source_receipt_cuda_packet_impl<const MAX_SOURCES: usize>(
-    component: &ReducedSwirlSourceReceiptComponent<MAX_SOURCES>,
-    app_vk: &MultiStarkVerifyingKey<SC>,
-    prefixes: &[RetainedStackingProof],
-    claims: &[AuthoritativeSwirlConstrainedRsClaim],
-    source_binding: ReducedSwirlSourceReceiptBinding<'_>,
-    source_offset: u32,
-    external_poseidon2_compression_inputs: &[[F; POSEIDON2_WIDTH]],
-    packet_kind: ReducedSwirlSourceReceiptPacketKind,
     cached_vk: Option<&CommittedTraceData<GpuBackend>>,
     engine: &BabyBearPoseidon2GpuEngine,
 ) -> Result<ReducedSwirlSourceReceiptCudaPacket, ReducedSwirlSourceReceiptAdapterError> {
@@ -1335,14 +804,9 @@ fn generate_reduced_swirl_source_receipt_cuda_packet_impl<const MAX_SOURCES: usi
             "reduced-SWIRL source component capacity mismatch",
         ));
     }
-    if component.mode() != packet_kind.expected_mode() {
-        return Err(ReducedSwirlSourceReceiptAdapterError::Profile(
-            "reduced-SWIRL source packet/component mode mismatch",
-        ));
-    }
     if prefixes.is_empty()
         || prefixes.len() > MAX_SOURCES
-        || packet_kind.is_in_flight() && prefixes.len() > REDUCED_SWIRL_IN_FLIGHT_SOURCE_CAPACITY
+        || prefixes.len() > REDUCED_SWIRL_IN_FLIGHT_SOURCE_CAPACITY
         || prefixes.len() != claims.len()
     {
         return Err(ReducedSwirlSourceReceiptAdapterError::Count {
@@ -1424,10 +888,10 @@ fn generate_reduced_swirl_source_receipt_cuda_packet_impl<const MAX_SOURCES: usi
         prefixes,
         claims,
         &checkpoints,
-        source_binding,
+        total_source_count,
         source_offset,
+        local_source_bindings,
         external_poseidon2_compression_inputs,
-        packet_kind.require_full_block(),
     )?;
     let auxiliary_contexts = auxiliary_contexts
         .into_iter()
@@ -1461,10 +925,10 @@ fn build_source_receipt_auxiliary_cpu_contexts<const MAX_SOURCES: usize>(
     prefixes: &[RetainedStackingProof],
     claims: &[AuthoritativeSwirlConstrainedRsClaim],
     checkpoints: &[DeferredOpeningCheckpointWitness],
-    source_binding: ReducedSwirlSourceReceiptBinding<'_>,
+    total_source_count: usize,
     source_offset: u32,
+    local_source_bindings: &[Digest],
     external_poseidon2_compression_inputs: &[[F; POSEIDON2_WIDTH]],
-    require_full_block: bool,
 ) -> Result<
     (
         ReducedSwirlSourceReceiptBlock,
@@ -1472,50 +936,16 @@ fn build_source_receipt_auxiliary_cpu_contexts<const MAX_SOURCES: usize>(
     ),
     ReducedSwirlSourceReceiptAdapterError,
 > {
-    let block = match (require_full_block, source_binding) {
-        (true, ReducedSwirlSourceReceiptBinding::Finalized(native_statement)) => {
-            build_reduced_swirl_source_receipt_block(
-                &component.receipt_air().profile,
-                app_vk,
-                prefixes,
-                claims,
-                checkpoints,
-                native_statement,
-            )?
-        }
-        (false, ReducedSwirlSourceReceiptBinding::Finalized(native_statement)) => {
-            build_reduced_swirl_source_receipt_range_block(
-                &component.receipt_air().profile,
-                app_vk,
-                prefixes,
-                claims,
-                checkpoints,
-                native_statement,
-                source_offset,
-            )?
-        }
-        (
-            false,
-            ReducedSwirlSourceReceiptBinding::InFlight {
-                total_source_count,
-                local_source_bindings,
-            },
-        ) => build_reduced_swirl_source_receipt_in_flight_block(
-            &component.receipt_air().profile,
-            app_vk,
-            prefixes,
-            claims,
-            checkpoints,
-            total_source_count,
-            source_offset,
-            local_source_bindings,
-        )?,
-        (true, ReducedSwirlSourceReceiptBinding::InFlight { .. }) => {
-            return Err(ReducedSwirlSourceReceiptAdapterError::Profile(
-                "in-flight source receipt cannot claim a complete flat block manifest",
-            ));
-        }
-    };
+    let block = build_reduced_swirl_source_receipt_in_flight_block(
+        &component.receipt_air().profile,
+        app_vk,
+        prefixes,
+        claims,
+        checkpoints,
+        total_source_count,
+        source_offset,
+        local_source_bindings,
+    )?;
     let source_records = prefixes
         .iter()
         .zip(claims)
@@ -1591,9 +1021,11 @@ fn reduced_swirl_source_receipt_component_digest<const MAX_SOURCES: usize>(
     observe_component_digest(&mut transcript, params_digest);
     observe_component_digest(&mut transcript, profile.protocol_digest);
     observe_component_digest(&mut transcript, profile.child_vk_pre_hash);
-    observe_component_mode(
+    // Preserve the original inline-mode setup tag in the key digest while
+    // making that mode the sole constructible architecture.
+    observe_component_usize(&mut transcript, 0)?;
+    observe_component_usize(
         &mut transcript,
-        component.mode(),
         component.source_air().export_lookup_count as usize,
     )?;
     for value in [
@@ -1665,15 +1097,6 @@ fn observe_component_digest(
     }
 }
 
-fn observe_component_mode(
-    transcript: &mut impl FiatShamirTranscript<BabyBearPoseidon2Config>,
-    mode: ReducedSwirlSourceReceiptMode,
-    export_lookup_count: usize,
-) -> Result<(), ReducedSwirlSourceReceiptAdapterError> {
-    observe_component_usize(transcript, mode.protocol_tag())?;
-    observe_component_usize(transcript, export_lookup_count)
-}
-
 fn observe_component_bytes(
     transcript: &mut impl FiatShamirTranscript<BabyBearPoseidon2Config>,
     bytes: &[u8],
@@ -1712,9 +1135,7 @@ mod tests {
     use super::*;
     use crate::prover::native_warp::{
         reduced_swirl_boundary::{ReducedSwirlVmBoundary, ReducedSwirlVmState},
-        reduced_swirl_native::{
-            reduced_swirl_manifest_digest, REDUCED_SWIRL_NATIVE_PROTOCOL_VERSION,
-        },
+        reduced_swirl_native::reduced_swirl_manifest_digest,
     };
 
     fn digest(seed: u32) -> Digest {
@@ -1828,8 +1249,8 @@ mod tests {
             block.manifest_digest
         );
 
-        // A detached nonterminal leaf uses global source indices while its
-        // one-entry manifest remains local to the leaf interval.
+        // A bounded nonterminal transition leaf uses global source indices
+        // while its one-entry manifest remains local to the leaf interval.
         let mut chunk = block.clone();
         chunk.source_offset = 7;
         chunk.sources[0].segment_index = 7;
@@ -1868,32 +1289,6 @@ mod tests {
             sdk_prefix.digest_with_claim(&mutated_claim).unwrap(),
             source.entry_digest
         );
-    }
-
-    #[test]
-    fn native_source_range_checks_offset_order_and_bounds() {
-        let bindings = vec![digest(10), digest(20), digest(30), digest(40)];
-        let native = ReducedSwirlNativeStatement {
-            protocol_version: REDUCED_SWIRL_NATIVE_PROTOCOL_VERSION,
-            block_manifest_digest: reduced_swirl_manifest_digest(&bindings).unwrap(),
-            source_bindings: bindings.clone(),
-        };
-
-        validate_native_source_binding_range(&native, 1, &bindings[1..3]).unwrap();
-
-        let reordered = [bindings[2], bindings[1]];
-        assert!(matches!(
-            validate_native_source_binding_range(&native, 1, &reordered),
-            Err(ReducedSwirlSourceReceiptAdapterError::NativeSourceBindings)
-        ));
-        assert!(matches!(
-            validate_native_source_binding_range(&native, 3, &bindings[1..3]),
-            Err(ReducedSwirlSourceReceiptAdapterError::SourceRange { .. })
-        ));
-        assert!(matches!(
-            validate_native_source_binding_range(&native, 0, &[]),
-            Err(ReducedSwirlSourceReceiptAdapterError::SourceRange { .. })
-        ));
     }
 
     #[test]
@@ -1940,59 +1335,5 @@ mod tests {
             validate_in_flight_source_binding_range(u32::MAX as usize + 1, 0, 1, &bindings[..1],),
             Err(ReducedSwirlSourceReceiptAdapterError::SourceRange { .. })
         ));
-    }
-
-    #[test]
-    fn detached_mode_changes_component_digest_binding() {
-        fn mode_binding(mode: ReducedSwirlSourceReceiptMode) -> Digest {
-            let mut transcript = default_duplex_sponge_recorder();
-            observe_component_bytes(&mut transcript, SOURCE_RECEIPT_COMPONENT_DIGEST_TAG);
-            observe_component_mode(&mut transcript, mode, mode.export_lookup_count() as usize)
-                .unwrap();
-            core::array::from_fn(|_| {
-                <_ as FiatShamirTranscript<BabyBearPoseidon2Config>>::sample(&mut transcript)
-            })
-        }
-
-        assert_eq!(
-            ReducedSwirlSourceReceiptMode::Inline.export_lookup_count(),
-            2
-        );
-        assert_eq!(
-            ReducedSwirlSourceReceiptMode::Detached.export_lookup_count(),
-            1
-        );
-        assert_ne!(
-            mode_binding(ReducedSwirlSourceReceiptMode::Inline),
-            mode_binding(ReducedSwirlSourceReceiptMode::Detached)
-        );
-    }
-
-    #[test]
-    fn packet_kinds_keep_export_mode_and_manifest_policy_setup_fixed() {
-        assert_eq!(
-            ReducedSwirlSourceReceiptPacketKind::FullBlockInline.expected_mode(),
-            ReducedSwirlSourceReceiptMode::Inline
-        );
-        assert!(ReducedSwirlSourceReceiptPacketKind::FullBlockInline.require_full_block());
-
-        assert_eq!(
-            ReducedSwirlSourceReceiptPacketKind::BoundedRangeInline.expected_mode(),
-            ReducedSwirlSourceReceiptMode::Inline
-        );
-        assert!(!ReducedSwirlSourceReceiptPacketKind::BoundedRangeInline.require_full_block());
-
-        assert_eq!(
-            ReducedSwirlSourceReceiptPacketKind::BoundedInFlightInline.expected_mode(),
-            ReducedSwirlSourceReceiptMode::Inline
-        );
-        assert!(ReducedSwirlSourceReceiptPacketKind::BoundedInFlightInline.is_in_flight());
-        assert!(!ReducedSwirlSourceReceiptPacketKind::BoundedInFlightInline.require_full_block());
-
-        assert_eq!(
-            ReducedSwirlSourceReceiptPacketKind::BoundedRangeDetached.expected_mode(),
-            ReducedSwirlSourceReceiptMode::Detached
-        );
-        assert!(!ReducedSwirlSourceReceiptPacketKind::BoundedRangeDetached.require_full_block());
     }
 }

@@ -1,11 +1,3 @@
-[patch."https://github.com/openvm-org/stark-backend.git"]
-openvm-stark-backend = { git = "https://github.com/OpenVM-WARP/stark-backend-warp.git", rev = "f1d9da7943a70793945c7acc7ecf17f41e501a82" }
-openvm-stark-sdk = { git = "https://github.com/OpenVM-WARP/stark-backend-warp.git", rev = "f1d9da7943a70793945c7acc7ecf17f41e501a82" }
-openvm-cpu-backend = { git = "https://github.com/OpenVM-WARP/stark-backend-warp.git", rev = "f1d9da7943a70793945c7acc7ecf17f41e501a82" }
-openvm-cuda-backend = { git = "https://github.com/OpenVM-WARP/stark-backend-warp.git", rev = "f1d9da7943a70793945c7acc7ecf17f41e501a82" }
-openvm-cuda-builder = { git = "https://github.com/OpenVM-WARP/stark-backend-warp.git", rev = "f1d9da7943a70793945c7acc7ecf17f41e501a82" }
-openvm-cuda-common = { git = "https://github.com/OpenVM-WARP/stark-backend-warp.git", rev = "f1d9da7943a70793945c7acc7ecf17f41e501a82" }
-
 
 
 [workspace.package]
@@ -351,3 +343,10 @@ ignored = [
 # Crates opt in with `[lints] workspace = true`.
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(openvm_intrinsics)', 'cfg(target_os, values("openvm"))'] }
+[patch."https://github.com/openvm-org/stark-backend.git"]
+openvm-stark-backend = { git = "https://github.com/OpenVM-WARP/stark-backend-warp.git", rev = "640da235392a06e7b01cb12a32c12ce909ee97e1" }
+openvm-stark-sdk = { git = "https://github.com/OpenVM-WARP/stark-backend-warp.git", rev = "640da235392a06e7b01cb12a32c12ce909ee97e1" }
+openvm-cpu-backend = { git = "https://github.com/OpenVM-WARP/stark-backend-warp.git", rev = "640da235392a06e7b01cb12a32c12ce909ee97e1" }
+openvm-cuda-backend = { git = "https://github.com/OpenVM-WARP/stark-backend-warp.git", rev = "640da235392a06e7b01cb12a32c12ce909ee97e1" }
+openvm-cuda-builder = { git = "https://github.com/OpenVM-WARP/stark-backend-warp.git", rev = "640da235392a06e7b01cb12a32c12ce909ee97e1" }
+openvm-cuda-common = { git = "https://github.com/OpenVM-WARP/stark-backend-warp.git", rev = "640da235392a06e7b01cb12a32c12ce909ee97e1" }

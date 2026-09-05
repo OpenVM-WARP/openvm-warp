@@ -1,8 +1,8 @@
 //! Backend-neutral accumulator-instance digest AIR primitives.
 //!
 //! These helpers authenticate WARP accumulator instances. They are shared by
-//! protocol-v19 History/VACC and are deliberately independent of the retired
-//! opening-as-PESAT history circuit.
+//! transition verification and terminal Decide, and are independent of the
+//! application PESAT relation.
 
 use core::borrow::{Borrow, BorrowMut};
 

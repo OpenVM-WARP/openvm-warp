@@ -1,42 +1,7 @@
-use openvm_poseidon2_air::POSEIDON2_WIDTH;
 use openvm_recursion_circuit_derive::AlignedBorrow;
 use openvm_stark_sdk::config::baby_bear_poseidon2::D_EF;
 
 use crate::{define_typed_per_proof_lookup_bus, define_typed_per_proof_permutation_bus};
-
-#[repr(C)]
-#[derive(AlignedBorrow, Debug, Clone)]
-pub struct WhirTerminalMessage<T> {
-    /// Transcript index immediately after the last WHIR challenge.
-    pub end_tidx: T,
-    /// Final claim after the last query phase.  The last WHIR round constrains
-    /// this to the sum of the generalized final-polynomial MLE contribution
-    /// and the ordinary query contribution.
-    pub final_claim: [T; D_EF],
-    /// Generalized final-polynomial contribution checked by the terminal
-    /// aggregate AIR.
-    pub final_aggregate: [T; D_EF],
-}
-
-define_typed_per_proof_permutation_bus!(WhirTerminalBus, WhirTerminalMessage);
-
-/// Fully constrained completion endpoint.  `(end_tidx, sample_count, state)`
-/// is the recursion transcript module's canonical row-aligned checkpoint and
-/// therefore determines the duplex cursor without trusting host-supplied
-/// absorb/sample indices.
-#[repr(C)]
-#[derive(AlignedBorrow, Debug, Clone)]
-pub struct WhirCompletionMessage<T> {
-    pub proof_idx: T,
-    pub class_index: T,
-    pub end_tidx: T,
-    pub sample_count: T,
-    pub state: [T; POSEIDON2_WIDTH],
-    pub final_aggregate: [T; D_EF],
-    pub final_claim: [T; D_EF],
-}
-
-define_typed_per_proof_permutation_bus!(WhirCompletionBus, WhirCompletionMessage);
 
 #[repr(C)]
 #[derive(AlignedBorrow, Debug, Clone)]

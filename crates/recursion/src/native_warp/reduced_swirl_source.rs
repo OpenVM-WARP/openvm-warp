@@ -862,7 +862,7 @@ fn validate_record(
         || record.roots.len() != record.widths.len()
         || record.roots.len() != record.stacking_openings.len()
         || record.stacking_point.len() != profile.log_message_len()
-        || record.widths.iter().any(|&width| width == 0)
+        || record.widths.contains(&0)
     {
         return Err("reduced-SWIRL source shape");
     }

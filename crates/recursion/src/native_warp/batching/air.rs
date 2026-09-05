@@ -47,8 +47,8 @@ pub struct NativeBatchingSigmaAir {
     pub eq_bus: NativeEqResultBus,
     pub opening_bus: NativeOpeningClaimBus,
     pub sumcheck_initial_bus: Option<NativeSumcheckInitialBus>,
-    /// Optional second consumer used by the history certificate to bind the
-    /// opening-authenticated claim into its compact replay seal.
+    /// Optional second consumer used by the transition certificate to bind the
+    /// opening-authenticated claim into its replay seal.
     pub certified_claim_bus: Option<NativeCertifiedBatchingClaimBus>,
     pub claim_count: usize,
     pub xi_eq_group_offset: usize,

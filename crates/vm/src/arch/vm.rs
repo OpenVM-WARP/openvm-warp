@@ -1514,7 +1514,7 @@ pub enum NativeWarpStreamError<SegmentError> {
 ///
 /// The plan is derived from the same metered execution and preflight trace
 /// generation used by proving. Keeping it as a typed artifact lets setup
-/// generate shape-dependent history keys before online proving without
+/// generate the transition-leaf verifier key before online proving without
 /// changing segmentation or trusting caller-supplied trace dimensions.
 #[derive(Clone, Debug)]
 pub struct NativeWarpContinuationPlan {
@@ -1639,12 +1639,6 @@ where
     #[cfg(feature = "rvr")]
     pub fn set_metered_artifact_path(&mut self, path: impl Into<std::path::PathBuf>) {
         self.metered_artifact_path = Some(path.into());
-    }
-
-    /// Clear the selected native metering artifact and compile metering code on the next run.
-    #[cfg(feature = "rvr")]
-    pub fn clear_metered_artifact_path(&mut self) {
-        self.metered_artifact_path = None;
     }
 
     #[instrument(name = "vm.reset_state", level = "debug", skip_all)]
@@ -1798,12 +1792,11 @@ where
 
         let num_airs = self.vm.pk().per_air.len();
         // Planning every AIR present at `2^l_skip`, to make the trace set uniform across
-        // segments and settle the history stage key, overflows the reduction endpoint program
+        // segments and settle the transition-leaf verifier key, overflows the reduction program
         // by a consistent ~15%: measured 610,354 instructions against a 524,288 cap at a 2^19
-        // history stacked height, and 1,194,126 against 1,048,576 at 2^20. The program scales
-        // with the cap, so raising the height is a treadmill -- and the check in
-        // `native_reduction_endpoint_program_chunks` is on the largest *single* program, so
-        // chunking cannot absorb it either.
+        // stacked height, and 1,194,126 against 1,048,576 at 2^20. The program scales with the
+        // cap, so raising the height is a treadmill. The verifier limit applies to the largest
+        // single program, so chunking cannot absorb it either.
         //
         // The six AIRs this admits are absent from most segments and would enter at minimum
         // height with no real rows, yet each still costs roughly 14k instructions because the

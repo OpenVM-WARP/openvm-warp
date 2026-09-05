@@ -21,15 +21,13 @@ use openvm_stark_sdk::config::baby_bear_poseidon2::{
     default_duplex_sponge_recorder, BabyBearPoseidon2Config as SC, Digest, DIGEST_SIZE, D_EF, EF, F,
 };
 use p3_air::{Air, AirBuilder, BaseAir};
-use p3_field::{extension::BinomiallyExtendable, BasedVectorSpace, Field, PrimeCharacteristicRing};
+use p3_field::{extension::BinomiallyExtendable, BasedVectorSpace, PrimeCharacteristicRing};
 use p3_matrix::{dense::RowMajorMatrix, Matrix};
 
 use crate::{
     bus::TranscriptBus,
     native_warp::terminal::{
-        NativeTerminalAccumulatorRootBus, NativeTerminalAccumulatorRootMessage,
         NativeTerminalAccumulatorValueBus, NativeTerminalAccumulatorValueMessage,
-        NativeTerminalLinearizerDescriptorBus, NativeTerminalLinearizerDescriptorMessage,
         NativeTerminalLinearizerEndBus, NativeTerminalLinearizerEndMessage,
         NativeTerminalWhirLinearizerWeightBus, NativeTerminalWhirLinearizerWeightMessage,
         NativeTerminalWhirPointBus, NativeTerminalWhirPointMessage, NativeTerminalWhirStatementBus,
@@ -65,9 +63,9 @@ pub enum NativeTerminalTranscriptBindingError {
 
 impl NativeTerminalTranscriptBinding {
     /// Construct the exact binding used by the coefficient-native SWIRL
-    /// terminal.  Ordinary-subgroup and two-coset layouts are rejected: this
-    /// module certifies the reduced SWIRL Eq relation, not a legacy or
-    /// fixed-multi-AIR terminal.
+    /// terminal. Ordinary-subgroup layouts are rejected: this module
+    /// certifies the reduced-SWIRL Eq relation and accepts only the
+    /// coefficient-subgroup layout.
     pub fn coefficient_subgroup<Obs>(
         descriptor: &TerminalDescriptor<Digest>,
         code: &WhirInitialRsWarpCode<<SC as StarkProtocolConfig>::Hasher, Obs>,
@@ -205,279 +203,6 @@ pub fn validate_native_terminal_eq_statement(
         TerminalWeightSpec::Eq { .. } | TerminalWeightSpec::PrismalinearMappedColumns(_) => {
             Err(NativeTerminalEqClaimError::Relation)
         }
-    }
-}
-
-#[repr(C)]
-#[derive(AlignedBorrow, StructReflection)]
-pub struct NativeTerminalLinearizerDescriptorCols<T> {
-    pub active: T,
-    pub tidx: T,
-    pub root: [T; DIGEST_SIZE],
-}
-
-/// Binds the algebraic terminal descriptor to the same transcript that
-/// contains the final WARP transition.
-#[derive(ColumnsAir)]
-#[columns_via(NativeTerminalLinearizerDescriptorCols<u8>)]
-pub struct NativeTerminalLinearizerDescriptorAir {
-    pub transcript_bus: TranscriptBus,
-    pub root_bus: NativeTerminalAccumulatorRootBus,
-    pub descriptor_bus: NativeTerminalLinearizerDescriptorBus,
-    pub transcript_binding: Arc<NativeTerminalTranscriptBinding>,
-}
-
-impl BaseAirWithPublicValues<F> for NativeTerminalLinearizerDescriptorAir {}
-impl PartitionedBaseAir<F> for NativeTerminalLinearizerDescriptorAir {}
-impl BaseAir<F> for NativeTerminalLinearizerDescriptorAir {
-    fn width(&self) -> usize {
-        NativeTerminalLinearizerDescriptorCols::<F>::width()
-    }
-}
-
-impl<AB: AirBuilder<F = F> + InteractionBuilder> Air<AB> for NativeTerminalLinearizerDescriptorAir {
-    fn eval(&self, builder: &mut AB) {
-        let main = builder.main();
-        let row = main
-            .row_slice(0)
-            .expect("native terminal linearizer descriptor row");
-        let local: &NativeTerminalLinearizerDescriptorCols<AB::Var> = (*row).borrow();
-        builder.assert_bool(local.active);
-        builder.when_first_row().assert_one(local.active);
-        builder.when_transition().assert_zero(local.active);
-
-        self.root_bus.receive(
-            builder,
-            NativeTerminalAccumulatorRootMessage {
-                root: local.root.map(Into::into),
-            },
-            local.active,
-        );
-
-        let mut tidx = AB::Expr::from(local.tidx);
-        let ext_constant = |value: AB::Expr| {
-            core::array::from_fn(|limb| {
-                if limb == 0 {
-                    value.clone()
-                } else {
-                    AB::Expr::ZERO
-                }
-            })
-        };
-        self.transcript_bus.observe_ext(
-            builder,
-            AB::Expr::ZERO,
-            tidx.clone(),
-            ext_constant(AB::Expr::from_u64(NATIVE_TERMINAL_DESCRIPTOR_DOMAIN_TAG)),
-            local.active,
-        );
-        tidx += AB::Expr::from_usize(D_EF);
-        for root_limb in local.root {
-            self.transcript_bus.observe_ext(
-                builder,
-                AB::Expr::ZERO,
-                tidx.clone(),
-                ext_constant(root_limb.into()),
-                local.active,
-            );
-            tidx += AB::Expr::from_usize(D_EF);
-        }
-        for &value in self.transcript_binding.descriptor_post_root() {
-            self.transcript_bus.observe_ext(
-                builder,
-                AB::Expr::ZERO,
-                tidx.clone(),
-                ext_constant(AB::Expr::from(value)),
-                local.active,
-            );
-            tidx += AB::Expr::from_usize(D_EF);
-        }
-        self.descriptor_bus.send(
-            builder,
-            NativeTerminalLinearizerDescriptorMessage {
-                tidx,
-                root: local.root.map(Into::into),
-            },
-            local.active,
-        );
-    }
-}
-
-#[repr(C)]
-#[derive(AlignedBorrow, StructReflection)]
-pub struct NativeTerminalAccumulatorTranscriptCols<T> {
-    pub active: T,
-    pub section: T,
-    pub section_flags: [T; 4],
-    pub coordinate: T,
-    pub is_first: T,
-    pub is_last: T,
-    pub is_section_end: T,
-    pub section_end_inverse: T,
-    pub tidx: T,
-    pub root: [T; DIGEST_SIZE],
-    pub value: [T; D_EF],
-    pub mu: [T; D_EF],
-    pub beta_last: [T; D_EF],
-    pub eta: [T; D_EF],
-}
-
-/// Observes `alpha || mu || beta || eta` in the algebraic terminal prefix.
-#[derive(ColumnsAir)]
-#[columns_via(NativeTerminalAccumulatorTranscriptCols<u8>)]
-pub struct NativeTerminalAccumulatorTranscriptAir {
-    pub transcript_bus: TranscriptBus,
-    pub descriptor_bus: NativeTerminalLinearizerDescriptorBus,
-    pub end_bus: NativeTerminalLinearizerEndBus,
-    pub value_bus: NativeTerminalAccumulatorValueBus,
-    pub alpha_len: usize,
-    pub beta_len: usize,
-}
-
-impl BaseAirWithPublicValues<F> for NativeTerminalAccumulatorTranscriptAir {}
-impl PartitionedBaseAir<F> for NativeTerminalAccumulatorTranscriptAir {}
-impl BaseAir<F> for NativeTerminalAccumulatorTranscriptAir {
-    fn width(&self) -> usize {
-        NativeTerminalAccumulatorTranscriptCols::<F>::width()
-    }
-}
-
-impl<AB: AirBuilder<F = F> + InteractionBuilder> Air<AB>
-    for NativeTerminalAccumulatorTranscriptAir
-{
-    fn eval(&self, builder: &mut AB) {
-        let main = builder.main();
-        let local_row = main
-            .row_slice(0)
-            .expect("native terminal accumulator transcript row");
-        let next_row = main
-            .row_slice(1)
-            .expect("native terminal next accumulator transcript row");
-        let local: &NativeTerminalAccumulatorTranscriptCols<AB::Var> = (*local_row).borrow();
-        let next: &NativeTerminalAccumulatorTranscriptCols<AB::Var> = (*next_row).borrow();
-
-        for flag in [
-            local.active,
-            local.is_first,
-            local.is_last,
-            local.is_section_end,
-        ]
-        .into_iter()
-        .chain(local.section_flags)
-        {
-            builder.assert_bool(flag);
-        }
-        let flag_sum = local
-            .section_flags
-            .iter()
-            .fold(AB::Expr::ZERO, |sum, &flag| sum + flag);
-        builder.assert_eq(flag_sum, local.active);
-        let section = local
-            .section_flags
-            .iter()
-            .enumerate()
-            .fold(AB::Expr::ZERO, |sum, (index, &flag)| {
-                sum + flag * AB::Expr::from_usize(index)
-            });
-        builder.when(local.active).assert_eq(local.section, section);
-        let section_len = local.section_flags[0] * AB::Expr::from_usize(self.alpha_len)
-            + local.section_flags[1]
-            + local.section_flags[2] * AB::Expr::from_usize(self.beta_len)
-            + local.section_flags[3];
-        let section_end = AB::Expr::from(local.coordinate) + AB::Expr::ONE - section_len;
-        builder
-            .when(local.active * local.is_section_end)
-            .assert_zero(section_end.clone());
-        builder
-            .when(local.active * (AB::Expr::ONE - local.is_section_end))
-            .assert_one(section_end * local.section_end_inverse);
-
-        builder.when_first_row().assert_one(local.active);
-        builder.when_first_row().assert_one(local.is_first);
-        builder.when_first_row().assert_zero(local.section);
-        builder.when_first_row().assert_zero(local.coordinate);
-        builder
-            .when_transition()
-            .assert_bool(local.active - next.active);
-        let same_section = next.active * (AB::Expr::ONE - local.is_section_end);
-        let next_section = next.active * local.is_section_end;
-        let mut transition = builder.when_transition();
-        let mut same = transition.when(same_section);
-        same.assert_eq(next.section, local.section);
-        same.assert_eq(next.coordinate, local.coordinate + AB::F::ONE);
-        let mut transition = builder.when_transition();
-        let mut advance = transition.when(next_section);
-        advance.assert_eq(next.section, local.section + AB::F::ONE);
-        advance.assert_zero(next.coordinate);
-        let mut transition = builder.when_transition();
-        let mut active_next = transition.when(next.active);
-        active_next.assert_zero(next.is_first);
-        active_next.assert_eq(next.tidx, local.tidx + AB::Expr::from_usize(D_EF));
-        assert_array_eq(&mut active_next, next.root, local.root);
-        assert_array_eq(&mut active_next, next.mu, local.mu);
-        assert_array_eq(&mut active_next, next.beta_last, local.beta_last);
-        assert_array_eq(&mut active_next, next.eta, local.eta);
-        let active_end = local.active - next.active;
-        builder
-            .when_transition()
-            .assert_eq(local.is_last, active_end);
-        builder
-            .when_last_row()
-            .assert_eq(local.is_last, local.active);
-        builder
-            .when(local.active * local.is_last)
-            .assert_eq(local.section, AB::Expr::from_usize(3));
-
-        self.descriptor_bus.receive(
-            builder,
-            NativeTerminalLinearizerDescriptorMessage {
-                tidx: local.tidx.into(),
-                root: local.root.map(Into::into),
-            },
-            local.active * local.is_first,
-        );
-        self.value_bus.lookup_key(
-            builder,
-            NativeTerminalAccumulatorValueMessage {
-                section: local.section.into(),
-                coordinate: local.coordinate.into(),
-                value: local.value.map(Into::into),
-            },
-            local.active,
-        );
-        self.transcript_bus.observe_ext(
-            builder,
-            AB::Expr::ZERO,
-            local.tidx.into(),
-            local.value,
-            local.active,
-        );
-        assert_array_eq(
-            &mut builder.when(local.section_flags[1]),
-            local.value,
-            local.mu.map(Into::into),
-        );
-        assert_array_eq(
-            &mut builder.when(local.section_flags[2] * local.is_section_end),
-            local.value,
-            local.beta_last.map(Into::into),
-        );
-        assert_array_eq(
-            &mut builder.when(local.section_flags[3]),
-            local.value,
-            local.eta.map(Into::into),
-        );
-        self.end_bus.send(
-            builder,
-            NativeTerminalLinearizerEndMessage {
-                tidx: local.tidx + AB::Expr::from_usize(D_EF),
-                root: local.root.map(Into::into),
-                mu: local.mu.map(Into::into),
-                beta_last: local.beta_last.map(Into::into),
-                eta: local.eta.map(Into::into),
-            },
-            local.active * local.is_last,
-        );
     }
 }
 
@@ -740,76 +465,6 @@ where
     }
 }
 
-pub fn generate_native_terminal_linearizer_descriptor_trace(
-    descriptor: &TerminalDescriptor<Digest>,
-    start_tidx: usize,
-) -> RowMajorMatrix<F> {
-    let width = NativeTerminalLinearizerDescriptorCols::<F>::width();
-    let mut values = F::zero_vec(width);
-    let cols: &mut NativeTerminalLinearizerDescriptorCols<F> = values.as_mut_slice().borrow_mut();
-    cols.active = F::ONE;
-    cols.tidx = F::from_usize(start_tidx);
-    cols.root = descriptor.root;
-    RowMajorMatrix::new(values, width)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn generate_native_terminal_accumulator_transcript_trace(
-    descriptor: &TerminalDescriptor<Digest>,
-    alpha: &[EF],
-    mu: EF,
-    beta: &[EF],
-    eta: EF,
-    start_tidx: usize,
-    required_height: Option<usize>,
-) -> Option<RowMajorMatrix<F>> {
-    if alpha.is_empty() || beta.is_empty() {
-        return None;
-    }
-    let entries = [
-        alpha,
-        core::slice::from_ref(&mu),
-        beta,
-        core::slice::from_ref(&eta),
-    ];
-    let valid_rows = entries.iter().map(|section| section.len()).sum::<usize>();
-    let height = required_height.unwrap_or_else(|| valid_rows.next_power_of_two());
-    if height < valid_rows {
-        return None;
-    }
-    let width = NativeTerminalAccumulatorTranscriptCols::<F>::width();
-    let mut values = F::zero_vec(height * width);
-    let mut row_index = 0usize;
-    let mut tidx = start_tidx;
-    for (section, values_in_section) in entries.into_iter().enumerate() {
-        for (coordinate, &value) in values_in_section.iter().enumerate() {
-            let row = &mut values[row_index * width..(row_index + 1) * width];
-            let cols: &mut NativeTerminalAccumulatorTranscriptCols<F> = row.borrow_mut();
-            cols.active = F::ONE;
-            cols.section = F::from_usize(section);
-            cols.section_flags[section] = F::ONE;
-            cols.coordinate = F::from_usize(coordinate);
-            cols.is_first = F::from_bool(row_index == 0);
-            cols.is_last = F::from_bool(row_index + 1 == valid_rows);
-            cols.is_section_end = F::from_bool(coordinate + 1 == values_in_section.len());
-            let section_delta =
-                F::from_usize(coordinate + 1) - F::from_usize(values_in_section.len());
-            if section_delta != F::ZERO {
-                cols.section_end_inverse = section_delta.inverse();
-            }
-            cols.tidx = F::from_usize(tidx);
-            cols.root = descriptor.root;
-            copy_ext(&mut cols.value, value);
-            copy_ext(&mut cols.mu, mu);
-            copy_ext(&mut cols.beta_last, *beta.last()?);
-            copy_ext(&mut cols.eta, eta);
-            row_index += 1;
-            tidx += D_EF;
-        }
-    }
-    Some(RowMajorMatrix::new(values, width))
-}
-
 pub fn generate_native_terminal_whir_statement_trace(
     descriptor: &TerminalDescriptor<Digest>,
     transcript_binding: &NativeTerminalTranscriptBinding,
@@ -1060,11 +715,11 @@ mod tests {
                     .copied()
                     .map(F::from_u8))
             }));
-        let legacy_word_image = descriptor
+        let metadata_word_image = descriptor
             .metadata_words()
             .map(F::from_u64)
             .collect::<Vec<_>>();
-        assert_ne!(binding.descriptor_post_root(), legacy_word_image);
+        assert_ne!(binding.descriptor_post_root(), metadata_word_image);
 
         let mut changed = descriptor.clone();
         changed.code_layout_version ^= 1;

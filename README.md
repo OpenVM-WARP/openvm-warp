@@ -12,6 +12,12 @@
 
 OpenVM is a performant and modular zkVM framework built for customization and extensibility.
 
+## Reduced-SWIRL WARP proving
+
+This fork adds a CUDA proving lane that stops SWIRL before each segment's PCS opening, accumulates the authenticated constrained-code sources with WARP, proves the transition chain recursively, and emits a standard succinct OpenVM proof. It reuses the recursive lane's verifier, key, transcript, and compression machinery where the statements coincide. See [Reduced-SWIRL WARP architecture](./docs/reduced-swirl-warp.md).
+
+This research extension targets the RV64 `develop-v2.1.0` code line. It has not been covered by the upstream OpenVM audits and should not be treated as production security software without an independent protocol and implementation audit.
+
 ## Key Features
 
 - **Modular no-CPU Architecture**: Unlike traditional machine architectures, the OpenVM architecture has no central processing unit. This design choice allows for seamless integration of custom chips, **without forking or modifying the core architecture**.

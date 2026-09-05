@@ -47,8 +47,8 @@ pub fn generate_native_leaf_hash_trace(
 
     // Each leaf is an independent sponge: only the blocks *within* a leaf chain
     // through `state`. Hand every leaf its own row range up front so the leaves
-    // run in parallel, which matters because this is where native WARP's
-    // history circuit spends most of its witness generation -- 354k
+    // run in parallel, which matters because this is where the VACC verifier
+    // spends most of its witness generation -- 354k
     // permutations per root step on a six-segment program, and they were
     // serial.
     //

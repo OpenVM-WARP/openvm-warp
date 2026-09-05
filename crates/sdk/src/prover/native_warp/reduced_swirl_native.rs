@@ -15,16 +15,15 @@ use openvm_stark_backend::{
     soundness,
     warp_accum::{
         canonical_swirl_reduced_code_binding, derive_swirl_constrained_rs_terminal_statement,
-        finish_exact_finite_warp_call, prove_terminal_constrained_whir_owned,
-        select_proven_rs_warp_params, verify_terminal_constrained_whir_recorded, Accumulator,
-        FieldElementDigestObserver, MerkleBatchOpeningProof, MerkleBatchOpeningVerification,
-        MerkleOpeningBackend, ProvenRsWarpSecurity, ReducedConstrainedCodeBinding,
-        ReducedConstrainedCodeClaim, ReducedConstrainedCodeRelation, ReducedWarpVaccRootProof,
-        ReducedWarpVaccStepProof, StackedRsBatchOpeningProof, StackedRsBatchOpeningVerification,
-        StackedRsFreshCommitment, StackedRsOpeningBackend, SwirlConstrainedRsRelation,
-        TerminalDescriptor, TerminalWhirProof, TerminalWhirVerification, WarpAccumError,
-        WarpRootProver, WarpVaccStepProverRecord, WarpVaccStepVerification, WhirInitialRsWarpCode,
-        WhirRsCodeProverData,
+        finish_warp_call, prove_terminal_constrained_whir_owned, select_proven_rs_warp_params,
+        verify_terminal_constrained_whir_recorded, Accumulator, FieldElementDigestObserver,
+        MerkleBatchOpeningProof, MerkleBatchOpeningVerification, MerkleOpeningBackend,
+        ProvenRsWarpSecurity, ReducedConstrainedCodeBinding, ReducedConstrainedCodeClaim,
+        ReducedConstrainedCodeRelation, ReducedWarpVaccRootProof, ReducedWarpVaccStepProof,
+        StackedRsBatchOpeningProof, StackedRsBatchOpeningVerification, StackedRsFreshCommitment,
+        StackedRsOpeningBackend, SwirlConstrainedRsRelation, TerminalDescriptor, TerminalWhirProof,
+        TerminalWhirVerification, WarpAccumError, WarpRootProver, WarpVaccStepProverRecord,
+        WarpVaccStepVerification, WhirInitialRsWarpCode, WhirRsCodeProverData,
     },
     warp_pesat::{AlgebraicChallenger, LinearChainSchedule, PesatShape},
     FiatShamirTranscript, StarkProtocolConfig, SystemParams, WhirConfig, WhirProximityStrategy,
@@ -453,11 +452,6 @@ impl<'a> ReducedSwirlNativeCpuStream<'a> {
     }
 
     #[must_use]
-    pub fn expected_next_source_index(&self) -> usize {
-        self.source_bindings.len()
-    }
-
-    #[must_use]
     pub fn pending_source_count(&self) -> usize {
         self.pending_sources.len()
     }
@@ -545,7 +539,7 @@ impl<'a> ReducedSwirlNativeCpuStream<'a> {
                 &accumulator_openings,
                 &(),
             )?;
-        if let Some(boundary) = finish_exact_finite_warp_call(&mut self.challenger, step_index) {
+        if let Some(boundary) = finish_warp_call(&mut self.challenger, step_index) {
             record.transcript_phases.push(boundary);
         }
         self.accumulator = Some(next);
@@ -777,7 +771,7 @@ pub fn verify_reduced_swirl_native_recorded(
                 &fresh_verifier,
                 &acc_verifier,
             )?;
-        if let Some(boundary) = finish_exact_finite_warp_call(&mut challenger, step_index) {
+        if let Some(boundary) = finish_warp_call(&mut challenger, step_index) {
             record.transcript_phases.push(boundary);
         }
         prior = Some(record.output_instance.clone());

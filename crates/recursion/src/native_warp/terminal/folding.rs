@@ -275,10 +275,9 @@ pub fn generate_native_terminal_whir_folding_trace(
             let zi = round.query_roots[query];
             let yi = if evaluation_layout {
                 // Use the recorded root compiled by
-                // `terminal_whir_query_root`.  Reconstructing `x` from a
-                // generic two-adic domain is incorrect for the initial
-                // coefficient two-coset oracle, whose physical query parity
-                // selects either the base coset or its generator shift.
+                // `terminal_whir_query_root`; reconstructing `x` from a
+                // generic two-adic domain would ignore the descriptor-bound
+                // layout.
                 let x = terminal_whir_query_root::<F>(
                     layout,
                     round_index == 0,

@@ -351,16 +351,6 @@ mod tests {
 
     #[test]
     fn verification_baseline_uses_exact_setup_lineage() {
-        let binding = ReducedSwirlWrapperBinding {
-            protocol_version: 3,
-            protocol_digest: digest(1),
-            relation_digest: digest(2),
-            warp_index_digest: digest(3),
-            terminal_index_digest: digest(4),
-            verifier_component_digest: digest(5),
-            input_arity: 8,
-            recursive_app_vk_commit: vk_commit(6),
-        };
         let app_exe_commit = digest(7);
         let memory_dimensions = MemoryDimensions::new(3, 27);
         let wrapper = vk_commit(8);

@@ -117,7 +117,6 @@ pub struct SymbolicExpressionAir<F: Field> {
 
     pub cnt_proofs: usize,
     pub dag_commit_subair: Option<Arc<DagCommitSubAir<F>>>,
-    pub includes_air: bool,
 }
 // No columns provided: width is dynamic, depending on `cnt_proofs` and on whether
 // `dag_commit_subair` is present, and mixes several column structs.
@@ -472,18 +471,16 @@ where
                 },
                 is_bus_index * air_present.clone(),
             );
-            if self.includes_air {
-                self.constraints_folding_bus.send(
-                    builder,
-                    proof_idx,
-                    ConstraintsFoldingMessage {
-                        air_idx: cached_cols.air_idx.into(),
-                        constraint_idx: cached_cols.constraint_idx.into(),
-                        value: value.clone(),
-                    },
-                    cached_cols.is_constraint * air_present,
-                );
-            }
+            self.constraints_folding_bus.send(
+                builder,
+                proof_idx,
+                ConstraintsFoldingMessage {
+                    air_idx: cached_cols.air_idx.into(),
+                    constraint_idx: cached_cols.constraint_idx.into(),
+                    value: value.clone(),
+                },
+                cached_cols.is_constraint * air_present,
+            );
         }
     }
 }

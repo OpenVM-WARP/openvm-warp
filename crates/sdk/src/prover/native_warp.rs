@@ -7,6 +7,9 @@
 //! from this module graph.
 
 pub mod reduced_swirl_boundary;
+#[cfg(feature = "cuda")]
+pub mod reduced_swirl_cuda_transport;
+pub mod reduced_swirl_error;
 pub mod reduced_swirl_execution_cpu;
 #[cfg(feature = "cuda")]
 pub mod reduced_swirl_execution_cuda;
@@ -17,19 +20,15 @@ pub mod reduced_swirl_params;
 #[cfg(feature = "cuda")]
 pub mod reduced_swirl_production_cuda;
 pub mod reduced_swirl_recursive_adapter;
-#[cfg(feature = "cuda")]
-pub mod reduced_swirl_source_leaf;
 pub mod reduced_swirl_source_receipt;
-pub mod reduced_swirl_source_tree_component;
 pub mod reduced_swirl_terminal_component;
 #[cfg(feature = "cuda")]
 pub mod reduced_swirl_transition_finalizer;
 pub mod reduced_swirl_transition_leaf;
+#[cfg(feature = "cuda")]
+pub mod reduced_swirl_transition_tree;
 pub mod reduced_swirl_vacc_component;
 pub mod reduced_swirl_wrapper_components;
-pub mod reduced_swirl_wrapper_system;
-#[cfg(feature = "cuda")]
-pub mod reduced_swirl_wrapper_system_cuda;
 
 #[cfg(test)]
 mod cutover_tests {

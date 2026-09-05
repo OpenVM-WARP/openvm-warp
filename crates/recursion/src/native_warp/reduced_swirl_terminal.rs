@@ -314,17 +314,14 @@ impl ReducedSwirlTerminalProductionSetup {
         self.identity.clone()
     }
 
-    #[must_use]
     pub fn protocol_digest(&self) -> Digest {
         self.identity.protocol_digest
     }
 
-    #[must_use]
     pub fn relation_digest(&self) -> Digest {
         self.identity.relation_digest
     }
 
-    #[must_use]
     pub fn terminal_index_digest(&self) -> Digest {
         self.identity.terminal_index_digest
     }
@@ -397,43 +394,6 @@ impl ReducedSwirlTerminalProductionSetup {
             first_internal_bus_idx,
             self.system_params.clone(),
         )
-    }
-
-    /// SDK integration seam for a verifier-recorded native terminal.
-    ///
-    /// The SDK converts `ReducedSwirlNativeVerification` plus its checked
-    /// proof descriptor/derived Eq statement into `record`; this crate cannot
-    /// name that SDK type without creating the forbidden SDK -> recursion ->
-    /// SDK dependency cycle. The returned packet contains the complete local
-    /// CPU AIR context inventory and typed receipt, while the returned
-    /// component supplies the corresponding setup-fixed AIRs.
-    #[allow(clippy::too_many_arguments)]
-    pub fn instantiate_and_generate_cpu_contexts<SC: StarkProtocolConfig<F = F>>(
-        &self,
-        verifier_component_digest: Digest,
-        shared: &BusInventory,
-        main_transcript_bus: TranscriptBus,
-        vacc_footer_bus: ReducedSwirlVaccFooterBus,
-        wrapper_terminal_receipt_bus_idx: BusIndex,
-        first_internal_bus_idx: BusIndex,
-        record: ReducedSwirlTerminalRecord<'_>,
-    ) -> Result<
-        (
-            ReducedSwirlTerminalComponent,
-            ReducedSwirlTerminalCpuPacket<SC>,
-        ),
-        ReducedSwirlTerminalError,
-    > {
-        let component = self.instantiate(
-            verifier_component_digest,
-            shared,
-            main_transcript_bus,
-            vacc_footer_bus,
-            wrapper_terminal_receipt_bus_idx,
-            first_internal_bus_idx,
-        )?;
-        let packet = component.generate_cpu_contexts::<SC>(record)?;
-        Ok((component, packet))
     }
 }
 
@@ -697,21 +657,6 @@ impl ReducedSwirlTerminalSetupIdentity {
     }
 
     #[must_use]
-    pub fn receipt_protocol_digest(&self) -> Digest {
-        self.protocol_digest
-    }
-
-    #[must_use]
-    pub fn receipt_relation_digest(&self) -> Digest {
-        self.relation_digest
-    }
-
-    #[must_use]
-    pub fn receipt_terminal_index_digest(&self) -> Digest {
-        self.terminal_index_digest
-    }
-
-    #[must_use]
     pub fn final_log_len(&self) -> usize {
         self.final_poly_len.ilog2() as usize
     }
@@ -770,7 +715,6 @@ impl ReducedSwirlTerminalSetupIdentity {
         out
     }
 
-    #[must_use]
     pub fn setup_identity_digest(&self) -> Digest {
         poseidon2_hash_slice_with_states(&self.setup_identity_material()).0
     }
@@ -803,7 +747,6 @@ pub struct ReducedSwirlTerminalProfile {
 }
 
 impl ReducedSwirlTerminalProfile {
-    #[must_use]
     pub fn setup_identity_digest(&self) -> Digest {
         self.setup.setup_identity_digest()
     }
@@ -813,7 +756,6 @@ impl ReducedSwirlTerminalProfile {
         &self.setup
     }
 
-    #[must_use]
     pub fn verifier_component_digest(&self) -> Digest {
         self.verifier_component_digest
     }
@@ -1699,7 +1641,6 @@ impl ReducedSwirlTerminalComponent {
         })
     }
 
-    #[must_use]
     pub fn protocol_digest(&self) -> Digest {
         // Deliberately excludes profile.verifier_component_digest, while
         // binding every interaction namespace used by these AIRs.
@@ -1858,7 +1799,6 @@ impl ReducedSwirlTerminalComponent {
                 inner_tree_id_offset: p.round_count(),
                 outer_tree_id_offset: 0,
                 evaluation_layout: true,
-                coefficient_two_coset_initial: false,
             },
         );
         add_air(

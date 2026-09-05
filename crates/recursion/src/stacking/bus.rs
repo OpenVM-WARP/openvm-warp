@@ -31,43 +31,6 @@ pub struct SumcheckClaimsMessage<T> {
 
 define_typed_per_proof_permutation_bus!(SumcheckClaimsBus, SumcheckClaimsMessage);
 
-/// One flattened stacking opening produced by the ordinary stacking verifier.
-///
-/// `proof_idx` (inserted by the typed bus) is the ordered reduction index and
-/// `opening_idx` is commitment-major. Setup-PCS authority consumes this bus
-/// exactly once before publishing the value on its multi-constraint statement
-/// bus; the value therefore cannot be replaced by an unconstrained adapter
-/// witness.
-#[repr(C)]
-#[derive(AlignedBorrow, Debug, Clone)]
-pub struct OrderedStackingOpeningMessage<T> {
-    pub opening_idx: T,
-    pub value: [T; D_EF],
-}
-
-define_typed_per_proof_permutation_bus!(OrderedStackingOpeningBus, OrderedStackingOpeningMessage);
-
-/// One coordinate of the original source opening point used as `r` by the
-/// ordinary stacking equations.
-///
-/// `proof_idx` (inserted by the typed bus) is the ordered reduction/transition
-/// index. In ordered mode the setup authority sends every coordinate exactly
-/// once. `EqBaseAir` consumes coordinate zero and `SumcheckRoundsAir` consumes
-/// the remaining coordinates, so the values entering the stacking algebra are
-/// constrained by the authority boundary rather than merely compared by host
-/// trace generation.
-#[repr(C)]
-#[derive(AlignedBorrow, Debug, Clone)]
-pub struct OrderedStackingSourcePointMessage<T> {
-    pub coordinate_idx: T,
-    pub value: [T; D_EF],
-}
-
-define_typed_per_proof_permutation_bus!(
-    OrderedStackingSourcePointBus,
-    OrderedStackingSourcePointMessage
-);
-
 #[repr(C)]
 #[derive(AlignedBorrow, Debug, Clone)]
 pub struct EqRandValuesLookupMessage<T> {

@@ -67,7 +67,7 @@ impl RowMajorChip<F> for FractionsFolderTraceGenerator {
                 );
                 let height = npa.len();
                 let mu_tidx = preflight.batch_constraint.tidx_before_univariate - D_EF;
-                let mu_slice = preflight.transcript_values_at(mu_tidx, D_EF);
+                let mu_slice = &preflight.transcript.values()[mu_tidx..mu_tidx + D_EF];
 
                 debug_assert_eq!(rows.len(), height * width);
 

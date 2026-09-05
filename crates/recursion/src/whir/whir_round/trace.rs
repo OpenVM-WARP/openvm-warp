@@ -13,37 +13,6 @@ use crate::{
 
 pub(crate) struct WhirRoundTraceGenerator;
 
-impl WhirRoundTraceGenerator {
-    /// Generate the round trace for an initial oracle laid out as the
-    /// interleaving `H union gH`.  This entry point is intentionally separate
-    /// from the ordinary [`RowMajorChip`] implementation: selecting the
-    /// two-coset geometry is verifier setup, not a heuristic inferred from a
-    /// large domain size.
-    pub(crate) fn generate_coefficient_two_coset_trace(
-        &self,
-        ctx: &(StandardTracegenCtx<'_>, &WhirBlobCpu),
-        required_height: Option<usize>,
-    ) -> Option<RowMajorMatrix<F>> {
-        let initial_log_domain_size = ctx.0.vk.inner.params.n_stack
-            + ctx.0.vk.inner.params.l_skip
-            + ctx.0.vk.inner.params.log_blowup;
-        if ctx.0.vk.inner.params.log_blowup != 1
-            || initial_log_domain_size == 0
-            || initial_log_domain_size - 1 > F::TWO_ADICITY
-        {
-            return None;
-        }
-        let num_rounds = ctx.0.vk.inner.params.num_whir_rounds();
-        let encoder = Encoder::new(num_rounds.max(2), 2, false);
-        match encoder.width() {
-            1 => generate_trace_impl::<1>(ctx, &encoder, required_height, true),
-            2 => generate_trace_impl::<2>(ctx, &encoder, required_height, true),
-            3 => generate_trace_impl::<3>(ctx, &encoder, required_height, true),
-            _ => None,
-        }
-    }
-}
-
 impl RowMajorChip<F> for WhirRoundTraceGenerator {
     type Ctx<'a> = (StandardTracegenCtx<'a>, &'a WhirBlobCpu);
 
@@ -58,9 +27,9 @@ impl RowMajorChip<F> for WhirRoundTraceGenerator {
         // Encoder requires at least 2 flags to work correctly
         let encoder = Encoder::new(num_rounds.max(2), 2, false);
         match encoder.width() {
-            1 => generate_trace_impl::<1>(ctx, &encoder, required_height, false),
-            2 => generate_trace_impl::<2>(ctx, &encoder, required_height, false),
-            3 => generate_trace_impl::<3>(ctx, &encoder, required_height, false),
+            1 => generate_trace_impl::<1>(ctx, &encoder, required_height),
+            2 => generate_trace_impl::<2>(ctx, &encoder, required_height),
+            3 => generate_trace_impl::<3>(ctx, &encoder, required_height),
             w => panic!("unsupported encoder width: {w}"),
         }
     }
@@ -70,7 +39,6 @@ fn generate_trace_impl<const ENC_WIDTH: usize>(
     ctx: &(StandardTracegenCtx<'_>, &WhirBlobCpu),
     whir_round_encoder: &Encoder,
     required_height: Option<usize>,
-    coefficient_two_coset_initial_domain: bool,
 ) -> Option<RowMajorMatrix<F>> {
     let proofs = ctx.0.proofs;
     let preflights = ctx.0.preflights;
@@ -78,7 +46,8 @@ fn generate_trace_impl<const ENC_WIDTH: usize>(
     let tidx_per_round = &blob.whir_round_tidx_per_round;
     let initial_claim_per_round = &blob.initial_claim_per_round;
     let post_sumcheck_claims = &blob.post_sumcheck_claims;
-    let final_poly_mle_evals = &blob.final_poly_mle_evals;
+    let eq_partials = &blob.eq_partials;
+    let final_poly_at_u = &blob.final_poly_at_u;
     debug_assert_eq!(proofs.len(), preflights.len());
     let sumcheck_rows_per_proof = post_sumcheck_claims.layout().items_per_proof();
 
@@ -115,7 +84,8 @@ fn generate_trace_impl<const ENC_WIDTH: usize>(
             let whir = &preflight.whir;
             let whir_proof = &proof.whir_proof;
 
-            let final_poly_eval = final_poly_mle_evals[proof_idx];
+            let final_poly_eval =
+                final_poly_at_u[proof_idx] * eq_partials[(proof_idx, sumcheck_rows_per_proof - 1)];
 
             let cols: &mut WhirRoundCols<F, ENC_WIDTH> = row.borrow_mut();
             cols.is_enabled = F::ONE;
@@ -124,15 +94,7 @@ fn generate_trace_impl<const ENC_WIDTH: usize>(
             cols.is_first_in_proof = F::from_bool(i == 0);
             cols.tidx = F::from_usize(tidx_per_round[(proof_idx, i)]);
             cols.num_queries = F::from_usize(num_queries_per_round[i]);
-            let omega_log = if coefficient_two_coset_initial_domain {
-                // Round zero folds the interleaved coset bit.  The resulting
-                // round-one oracle is over the same subgroup H; only later
-                // rounds square the generator.
-                initial_log_domain_size - if i == 0 { 1 } else { i }
-            } else {
-                initial_log_domain_size - i
-            };
-            cols.omega = F::two_adic_generator(omega_log);
+            cols.omega = F::two_adic_generator(initial_log_domain_size - i);
             cols.claim.copy_from_slice(
                 initial_claim_per_round[(proof_idx, i)].as_basis_coefficients_slice(),
             );

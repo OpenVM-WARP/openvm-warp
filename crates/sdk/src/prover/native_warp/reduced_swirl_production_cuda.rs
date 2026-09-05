@@ -41,12 +41,12 @@ use super::{
         package_reduced_swirl_recursive_proof, reduced_swirl_canonical_adapter_params,
         ReducedSwirlRecursiveAdapter,
     },
-    reduced_swirl_source_leaf::{
-        reduced_swirl_source_tree_params, ReducedSwirlSourceTreeCudaProver,
-    },
     reduced_swirl_transition_finalizer::{
         ReducedSwirlTransitionFinalizerComponents, ReducedSwirlTransitionFinalizerCudaProver,
         ReducedSwirlTransitionFinalizerSystemError,
+    },
+    reduced_swirl_transition_tree::{
+        reduced_swirl_transition_tree_params, ReducedSwirlTransitionTreeCudaProver,
     },
 };
 use crate::{prover::AppProver, StdIn, F, SC};
@@ -69,16 +69,7 @@ pub struct ReducedSwirlProductionCudaTelemetry {
     pub transition_leaf_barrier_wait_ms: f64,
     pub native_verify_ms: f64,
     pub component_setup_ms: f64,
-    /// Retained for API compatibility; transition-leaf proving is now streamed
-    /// inside `source_and_warp_ms` and is not repeated as a second phase.
-    pub source_leaf_prove_ms: f64,
-    pub source_tree_prove_ms: f64,
-    /// Retained for API compatibility; finalizer trace generation is included
-    /// in `wrapper_prove_ms` and there is no detached replay tail.
-    pub detached_tail_tracegen_ms: f64,
-    /// Retained for API compatibility; component trace generation is no longer
-    /// a separately retained phase.
-    pub component_tracegen_ms: f64,
+    pub transition_tree_prove_ms: f64,
     /// Fixed finalizer MultiSTARK key generation.
     pub wrapper_keygen_ms: f64,
     /// Fixed finalizer MultiSTARK proving, including terminal Decide/WHIR.
@@ -237,31 +228,31 @@ where
     .map_err(|error| ReducedSwirlProductionCudaError::Setup(format!("{error:?}")))?;
 
     let component_setup_started = Instant::now();
-    let source_tree_params = reduced_swirl_source_tree_params(&recursive_leaf_params)
+    let transition_tree_params = reduced_swirl_transition_tree_params(&recursive_leaf_params)
         .map_err(|error| ReducedSwirlProductionCudaError::Setup(error.to_string()))?;
-    let source_tree_prover =
-        ReducedSwirlSourceTreeCudaProver::new(transition_leaf_vk, source_tree_params);
+    let transition_tree_prover =
+        ReducedSwirlTransitionTreeCudaProver::new(transition_leaf_vk, transition_tree_params);
     let mut component_setup_ms = elapsed_ms(component_setup_started);
 
-    let source_tree_started = Instant::now();
-    let source_tree = source_tree_prover
+    let transition_tree_started = Instant::now();
+    let transition_tree = transition_tree_prover
         .prove(transition_leaf_proofs, recursive_app_vk_commit)
         .map_err(|error| ReducedSwirlProductionCudaError::ProofPhase {
             phase: "transition proof tree",
             message: error.to_string(),
         })?;
-    let source_tree_prove_ms = elapsed_ms(source_tree_started);
-    report_phase("transition proof tree", source_tree_prove_ms);
+    let transition_tree_prove_ms = elapsed_ms(transition_tree_started);
+    report_phase("transition proof tree", transition_tree_prove_ms);
     cleanup_cuda_phase("transition proof tree")?;
 
     let finalizer_components_started = Instant::now();
     let finalizer_params = reduced_swirl_transition_finalizer_params(
         &wrapper_params,
-        &source_tree.root_vk.inner.params,
+        &transition_tree.root_vk.inner.params,
     );
     let finalizer_components = Arc::new(ReducedSwirlTransitionFinalizerComponents::new(
-        Arc::clone(&source_tree.root_vk),
-        source_tree.trusted_vk_commits,
+        Arc::clone(&transition_tree.root_vk),
+        transition_tree.trusted_vk_commits,
         &native_setup,
         &terminal_setup,
         app_params,
@@ -278,7 +269,7 @@ where
     let binding = finalizer_components.binding().clone();
     let wrapper_prove_started = Instant::now();
     let wrapper_proof = finalizer_prover.prove(
-        &source_tree.proof,
+        &transition_tree.proof,
         initial_transition_state,
         final_transition_state,
         &native.proof.statement.source_bindings,
@@ -291,7 +282,7 @@ where
     let wrapper_vk = finalizer_prover.keys().verifying_key();
     drop(finalizer_prover);
     drop(finalizer_components);
-    drop(source_tree);
+    drop(transition_tree);
     cleanup_cuda_phase("transition finalizer")?;
 
     let adapter_setup_started = Instant::now();
@@ -330,10 +321,7 @@ where
             transition_leaf_barrier_wait_ms,
             native_verify_ms,
             component_setup_ms,
-            source_leaf_prove_ms: 0.0,
-            source_tree_prove_ms,
-            detached_tail_tracegen_ms: 0.0,
-            component_tracegen_ms: 0.0,
+            transition_tree_prove_ms,
             wrapper_keygen_ms,
             wrapper_prove_ms,
             recursive_adapter_setup_ms,
@@ -347,8 +335,7 @@ where
 
 /// Rebuild the direct-source verifier profile at the application's exact RS
 /// geometry while raising only the constraint-degree envelope needed by the
-/// source/VACC/finalizer AIRs. The old detached wrapper enlarged the message
-/// domain and therefore cannot key the native constrained-code relation.
+/// source, VACC, and finalizer AIRs.
 fn reduced_swirl_transition_wrapper_params(native: &SystemParams) -> SystemParams {
     params_with_100_bits_security(
         native.log_blowup,

@@ -12,7 +12,7 @@
 //! spill/restore policy and no CPU source fallback.  The terminal prover reuses
 //! that accumulator's exact coefficient-subgroup codeword and Merkle root.
 
-use core::{fmt::Display, mem::size_of};
+use core::mem::size_of;
 use std::{sync::Arc, time::Instant};
 
 use openvm_circuit::arch::POSEIDON2_WIDTH;
@@ -26,23 +26,18 @@ use openvm_cuda_backend::{
     resident_warp::{
         CudaResidentWarpCode, CudaResidentWarpOpeningBackend, CudaResidentWarpProverData,
     },
-    stacked_reduction::StackedPcsData2,
     warp_batching_sumcheck::GpuBatchingSumcheck,
-    GpuBackend,
 };
 use openvm_cuda_common::{
     copy::pcie_counters,
     memory_manager::{device_memory_snapshot, DeviceMemorySnapshot},
     stream::GpuDeviceCtx,
 };
-use openvm_recursion_circuit::system::RetainedStackingProof;
 use openvm_stark_backend::{
     native_warp::NativeWarpChallenger,
     p3_field::{BasedVectorSpace, PrimeCharacteristicRing},
-    proof::{BatchConstraintProof, GkrProof, StackingProof},
-    prover::{NativeStackingReduction, PendingConstrainedCodeWitness},
     warp_accum::{
-        derive_swirl_constrained_rs_terminal_statement, finish_exact_finite_warp_call, Accumulator,
+        derive_swirl_constrained_rs_terminal_statement, finish_warp_call, Accumulator,
         ExternalCommittedConstrainedCodeSource, FieldElementDigestObserver,
         ReducedConstrainedCodeClaim, ReducedConstrainedCodeRelation, ReducedWarpVaccRootProof,
         StackedRsFreshCommitment, StackedRsOpeningBackend, TerminalDescriptor, WarpAccumError,
@@ -71,16 +66,6 @@ const REDUCED_SWIRL_NATIVE_SOURCE_BATCH_TAG: &[u8] =
 const REDUCED_SWIRL_NATIVE_MANIFEST_FOOTER_TAG: &[u8] =
     b"openvm.native-warp.swirl-reduced-source.manifest-footer.v3";
 
-pub type ReducedSwirlCudaPendingWitness =
-    PendingConstrainedCodeWitness<Digest, Vec<EF>, Vec<StackedPcsData2<Digest>>>;
-pub type ReducedSwirlCudaNativeReduction = NativeStackingReduction<
-    SC,
-    GpuBackend,
-    (GkrProof<SC>, BatchConstraintProof<SC>),
-    StackingProof<SC>,
-    Vec<EF>,
-    Vec<StackedPcsData2<Digest>>,
->;
 pub type ReducedSwirlCudaCode = CudaResidentWarpCode<
     <SC as StarkProtocolConfig>::Hasher,
     Poseidon2MerkleHash,
@@ -221,16 +206,7 @@ pub struct ReducedSwirlNativeCudaTelemetry {
     pub peak_lifetime_live_gpu_bytes: usize,
     pub peak_driver_used_gpu_bytes: usize,
     pub driver_total_gpu_bytes: usize,
-    pub accumulator_spill_count: usize,
-    pub accumulator_restore_count: usize,
-    pub accumulator_lifecycle_h2d_bytes: usize,
-    pub accumulator_lifecycle_d2h_bytes: usize,
-    pub fresh_reencodes: usize,
-    pub fresh_recommits: usize,
     pub terminal_reused_initial_roots: usize,
-    pub terminal_accumulator_reencodes: usize,
-    pub terminal_accumulator_recommits: usize,
-    pub terminal_full_message_d2h_bytes: usize,
     pub terminal_bounded_proof_d2h_bytes: usize,
     pub source_projection_ms: f64,
     pub vacc_ms: f64,
@@ -244,22 +220,10 @@ pub struct ReducedSwirlNativeCudaTelemetry {
 }
 
 impl ReducedSwirlNativeCudaTelemetry {
-    /// Structural invariant of this orchestration path.  Bounded challenge,
-    /// opened-row, Merkle-path, and proof transfers remain visible in
-    /// `transfers`; only full-payload lifecycle traffic is forbidden here.
-    pub fn assert_no_duplicate_payload_pipeline(&self) -> Result<(), &'static str> {
-        if self.accumulator_spill_count != 0
-            || self.accumulator_restore_count != 0
-            || self.accumulator_lifecycle_h2d_bytes != 0
-            || self.accumulator_lifecycle_d2h_bytes != 0
-            || self.fresh_reencodes != 0
-            || self.fresh_recommits != 0
-            || self.terminal_reused_initial_roots != 1
-            || self.terminal_accumulator_reencodes != 0
-            || self.terminal_accumulator_recommits != 0
-            || self.terminal_full_message_d2h_bytes != 0
-        {
-            return Err("duplicate or host-staged reduced-SWIRL CUDA payload pipeline");
+    /// The terminal prover must consume the existing accumulator commitment.
+    pub fn assert_resident_terminal_contract(&self) -> Result<(), &'static str> {
+        if self.terminal_reused_initial_roots != 1 {
+            return Err("terminal prover did not reuse exactly one resident accumulator root");
         }
         Ok(())
     }
@@ -278,6 +242,7 @@ pub struct ReducedSwirlNativeCudaOutput {
 /// `transcript_prefix` is the independent native verifier's exact transcript
 /// through `end_checkpoint`. It is borrowed in place; constructing this view
 /// never clones the transcript, proof history, claims, or source bindings.
+#[non_exhaustive]
 pub struct ReducedSwirlNativeCudaCompletedStep<'a> {
     pub total_source_count: usize,
     pub call_index: usize,
@@ -299,7 +264,6 @@ pub struct ReducedSwirlNativeCudaCompletedStep<'a> {
     pub authoritative_claims:
         &'a [ReducedConstrainedCodeClaim<EF, StackedRsFreshCommitment<EF, Digest>>],
     pub source_bindings: &'a [Digest],
-    _sealed: (),
 }
 
 /// Bounded owned snapshot of one completed native WARP call.
@@ -383,7 +347,6 @@ impl ReducedSwirlNativeCudaCompletedStepOwned {
             end_state: self.end_state,
             authoritative_claims: &self.authoritative_claims,
             source_bindings: &self.source_bindings,
-            _sealed: (),
         }
     }
 }
@@ -509,11 +472,6 @@ impl<'a> ReducedSwirlNativeCudaStream<'a> {
     }
 
     #[must_use]
-    pub fn expected_next_source_index(&self) -> usize {
-        self.source_bindings.len()
-    }
-
-    #[must_use]
     pub fn pending_source_count(&self) -> usize {
         self.pending_sources.len()
     }
@@ -617,68 +575,7 @@ impl<'a> ReducedSwirlNativeCudaStream<'a> {
             end_state: completed.end_state,
             authoritative_claims,
             source_bindings,
-            _sealed: (),
         }))
-    }
-
-    /// Consume a genuine pending SWIRL source.  `source_challenger` is the
-    /// segment-prefix transcript used to derive SWIRL's theta challenge; the
-    /// block-wide WARP challenger remains independently owned by this stream.
-    pub fn push_pending<Ch>(
-        &mut self,
-        source_binding: Digest,
-        pending: ReducedSwirlCudaPendingWitness,
-        stacking_openings: &[Vec<EF>],
-        source_challenger: &mut Ch,
-    ) -> Result<(), ReducedSwirlNativeCudaError>
-    where
-        Ch: AlgebraicChallenger<EF>,
-    {
-        self.ensure_live()?;
-        let started = Instant::now();
-        let transfer_start = pcie_counters::snapshot();
-        let source = match CudaReducedSwirlConstrainedCodeSource::try_from_pending(
-            pending,
-            stacking_openings,
-            source_challenger,
-            self.setup.device_ctx.clone(),
-        ) {
-            Ok(source) => source,
-            Err(error) => {
-                self.poisoned = true;
-                return Err(ReducedSwirlNativeCudaError::Source(error));
-            }
-        };
-        let projection_ms = elapsed_ms(started);
-        let projection_transfers = transfer_delta(transfer_start, pcie_counters::snapshot());
-        self.push_source_with_projection_telemetry(
-            source_binding,
-            source,
-            projection_ms,
-            projection_transfers,
-        )
-    }
-
-    /// Split a native reduction exactly once.  The retained recursive prefix
-    /// is returned to the caller for the succinct wrapper; the opaque pending
-    /// PCS owner moves directly into this CUDA stream.
-    pub fn push_native_reduction<Ch>(
-        &mut self,
-        source_binding: Digest,
-        reduction: ReducedSwirlCudaNativeReduction,
-        source_challenger: &mut Ch,
-    ) -> Result<RetainedStackingProof, ReducedSwirlNativeCudaError>
-    where
-        Ch: AlgebraicChallenger<EF>,
-    {
-        let (retained, pending) = RetainedStackingProof::split_native_reduction(reduction);
-        self.push_pending(
-            source_binding,
-            pending,
-            &retained.stacking_proof.stacking_openings,
-            source_challenger,
-        )?;
-        Ok(retained)
     }
 
     /// Accept an already constructed device-authoritative source.  This is
@@ -824,7 +721,7 @@ impl<'a> ReducedSwirlNativeCudaStream<'a> {
                 &accumulator_openings,
                 &self.accelerator,
             )?;
-        if let Some(boundary) = finish_exact_finite_warp_call(&mut self.challenger, step_index) {
+        if let Some(boundary) = finish_warp_call(&mut self.challenger, step_index) {
             record.transcript_phases.push(boundary);
         }
 
@@ -873,8 +770,7 @@ impl<'a> ReducedSwirlNativeCudaStream<'a> {
                 &fresh_verifier,
                 &accumulator_verifier,
             )?;
-        if let Some(boundary) = finish_exact_finite_warp_call(&mut verifier_challenger, step_index)
-        {
+        if let Some(boundary) = finish_warp_call(&mut verifier_challenger, step_index) {
             verification.transcript_phases.push(boundary);
         }
         let verifier_transcript = verifier_challenger.into_inner();
@@ -1084,7 +980,7 @@ impl<'a> ReducedSwirlNativeCudaStream<'a> {
         self.telemetry.transfers = transfer_delta(self.transfer_start, pcie_counters::snapshot());
         observe_memory(&mut self.telemetry, memory_snapshot()?);
         self.telemetry
-            .assert_no_duplicate_payload_pipeline()
+            .assert_resident_terminal_contract()
             .map_err(ReducedSwirlNativeCudaError::State)?;
         let swirl_power_batch_security =
             ReducedSwirlPowerBatchSecurityBudget::derive(&self.authoritative_claims)?;
@@ -1119,47 +1015,6 @@ impl<'a> ReducedSwirlNativeCudaStream<'a> {
         self.poisoned = true;
         Err(ReducedSwirlNativeCudaError::State(message))
     }
-}
-
-/// Supplier-oriented adapter for callers that already stream pending owners.
-pub fn prove_reduced_swirl_native_cuda_streaming<Supply, SupplyError>(
-    setup: &ReducedSwirlNativeCudaSetup,
-    statement: ReducedSwirlNativeStatement,
-    mut supply: Supply,
-) -> Result<ReducedSwirlNativeCudaOutput, ReducedSwirlNativeCudaError>
-where
-    Supply: FnMut(
-        usize,
-    ) -> Result<
-        (
-            ReducedSwirlCudaPendingWitness,
-            Vec<Vec<EF>>,
-            NativeWarpChallenger<SC, DuplexSpongeRecorder>,
-        ),
-        SupplyError,
-    >,
-    SupplyError: Display,
-{
-    statement.validate()?;
-    let source_count = statement.source_bindings.len();
-    let mut stream = ReducedSwirlNativeCudaStream::new(setup, source_count)?;
-    for source_index in 0..source_count {
-        let (pending, openings, mut source_challenger) = supply(source_index)
-            .map_err(|error| ReducedSwirlNativeCudaError::SourceProvider(error.to_string()))?;
-        stream.push_pending(
-            statement.source_bindings[source_index],
-            pending,
-            &openings,
-            &mut source_challenger,
-        )?;
-    }
-    let output = stream.finish()?;
-    if output.native.proof.statement != statement {
-        return Err(ReducedSwirlNativeCudaError::State(
-            "streamed public statement mismatch",
-        ));
-    }
-    Ok(output)
 }
 
 fn validate_source(
@@ -1377,19 +1232,13 @@ fn copy_terminal_telemetry(
     terminal: ResidentTerminalWhirInstrumentation,
 ) {
     telemetry.terminal_reused_initial_roots = terminal.reused_initial_roots;
-    telemetry.terminal_accumulator_reencodes = terminal.accumulator_reencodes;
-    telemetry.terminal_accumulator_recommits = terminal.accumulator_recommits;
-    telemetry.terminal_full_message_d2h_bytes = terminal.full_accumulator_message_d2h_bytes;
     telemetry.terminal_bounded_proof_d2h_bytes = terminal.bounded_proof_d2h_bytes;
 }
 
 #[cfg(all(test, feature = "test-utils"))]
 mod tests {
     use openvm_circuit::system::connector::DEFAULT_SUSPEND_EXIT_CODE;
-    use openvm_continuations::circuit::{
-        reduced_swirl_source_receipt::ReducedSwirlSourceReceiptBlock,
-        reduced_swirl_warp::ReducedSwirlSourceReceiptBus,
-    };
+    use openvm_continuations::circuit::reduced_swirl_warp::ReducedSwirlSourceReceiptBus;
     use openvm_cuda_backend::BabyBearPoseidon2GpuEngine;
     use openvm_recursion_circuit::{
         native_warp::{ReducedSwirlSourceAuthorityBus, ReducedSwirlSourceProfile},
@@ -1410,9 +1259,7 @@ mod tests {
         reduced_swirl_source_receipt::{
             reduced_swirl_source_receipt_profile, ProductionReducedSwirlSourceReceiptComponent,
         },
-        reduced_swirl_vacc_component::{
-            build_reduced_swirl_vacc_aggregate_record, ProductionReducedSwirlVaccComponent,
-        },
+        reduced_swirl_vacc_component::ProductionReducedSwirlVaccComponent,
     };
 
     #[test]
@@ -1485,8 +1332,6 @@ mod tests {
         let mut source_bindings = Vec::new();
         let mut incremental_records = Vec::new();
         let mut incremental_checkpoints = Vec::new();
-        let mut incremental_receipts = Vec::new();
-        let mut receipt_sources = Vec::new();
         for (source_index, (a, b)) in [(0, 1), (2, 3), (5, 8)].into_iter().enumerate() {
             let fixture = PreprocessedFibFixture::new(a, b, selectors.clone());
             let proving_context = engine
@@ -1533,7 +1378,7 @@ mod tests {
                 incremental_records.push(completed.verification.clone());
                 incremental_checkpoints.push(completed.end_checkpoint);
                 let source_end = completed.source_start + completed.fresh_count;
-                let source_packet = source_component.generate_cpu_in_flight_inline_packet(
+                let source_packet = source_component.generate_cpu_in_flight_packet(
                     &vk,
                     &retained[completed.source_start..source_end],
                     &wrapper_claims[completed.source_start..source_end],
@@ -1555,12 +1400,12 @@ mod tests {
                     ),
                     Err(crate::prover::native_warp::reduced_swirl_vacc_component::ReducedSwirlVaccComponentError::SourceBinding { .. })
                 ));
-                incremental_receipts.push((
-                    packet.receipt,
-                    packet.entry_digests,
-                    packet.manifest_digest,
-                ));
-                receipt_sources.extend(source_packet.block.sources);
+                assert_eq!(packet.entry_digests.len(), completed.fresh_count);
+                assert_eq!(
+                    packet.receipt.call_index,
+                    F::from_usize(completed.call_index)
+                );
+                assert_eq!(packet.receipt.manifest_digest, packet.manifest_digest);
             }
         }
         let output = stream.finish()?;
@@ -1573,13 +1418,9 @@ mod tests {
         assert_eq!(output.native.proof.statement, statement);
         assert_eq!(output.native.proof.vacc.steps.len(), 2);
         assert_eq!(incremental_records.len(), 2);
-        assert_eq!(incremental_receipts.len(), 2);
         assert_eq!(output.telemetry.maximum_pending_sources, 2);
         assert_eq!(output.telemetry.maximum_scheduled_fresh_count, 2);
-        assert!(output
-            .telemetry
-            .assert_no_duplicate_payload_pipeline()
-            .is_ok());
+        assert!(output.telemetry.assert_resident_terminal_contract().is_ok());
 
         let verified = verify_reduced_swirl_native_recorded(
             setup.cpu_setup(),
@@ -1593,28 +1434,6 @@ mod tests {
         );
         assert_eq!(verified.terminal.root, verified.final_instance.rt);
         assert_eq!(incremental_records, verified.transition_records);
-        let source_block = ReducedSwirlSourceReceiptBlock {
-            source_offset: 0,
-            sources: receipt_sources,
-            manifest_digest: statement.block_manifest_digest,
-        };
-        let aggregate_record = build_reduced_swirl_vacc_aggregate_record(
-            vacc_component.profile(),
-            &output.native,
-            &verified,
-            &source_block,
-        )?;
-        for (call_index, expected) in incremental_receipts.iter().enumerate() {
-            let legacy = vacc_component.generate_transition_cpu_packet(
-                &output.native,
-                &verified,
-                &aggregate_record,
-                call_index,
-            )?;
-            assert_eq!(&legacy.receipt, &expected.0);
-            assert_eq!(&legacy.entry_digests, &expected.1);
-            assert_eq!(&legacy.manifest_digest, &expected.2);
-        }
         for (checkpoint, record) in incremental_checkpoints
             .iter()
             .zip(&verified.transition_records)
@@ -1625,7 +1444,7 @@ mod tests {
                 .find(|phase| {
                     matches!(
                         phase.phase,
-                        openvm_stark_backend::warp_accum::NativeTranscriptPhase::ExactFiniteCallBoundary { .. }
+                        openvm_stark_backend::warp_accum::NativeTranscriptPhase::CallBoundary { .. }
                     )
                 })
                 .ok_or_else(|| eyre::eyre!("missing incremental call boundary"))?;
@@ -1647,7 +1466,7 @@ mod invariant_tests {
             terminal_reused_initial_roots: 1,
             ..Default::default()
         };
-        assert!(telemetry.assert_no_duplicate_payload_pipeline().is_ok());
+        assert!(telemetry.assert_resident_terminal_contract().is_ok());
     }
 
     #[test]
@@ -1656,12 +1475,8 @@ mod invariant_tests {
             terminal_reused_initial_roots: 1,
             ..Default::default()
         };
-        telemetry.fresh_reencodes = 1;
-        assert!(telemetry.assert_no_duplicate_payload_pipeline().is_err());
-
-        telemetry.fresh_reencodes = 0;
-        telemetry.terminal_full_message_d2h_bytes = size_of::<EF>();
-        assert!(telemetry.assert_no_duplicate_payload_pipeline().is_err());
+        telemetry.terminal_reused_initial_roots = 0;
+        assert!(telemetry.assert_resident_terminal_contract().is_err());
     }
 
     #[test]

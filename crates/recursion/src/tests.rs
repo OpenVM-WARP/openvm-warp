@@ -65,8 +65,7 @@ fn verifier_sub_circuit_respects_starting_bus_index() {
     let (child_vk, _) = FibFixture::new(0, 1, 1 << 3).keygen_and_prove(&child_engine);
     let config = VerifierConfig::default();
 
-    let zero_based =
-        VerifierSubCircuit::<1>::new_with_options(Arc::new(child_vk.clone()), config.clone());
+    let zero_based = VerifierSubCircuit::<1>::new_with_options(Arc::new(child_vk.clone()), config);
     let verifier_bus_count = zero_based.next_bus_idx();
     let first_bus_idx = verifier_bus_count + 17;
     let offset = VerifierSubCircuit::<1>::new_with_options_from_bus_idx_manager(
@@ -530,59 +529,6 @@ fn test_deferred_opening_verifier_stops_after_stacking_and_exports_checkpoint() 
     assert_eq!(private.len(), 1);
     assert_eq!(private[0].checkpoint, decoded[0]);
     assert!(decoded[0].transcript_index > 0);
-    debug(&parent_engine, &circuit.airs(), ctxs);
-}
-
-#[test]
-fn test_deferred_stacking_verifier_exports_compact_transcript_checkpoint() {
-    setup_tracing_with_log_level(Level::ERROR);
-    let params = default_test_params_small();
-    let child_engine = BabyBearPoseidon2CpuEngine::<DuplexSponge>::new(params);
-    let parent_engine = test_engine_small();
-    let (vk, proof) = InteractionsFixture11.keygen_and_prove(&child_engine);
-
-    let circuit = VerifierSubCircuit::<2>::new_with_options(
-        Arc::new(vk.clone()),
-        VerifierConfig {
-            tail_mode: crate::system::VerifierTailMode::DeferredStacking,
-            ..Default::default()
-        },
-    );
-    let post_stacking = VerifierSubCircuit::<2>::new_with_options(
-        Arc::new(vk.clone()),
-        VerifierConfig {
-            tail_mode: crate::system::VerifierTailMode::DeferredWhir,
-            ..Default::default()
-        },
-    );
-    assert!(
-        circuit.airs::<BabyBearPoseidon2Config>().len()
-            < post_stacking.airs::<BabyBearPoseidon2Config>().len()
-    );
-
-    let vk_commit_data = circuit.commit_child_vk(&parent_engine, &vk);
-    let ctxs = circuit.generate_proving_ctxs_base(
-        &vk,
-        CachedTraceCtx::PcsData(vk_commit_data),
-        &[proof],
-        &(),
-        default_duplex_sponge_recorder(),
-    );
-    assert_eq!(ctxs.len(), circuit.airs::<BabyBearPoseidon2Config>().len());
-    let claims = &ctxs[ctxs.len() - 4];
-    assert!(claims.common_main.height() > 1);
-    assert!(claims.public_values.is_empty());
-    let checkpoint = &ctxs[ctxs.len() - 3];
-    assert_eq!(checkpoint.common_main.height(), 1);
-    assert_eq!(
-        checkpoint.public_values.len(),
-        crate::system::ConstraintReductionCheckpointAir::<2>::public_width()
-    );
-    assert_eq!(checkpoint.public_values[0], F::ONE);
-    assert_eq!(
-        checkpoint.public_values[checkpoint.public_values.len() / 2],
-        F::ZERO
-    );
     debug(&parent_engine, &circuit.airs(), ctxs);
 }
 

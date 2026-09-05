@@ -33,7 +33,6 @@ use openvm_recursion_circuit::{
         AggregationSubCircuit, BusIndexManager, BusInventory, VerifierConfig, VerifierSubCircuit,
         VerifierTailMode,
     },
-    transcript::Poseidon2BusOwner,
 };
 use openvm_stark_backend::{
     interaction::{BusIndex, InteractionBuilder},
@@ -261,40 +260,6 @@ pub struct ReducedSwirlSourceReceiptBlock {
     pub manifest_digest: Digest,
 }
 
-/// Setup-fixed wiring of the source receipt component.
-///
-/// Inline mode exports source authority to the sibling VACC component and
-/// therefore uses fanout two for source exports. Detached mode is used by a
-/// bounded source leaf: the receipt is the sole consumer, so every source
-/// export has fanout one and no authority record is emitted.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ReducedSwirlSourceReceiptMode {
-    #[default]
-    Inline = 0,
-    Detached = 1,
-}
-
-impl ReducedSwirlSourceReceiptMode {
-    #[must_use]
-    pub const fn export_lookup_count(self) -> u32 {
-        match self {
-            Self::Inline => 2,
-            Self::Detached => 1,
-        }
-    }
-
-    #[must_use]
-    pub const fn emits_authority(self) -> bool {
-        matches!(self, Self::Inline)
-    }
-
-    #[must_use]
-    pub const fn protocol_tag(self) -> usize {
-        self as u8 as usize
-    }
-}
-
 /// Fill every canonical subdigest, source-entry digest and the ordered block
 /// manifest from authenticated scalar data. SDK adapters use this before
 /// comparing against `ReducedSwirlSourceManifestPrefix::digest_with_claim`.
@@ -333,7 +298,6 @@ pub fn canonicalize_reduced_swirl_source_receipt_block(
 #[derive(Clone, Debug)]
 pub struct ReducedSwirlSourceReceiptAir {
     pub profile: ReducedSwirlSourceReceiptProfile,
-    pub mode: ReducedSwirlSourceReceiptMode,
     pub transcript_bus: TranscriptBus,
     pub verifier_buses: BusInventory,
     pub source_air: ReducedSwirlSourceAir,
@@ -463,31 +427,29 @@ where
             is_last.clone(),
         );
 
-        if self.mode.emits_authority() {
-            self.authority_bus.send(
-                builder,
-                ReducedSwirlSourceAuthorityMessage {
-                    source: proof.clone(),
-                    segment_index: local[SEGMENT].into(),
-                    common_main_root: array::<AB, DIGEST_SIZE>(
-                        local,
-                        self.profile.roots_offset() + ROOT_DIGEST,
-                    ),
-                    trace_layout_digest: array::<AB, DIGEST_SIZE>(local, LAYOUT_DIGEST),
-                    pending_claim_digest: array::<AB, DIGEST_SIZE>(local, PENDING_DIGEST),
-                    checkpoint_tidx: local[CHECKPOINT_TIDX].into(),
-                    checkpoint_state: array::<AB, POSEIDON2_WIDTH>(local, CHECKPOINT_STATE),
-                    program_commitment: array::<AB, DIGEST_SIZE>(local, PROGRAM),
-                    initial_pc: local[INITIAL_PC].into(),
-                    initial_root: array::<AB, DIGEST_SIZE>(local, INITIAL_ROOT),
-                    final_pc: local[FINAL_PC].into(),
-                    final_root: array::<AB, DIGEST_SIZE>(local, FINAL_ROOT),
-                    exit_code: local[EXIT_CODE].into(),
-                    is_terminate: local[IS_TERMINATE].into(),
-                },
-                active.clone(),
-            );
-        }
+        self.authority_bus.send(
+            builder,
+            ReducedSwirlSourceAuthorityMessage {
+                source: proof.clone(),
+                segment_index: local[SEGMENT].into(),
+                common_main_root: array::<AB, DIGEST_SIZE>(
+                    local,
+                    self.profile.roots_offset() + ROOT_DIGEST,
+                ),
+                trace_layout_digest: array::<AB, DIGEST_SIZE>(local, LAYOUT_DIGEST),
+                pending_claim_digest: array::<AB, DIGEST_SIZE>(local, PENDING_DIGEST),
+                checkpoint_tidx: local[CHECKPOINT_TIDX].into(),
+                checkpoint_state: array::<AB, POSEIDON2_WIDTH>(local, CHECKPOINT_STATE),
+                program_commitment: array::<AB, DIGEST_SIZE>(local, PROGRAM),
+                initial_pc: local[INITIAL_PC].into(),
+                initial_root: array::<AB, DIGEST_SIZE>(local, INITIAL_ROOT),
+                final_pc: local[FINAL_PC].into(),
+                final_root: array::<AB, DIGEST_SIZE>(local, FINAL_ROOT),
+                exit_code: local[EXIT_CODE].into(),
+                is_terminate: local[IS_TERMINATE].into(),
+            },
+            active.clone(),
+        );
         self.receipt_bus.add_key_with_lookups(
             builder,
             ReducedSwirlSourceReceiptMessage {
@@ -744,20 +706,18 @@ impl ReducedSwirlSourceReceiptAir {
                 },
                 enabled.clone(),
             );
-            // Inline VACC consumes roots/beta/claim but not point/opening.
-            // Balance that setup-fixed second export lookup only in inline
-            // mode. Detached leaves use fanout one and must not duplicate it.
-            if self.mode == ReducedSwirlSourceReceiptMode::Inline {
-                self.source_air.point_export_bus.lookup_key(
-                    builder,
-                    ReducedSwirlSourcePointMessage {
-                        source: proof.clone(),
-                        coordinate: AB::Expr::from_usize(coordinate),
-                        value: array::<AB, D_EF>(row, point),
-                    },
-                    enabled.clone(),
-                );
-            }
+            // The source AIR exports every source family with fanout two.
+            // VACC consumes roots, beta, and the claim; this balancing lookup
+            // accounts for the second point export that VACC does not use.
+            self.source_air.point_export_bus.lookup_key(
+                builder,
+                ReducedSwirlSourcePointMessage {
+                    source: proof.clone(),
+                    coordinate: AB::Expr::from_usize(coordinate),
+                    value: array::<AB, D_EF>(row, point),
+                },
+                enabled.clone(),
+            );
             self.source_air.beta_export_bus.lookup_key(
                 builder,
                 ReducedSwirlSourceBetaMessage {
@@ -811,19 +771,17 @@ impl ReducedSwirlSourceReceiptAir {
                 },
                 enabled.clone() * slot_active.clone() * first.clone(),
             );
-            if self.mode == ReducedSwirlSourceReceiptMode::Inline {
-                self.source_air.opening_export_bus.lookup_key(
-                    builder,
-                    ReducedSwirlSourceOpeningMessage {
-                        source: proof.clone(),
-                        opening_index: AB::Expr::from_usize(index),
-                        root_ordinal: row[offset + OPENING_ROOT].into(),
-                        column: row[offset + OPENING_COLUMN].into(),
-                        value: array::<AB, D_EF>(row, offset + OPENING_VALUE),
-                    },
-                    enabled.clone() * slot_active.clone(),
-                );
-            }
+            self.source_air.opening_export_bus.lookup_key(
+                builder,
+                ReducedSwirlSourceOpeningMessage {
+                    source: proof.clone(),
+                    opening_index: AB::Expr::from_usize(index),
+                    root_ordinal: row[offset + OPENING_ROOT].into(),
+                    column: row[offset + OPENING_COLUMN].into(),
+                    value: array::<AB, D_EF>(row, offset + OPENING_VALUE),
+                },
+                enabled.clone() * slot_active.clone(),
+            );
             self.source_air.opening_export_bus.lookup_key(
                 builder,
                 ReducedSwirlSourceOpeningMessage {
@@ -1473,26 +1431,9 @@ impl ReducedSwirlSourceReceiptProducer {
         airs
     }
 
-    /// Poseidon lookup owner shared with a detached source-leaf boundary AIR.
-    /// The boundary AIR must use these buses, and pass its compression
-    /// pre-states to [`Self::generate_traces_with_external_compressions`], so
-    /// no second Poseidon table is introduced.
-    #[must_use]
-    pub fn poseidon2_bus_owner(&self) -> Poseidon2BusOwner {
-        self.transcript.poseidon2_bus_owner()
-    }
-
-    pub fn generate_traces(
-        &self,
-        block: &ReducedSwirlSourceReceiptBlock,
-    ) -> Result<ReducedSwirlSourceReceiptTraces, &'static str> {
-        self.generate_traces_with_external_compressions(block, &[])
-    }
-
-    /// Generate the ordinary receipt traces while servicing an additional,
-    /// caller-owned set of compression lookups in this producer's existing
-    /// Poseidon table. Inputs are full Poseidon pre-states in canonical lookup
-    /// order. Existing inline callers use [`Self::generate_traces`].
+    /// Generate receipt traces while servicing the transition boundary's
+    /// compression lookups in this producer's existing Poseidon table. Inputs
+    /// are full Poseidon pre-states in canonical lookup order.
     pub fn generate_traces_with_external_compressions(
         &self,
         block: &ReducedSwirlSourceReceiptBlock,
@@ -1539,7 +1480,6 @@ pub struct ReducedSwirlSourceReceiptComponent<
     source_air: ReducedSwirlSourceAir,
     source_transcript: NativeWarpTranscriptModule,
     receipt: ReducedSwirlSourceReceiptProducer,
-    mode: ReducedSwirlSourceReceiptMode,
     next_bus_idx: BusIndex,
 }
 
@@ -1563,48 +1503,6 @@ impl<const MAX_SOURCES: usize> ReducedSwirlSourceReceiptComponent<MAX_SOURCES> {
         receipt_bus: ReducedSwirlSourceReceiptBus,
         authority_bus: ReducedSwirlSourceAuthorityBus,
         bus_idx_manager: BusIndexManager,
-    ) -> Result<Self, &'static str> {
-        Self::new_with_mode(
-            child_vk,
-            profile,
-            params,
-            receipt_bus,
-            authority_bus,
-            bus_idx_manager,
-            ReducedSwirlSourceReceiptMode::Inline,
-        )
-    }
-
-    /// Construct a bounded source-leaf component whose sole output is the
-    /// receipt. No per-source authority lookup escapes this component.
-    pub fn new_detached(
-        child_vk: Arc<MultiStarkVerifyingKey<BabyBearPoseidon2Config>>,
-        profile: ReducedSwirlSourceReceiptProfile,
-        params: SystemParams,
-        receipt_bus: ReducedSwirlSourceReceiptBus,
-        authority_bus: ReducedSwirlSourceAuthorityBus,
-        bus_idx_manager: BusIndexManager,
-    ) -> Result<Self, &'static str> {
-        Self::new_with_mode(
-            child_vk,
-            profile,
-            params,
-            receipt_bus,
-            authority_bus,
-            bus_idx_manager,
-            ReducedSwirlSourceReceiptMode::Detached,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn new_with_mode(
-        child_vk: Arc<MultiStarkVerifyingKey<BabyBearPoseidon2Config>>,
-        profile: ReducedSwirlSourceReceiptProfile,
-        params: SystemParams,
-        receipt_bus: ReducedSwirlSourceReceiptBus,
-        authority_bus: ReducedSwirlSourceAuthorityBus,
-        bus_idx_manager: BusIndexManager,
-        mode: ReducedSwirlSourceReceiptMode,
     ) -> Result<Self, &'static str> {
         profile.validate()?;
         if profile.source.maximum_sources != MAX_SOURCES {
@@ -1659,9 +1557,9 @@ impl<const MAX_SOURCES: usize> ReducedSwirlSourceReceiptComponent<MAX_SOURCES> {
             opening_export_bus: ReducedSwirlSourceOpeningBus::new(buses.new_bus_idx()),
             beta_export_bus: ReducedSwirlSourceBetaBus::new(buses.new_bus_idx()),
             claim_export_bus: ReducedSwirlSourceClaimBus::new(buses.new_bus_idx()),
-            // Inline mode has a second VACC consumer. A detached source leaf
-            // has only the receipt consumer and therefore exact fanout one.
-            export_lookup_count: mode.export_lookup_count(),
+            // The receipt and sibling VACC are the two consumers of every
+            // source export family in the combined transition leaf.
+            export_lookup_count: 2,
         };
         let source_transcript = NativeWarpTranscriptModule::new_for_bus(
             &verifier_buses,
@@ -1670,7 +1568,6 @@ impl<const MAX_SOURCES: usize> ReducedSwirlSourceReceiptComponent<MAX_SOURCES> {
         );
         let receipt_air = ReducedSwirlSourceReceiptAir {
             profile,
-            mode,
             transcript_bus: TranscriptBus::new(buses.new_bus_idx()),
             verifier_buses: verifier_buses.clone(),
             source_air,
@@ -1686,7 +1583,6 @@ impl<const MAX_SOURCES: usize> ReducedSwirlSourceReceiptComponent<MAX_SOURCES> {
             source_air,
             source_transcript,
             receipt,
-            mode,
             next_bus_idx: buses.next_bus_idx(),
         })
     }
@@ -1717,17 +1613,6 @@ impl<const MAX_SOURCES: usize> ReducedSwirlSourceReceiptComponent<MAX_SOURCES> {
     }
 
     #[must_use]
-    pub const fn mode(&self) -> ReducedSwirlSourceReceiptMode {
-        self.mode
-    }
-
-    /// Poseidon owner to be used by a detached source-leaf boundary AIR.
-    #[must_use]
-    pub fn receipt_poseidon2_bus_owner(&self) -> Poseidon2BusOwner {
-        self.receipt.poseidon2_bus_owner()
-    }
-
-    #[must_use]
     pub const fn next_bus_idx(&self) -> BusIndex {
         self.next_bus_idx
     }
@@ -1750,16 +1635,8 @@ impl<const MAX_SOURCES: usize> ReducedSwirlSourceReceiptComponent<MAX_SOURCES> {
         airs
     }
 
-    pub fn generate_auxiliary_traces(
-        &self,
-        source_records: &[ReducedSwirlSourceRecord],
-        block: &ReducedSwirlSourceReceiptBlock,
-    ) -> Result<ReducedSwirlSourceReceiptComponentTraces, &'static str> {
-        self.generate_auxiliary_traces_with_external_compressions(source_records, block, &[])
-    }
-
-    /// As [`Self::generate_auxiliary_traces`], with extra compression
-    /// pre-states supplied by a boundary AIR sharing the receipt Poseidon bus.
+    /// Generate source and receipt traces while supplying compression
+    /// pre-states from the boundary AIR that shares the receipt Poseidon bus.
     pub fn generate_auxiliary_traces_with_external_compressions(
         &self,
         source_records: &[ReducedSwirlSourceRecord],

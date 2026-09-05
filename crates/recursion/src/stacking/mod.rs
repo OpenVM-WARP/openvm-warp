@@ -15,7 +15,6 @@ use p3_matrix::dense::RowMajorMatrix;
 use strum::{EnumCount, EnumDiscriminants};
 
 use crate::{
-    bus::{ColumnClaimsBus, WhirOpeningPointBus},
     stacking::{
         bus::*,
         claims::{StackingClaimsAir, StackingClaimsTraceGenerator},
@@ -38,20 +37,9 @@ pub mod claims;
 pub mod eq_base;
 pub mod eq_bits;
 pub mod opening;
-pub mod ordered;
 pub mod sumcheck;
 pub mod univariate;
 mod utils;
-pub use bus::{
-    OrderedStackingOpeningBus, OrderedStackingOpeningMessage, OrderedStackingSourcePointBus,
-    OrderedStackingSourcePointMessage,
-};
-pub use ordered::{
-    OrderedStackingClaim, OrderedStackingClaimIdentity, OrderedStackingPreflight,
-    OrderedStackingProfile, OrderedStackingProfileError, OrderedStackingReduction,
-    OrderedStackingStatementShape, OrderedStackingTracegenError, OrderedStackingTranscriptSchedule,
-};
-pub(crate) use utils::sorted_column_claims;
 
 #[cfg(feature = "cuda")]
 mod cuda_abi;
@@ -85,43 +73,6 @@ pub struct StackingModule {
     /// claims on the native reduction endpoint-input bus, where the
     /// fresh-opening tables consume them.
     native_exports: Option<StackingNativeExports>,
-    /// Setup-fixed ordered-reduction mode. This is configured before keygen and replaces only
-    /// the child-proof shape source used by `OpeningClaimsAir`; all algebraic and transcript AIRs
-    /// remain the ordinary stacking verifier AIRs.
-    ordered_profile: Option<Arc<OrderedStackingProfile>>,
-    ordered_column_claims_bus: Option<ColumnClaimsBus>,
-    ordered_source_point_bus: Option<OrderedStackingSourcePointBus>,
-    ordered_authority_transcript_proof_idx: Option<usize>,
-    ordered_reduced_point_bus: Option<WhirOpeningPointBus>,
-    ordered_stacking_opening_bus: Option<OrderedStackingOpeningBus>,
-}
-
-/// Isolated, typed outputs produced by setup-fixed ordered stacking.
-///
-/// `reduced_point` carries `WhirOpeningPointMessage { idx, value }` under the
-/// source reduction's `proof_idx`. `stacking_opening` carries
-/// `OrderedStackingOpeningMessage { opening_idx, value }` under the same key.
-/// Both are permutation buses: the setup-PCS statement authority must consume
-/// each message exactly once before fanout on multi-constraint lookup buses.
-#[derive(Clone, Copy, Debug)]
-pub struct OrderedStackingOutputBuses {
-    pub reduced_point: WhirOpeningPointBus,
-    pub stacking_opening: OrderedStackingOpeningBus,
-}
-
-/// Verifier-owned authority boundary for ordered stacking reductions.
-///
-/// `column_claims` remains keyed by the reduction/transition index. Every
-/// `TranscriptBus` interaction from every reduction is instead keyed by the
-/// single `transcript_proof_idx`, whose transcript already contains the batch
-/// prefix and later continues into multi-WHIR. `source_opening_point` is an
-/// isolated permutation bus keyed by the reduction/transition index; ordered
-/// stacking consumes each original `r` coordinate exactly once from it.
-#[derive(Clone, Copy, Debug)]
-pub struct OrderedStackingAuthority {
-    pub column_claims: ColumnClaimsBus,
-    pub source_opening_point: OrderedStackingSourcePointBus,
-    pub transcript_proof_idx: usize,
 }
 
 /// See [`StackingModule::set_partial_assembly_exports`].
@@ -165,100 +116,10 @@ impl StackingModule {
             mu_pow_bits: child_vk.inner.params.whir.mu_pow_bits,
             emit_whir_exports: true,
             native_exports: None,
-            ordered_profile: None,
-            ordered_column_claims_bus: None,
-            ordered_source_point_bus: None,
-            ordered_authority_transcript_proof_idx: None,
-            ordered_reduced_point_bus: None,
-            ordered_stacking_opening_bus: None,
         }
     }
 
-    /// Configure this module as a setup-fixed ordered stacking verifier.
-    ///
-    /// This must be called before [`AirModule::airs`] and key generation. The profile is embedded
-    /// as `OpeningClaimsAir` preprocessed data, so layouts, rotation flags, claim identities and
-    /// their order are verifier-owned rather than witness-selected. The profile must carry the
-    /// verifier-owned global transcript schedule. The supplied claim and source-point buses must
-    /// be isolated from the child verifier's ordinary buses.
-    pub fn configure_ordered_reductions(
-        &mut self,
-        profile: OrderedStackingProfile,
-        authority: OrderedStackingAuthority,
-    ) -> Result<(), OrderedStackingProfileError> {
-        profile.validate_module_params(self.l_skip, self.n_stack, self.w_stack)?;
-        if self.ordered_profile.is_some() {
-            return Err(OrderedStackingProfileError::AlreadyConfigured);
-        }
-        self.emit_whir_exports = false;
-        self.ordered_column_claims_bus = Some(authority.column_claims);
-        self.ordered_source_point_bus = Some(authority.source_opening_point);
-        self.ordered_authority_transcript_proof_idx = Some(authority.transcript_proof_idx);
-        self.ordered_profile = Some(Arc::new(profile));
-        Ok(())
-    }
-
-    /// Publish the constrained reduced cube point and commitment-major
-    /// stacking openings on isolated typed buses.
-    ///
-    /// This must be configured after [`Self::configure_ordered_reductions`]
-    /// and before [`AirModule::airs`]. It does not publish directly on the
-    /// multi-constraint lookup buses: their point multiplicities depend on
-    /// the terminal WHIR profile. A caller-owned statement AIR must receive
-    /// these exact permutation messages and perform that fixed-profile fanout.
-    pub fn configure_ordered_statement_outputs(
-        &mut self,
-        outputs: OrderedStackingOutputBuses,
-    ) -> Result<(), OrderedStackingProfileError> {
-        if self.ordered_profile.is_none() {
-            return Err(OrderedStackingProfileError::StatementOutputsRequireOrderedProfile);
-        }
-        if self.ordered_reduced_point_bus.is_some() || self.ordered_stacking_opening_bus.is_some() {
-            return Err(OrderedStackingProfileError::StatementOutputsAlreadyConfigured);
-        }
-        self.ordered_reduced_point_bus = Some(outputs.reduced_point);
-        self.ordered_stacking_opening_bus = Some(outputs.stacking_opening);
-        Ok(())
-    }
-
-    /// Generate the six ordinary stacking verifier AIR contexts from canonical ordered
-    /// reductions, without constructing a synthetic child [`Proof`].
-    ///
-    /// The real `StackingProof`, opening point, ordered current/rotated claims and exact stacking
-    /// and batch-constraint preflights are checked against the setup-fixed profile before any
-    /// matrix is allocated.
-    pub fn generate_ordered_reduction_ctxs<SC: StarkProtocolConfig<F = F>>(
-        &self,
-        reductions: &[OrderedStackingReduction<'_>],
-        required_heights: Option<&[usize]>,
-    ) -> Result<Vec<AirProvingContext<CpuBackend<SC>>>, OrderedStackingTracegenError> {
-        let profile = self
-            .ordered_profile
-            .as_deref()
-            .ok_or(OrderedStackingTracegenError::ModuleNotConfigured)?;
-        ordered::generate_ordered_reduction_ctxs::<SC>(profile, reductions, required_heights)
-    }
-
-    /// Generate the authority-owned `EqNegAir` companion for the ordered
-    /// `EqBaseAir` context.
-    ///
-    /// This trace is derived directly from the same validated reductions: it
-    /// uses `stacking.sumcheck_rnd[0]` as `u` and `opening_point[0]` as `r`.
-    /// It does not synthesize a batch-constraint preflight.
-    pub fn generate_ordered_eq_neg_ctx<SC: StarkProtocolConfig<F = F>>(
-        &self,
-        reductions: &[OrderedStackingReduction<'_>],
-        required_height: Option<usize>,
-    ) -> Result<AirProvingContext<CpuBackend<SC>>, OrderedStackingTracegenError> {
-        let profile = self
-            .ordered_profile
-            .as_deref()
-            .ok_or(OrderedStackingTracegenError::ModuleNotConfigured)?;
-        ordered::generate_ordered_eq_neg_ctx::<SC>(profile, reductions, required_height)
-    }
-
-    /// Configure the module for a partial assembly without the WHIR module
-    /// (the v29 native WARP history certificate): the μ-PoW/μ batching tail,
+    /// Configure the module for a reduced-SWIRL assembly without the WHIR module: the μ-PoW/μ batching tail,
     /// the WHIR handoff buses, the stacking-index provider, and the
     /// opening-point sends are gated off, and instead the sampled stacking
     /// point and the stacking-opening claims are re-published on the native
@@ -374,9 +235,7 @@ impl AirModule for StackingModule {
         let opening_air = OpeningClaimsAir {
             lifted_heights_bus: self.bus_inventory.lifted_heights_bus,
             stacking_module_bus: self.bus_inventory.stacking_module_bus,
-            column_claims_bus: self
-                .ordered_column_claims_bus
-                .unwrap_or(self.bus_inventory.column_claims_bus),
+            column_claims_bus: self.bus_inventory.column_claims_bus,
             transcript_bus: self.bus_inventory.transcript_bus,
             air_shape_bus: self.bus_inventory.air_shape_bus,
             stacking_tidx_bus: self.stacking_tidx_bus,
@@ -386,8 +245,6 @@ impl AirModule for StackingModule {
             eq_bits_lookup_bus: self.eq_bits_lookup_bus,
             l_skip: self.l_skip,
             n_stack: self.n_stack,
-            authority_transcript_proof_idx: self.ordered_authority_transcript_proof_idx,
-            ordered_profile: self.ordered_profile.clone(),
         };
         let univariate_round_air = UnivariateRoundAir {
             transcript_bus: self.bus_inventory.transcript_bus,
@@ -396,18 +253,10 @@ impl AirModule for StackingModule {
             eq_rand_values_bus: self.eq_rand_values_bus,
             eq_kernel_lookup_bus: self.eq_kernel_lookup_bus,
             l_skip: self.l_skip,
-            authority_transcript_proof_idx: self.ordered_authority_transcript_proof_idx,
-            // The scalar univariate challenge is not itself the complete
-            // SWIRL cube prefix. `EqBaseAir` exports its `l_skip` successive
-            // squares in the exact ordinary-WHIR coordinate order.
-            native_point_export: None,
         };
         let sumcheck_rounds_air = SumcheckRoundsAir {
             constraint_randomness_bus: self.bus_inventory.constraint_randomness_bus,
-            ordered_source_point_bus: self.ordered_source_point_bus,
-            whir_opening_point_bus: self
-                .ordered_reduced_point_bus
-                .unwrap_or(self.bus_inventory.whir_opening_point_bus),
+            whir_opening_point_bus: self.bus_inventory.whir_opening_point_bus,
             transcript_bus: self.bus_inventory.transcript_bus,
             stacking_tidx_bus: self.stacking_tidx_bus,
             sumcheck_claims_bus: self.sumcheck_claims_bus,
@@ -415,8 +264,7 @@ impl AirModule for StackingModule {
             eq_rand_values_bus: self.eq_rand_values_bus,
             eq_kernel_lookup_bus: self.eq_kernel_lookup_bus,
             l_skip: self.l_skip,
-            authority_transcript_proof_idx: self.ordered_authority_transcript_proof_idx,
-            emit_whir_point: self.emit_whir_exports || self.ordered_reduced_point_bus.is_some(),
+            emit_whir_point: self.emit_whir_exports,
             native_point_export: self
                 .native_exports
                 .map(|exports| (exports.endpoint_input_bus, exports.point_lookups)),
@@ -433,26 +281,21 @@ impl AirModule for StackingModule {
             stacking_index_mult: self.stacking_index_mult,
             w_stack: self.w_stack,
             mu_pow_bits: self.mu_pow_bits,
-            authority_transcript_proof_idx: self.ordered_authority_transcript_proof_idx,
             emit_whir_exports: self.emit_whir_exports,
             native_opening_export: self
                 .native_exports
                 .map(|exports| (exports.endpoint_input_bus, exports.opening_lookups)),
-            ordered_opening_export: self.ordered_stacking_opening_bus,
         };
         let eq_base_air = EqBaseAir {
             constraint_randomness_bus: self.bus_inventory.constraint_randomness_bus,
-            ordered_source_point_bus: self.ordered_source_point_bus,
-            whir_opening_point_bus: self
-                .ordered_reduced_point_bus
-                .unwrap_or(self.bus_inventory.whir_opening_point_bus),
+            whir_opening_point_bus: self.bus_inventory.whir_opening_point_bus,
             eq_base_bus: self.eq_base_bus,
             eq_rand_values_bus: self.eq_rand_values_bus,
             eq_kernel_lookup_bus: self.eq_kernel_lookup_bus,
             eq_neg_base_rand_bus: self.bus_inventory.eq_neg_base_rand_bus,
             eq_neg_result_bus: self.bus_inventory.eq_neg_result_bus,
             l_skip: self.l_skip,
-            emit_whir_point: self.emit_whir_exports || self.ordered_reduced_point_bus.is_some(),
+            emit_whir_point: self.emit_whir_exports,
             native_point_export: self
                 .native_exports
                 .map(|exports| (exports.endpoint_input_bus, exports.point_lookups)),

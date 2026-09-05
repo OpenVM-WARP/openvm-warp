@@ -36,7 +36,7 @@ use crate::{prover::AppProver, StdIn, F, SC};
 
 /// Complete native result before the one final recursive wrapper is proved.
 /// Large PCS owners have already been consumed and released; retained prefixes
-/// and claims are the bounded verifier-history inputs.
+/// and claims are the bounded transition-tree inputs.
 pub struct ReducedSwirlCpuExecution {
     pub setup: ReducedSwirlNativeSetup,
     pub native: ReducedSwirlNativeProverOutput,

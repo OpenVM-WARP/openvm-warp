@@ -21,9 +21,7 @@ use crate::{
     bus::CertifiedTranscriptCheckpointBus,
     system::{AirModule, BusInventory, GlobalCtxCpu, Preflight, TraceGenModule},
     transcript::{
-        merkle_verify::{
-            MerkleInitialCommitment, MerkleVerifyAir, MerkleVerifyCols, MerkleVerifyTraceError,
-        },
+        merkle_verify::{MerkleVerifyAir, MerkleVerifyCols},
         poseidon2::{Poseidon2Air, Poseidon2Cols, Poseidon2MultiBusAir, CHUNK},
         transcript::{
             TranscriptAir, TranscriptCheckpointCols, TranscriptCols, TranscriptResumeCols,
@@ -41,19 +39,6 @@ pub type Poseidon2MultibusInputs = Vec<(Vec<[F; POSEIDON2_WIDTH]>, Vec<[F; POSEI
 pub struct Poseidon2BusOwner {
     pub permute_bus: crate::bus::Poseidon2PermuteBus,
     pub compress_bus: crate::bus::Poseidon2CompressBus,
-}
-
-/// Transcript and Merkle contexts whose Poseidon requests are serviced by an
-/// enclosing multi-bus Poseidon table.
-///
-/// The contexts are ordered as `TranscriptAir`, then `MerkleVerifyAir`, which
-/// matches [`TranscriptModule::airs_without_poseidon`].  Keeping the raw
-/// requests is essential: rebuilding a private Poseidon trace and then trying
-/// to merge it would lose the per-owner lookup namespace.
-pub struct TranscriptSharedPoseidonCpuPacket<SC: StarkProtocolConfig<F = F>> {
-    pub contexts: Vec<AirProvingContext<CpuBackend<SC>>>,
-    pub poseidon2_permutation_inputs: Vec<[F; POSEIDON2_WIDTH]>,
-    pub poseidon2_compression_inputs: Vec<[F; POSEIDON2_WIDTH]>,
 }
 
 #[cfg(feature = "cuda")]
@@ -156,192 +141,6 @@ impl<const SBOX_REGISTERS: usize> TranscriptModule<SBOX_REGISTERS> {
             permute_bus: self.bus_inventory.poseidon2_permute_bus,
             compress_bus: self.bus_inventory.poseidon2_compress_bus,
         }
-    }
-
-    /// Return the transcript and Merkle owners while omitting this module's
-    /// private Poseidon table.  The caller must install exactly one physical
-    /// multi-bus Poseidon owner containing [`Self::poseidon2_bus_owner`].
-    #[must_use]
-    pub fn airs_without_poseidon<SC: StarkProtocolConfig<F = F>>(&self) -> Vec<AirRef<SC>> {
-        let mut airs = self.airs::<SC>();
-        debug_assert_eq!(airs.len(), 3);
-        airs.remove(1);
-        airs
-    }
-
-    /// Generate transcript and Merkle contexts while retaining all Poseidon
-    /// requests for an enclosing shared table.
-    ///
-    /// `external_*` contains requests made by caller-owned authority AIRs on
-    /// this module's Poseidon buses.  Required heights, when present, are in
-    /// the same two-entry order as [`Self::airs_without_poseidon`].
-    pub fn generate_cpu_contexts_for_shared_poseidon<SC: StarkProtocolConfig<F = F>>(
-        &self,
-        child_vk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
-        proofs: &[Proof<BabyBearPoseidon2Config>],
-        preflights: &[Preflight],
-        external_poseidon2_permutation_inputs: &[[F; POSEIDON2_WIDTH]],
-        external_poseidon2_compression_inputs: &[[F; POSEIDON2_WIDTH]],
-        required_heights: Option<&[usize]>,
-    ) -> Option<TranscriptSharedPoseidonCpuPacket<SC>> {
-        self.generate_cpu_contexts_for_shared_poseidon_with_checkpoints(
-            child_vk,
-            proofs,
-            preflights,
-            &[],
-            external_poseidon2_permutation_inputs,
-            external_poseidon2_compression_inputs,
-            required_heights,
-        )
-    }
-
-    /// Checkpoint-aware form of
-    /// [`Self::generate_cpu_contexts_for_shared_poseidon`]. Each proof may
-    /// select either, both, or neither checkpoint kind.
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate_cpu_contexts_for_shared_poseidon_with_checkpoints<
-        SC: StarkProtocolConfig<F = F>,
-    >(
-        &self,
-        child_vk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
-        proofs: &[Proof<BabyBearPoseidon2Config>],
-        preflights: &[Preflight],
-        checkpoint_targets: &[Option<[Option<usize>; 2]>],
-        external_poseidon2_permutation_inputs: &[[F; POSEIDON2_WIDTH]],
-        external_poseidon2_compression_inputs: &[[F; POSEIDON2_WIDTH]],
-        required_heights: Option<&[usize]>,
-    ) -> Option<TranscriptSharedPoseidonCpuPacket<SC>> {
-        self.generate_cpu_contexts_for_shared_poseidon_with_checkpoints_inner(
-            child_vk,
-            proofs,
-            preflights,
-            checkpoint_targets,
-            external_poseidon2_permutation_inputs,
-            external_poseidon2_compression_inputs,
-            None,
-            required_heights,
-        )
-        .ok()
-        .flatten()
-    }
-
-    /// Direct-carrier counterpart of
-    /// [`Self::generate_cpu_contexts_for_shared_poseidon_with_checkpoints`].
-    ///
-    /// Initial WHIR roots are supplied explicitly in `(proof_idx,
-    /// commit_minor)` order. This path never derives an initial root from the
-    /// compatibility `Proof`; later-round roots retain the legacy proof path.
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate_cpu_contexts_for_shared_poseidon_with_checkpoints_and_initial_commitments<
-        SC: StarkProtocolConfig<F = F>,
-    >(
-        &self,
-        child_vk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
-        proofs: &[Proof<BabyBearPoseidon2Config>],
-        preflights: &[Preflight],
-        checkpoint_targets: &[Option<[Option<usize>; 2]>],
-        external_poseidon2_permutation_inputs: &[[F; POSEIDON2_WIDTH]],
-        external_poseidon2_compression_inputs: &[[F; POSEIDON2_WIDTH]],
-        initial_commitments: &[Vec<MerkleInitialCommitment>],
-        required_heights: Option<&[usize]>,
-    ) -> Result<Option<TranscriptSharedPoseidonCpuPacket<SC>>, MerkleVerifyTraceError> {
-        self.generate_cpu_contexts_for_shared_poseidon_with_checkpoints_inner(
-            child_vk,
-            proofs,
-            preflights,
-            checkpoint_targets,
-            external_poseidon2_permutation_inputs,
-            external_poseidon2_compression_inputs,
-            Some(initial_commitments),
-            required_heights,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn generate_cpu_contexts_for_shared_poseidon_with_checkpoints_inner<
-        SC: StarkProtocolConfig<F = F>,
-    >(
-        &self,
-        child_vk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
-        proofs: &[Proof<BabyBearPoseidon2Config>],
-        preflights: &[Preflight],
-        checkpoint_targets: &[Option<[Option<usize>; 2]>],
-        external_poseidon2_permutation_inputs: &[[F; POSEIDON2_WIDTH]],
-        external_poseidon2_compression_inputs: &[[F; POSEIDON2_WIDTH]],
-        direct_initial_commitments: Option<&[Vec<MerkleInitialCommitment>]>,
-        required_heights: Option<&[usize]>,
-    ) -> Result<Option<TranscriptSharedPoseidonCpuPacket<SC>>, MerkleVerifyTraceError> {
-        if proofs.len() != preflights.len() || proofs.is_empty() {
-            return Ok(None);
-        }
-        let (required_transcript, required_merkle_verify) = match required_heights {
-            Some([transcript, merkle]) => (Some(*transcript), Some(*merkle)),
-            Some(_) => return Ok(None),
-            None => (None, None),
-        };
-
-        let merkle = match direct_initial_commitments {
-            Some(initial_commitments) => merkle_verify::generate_trace_with_initial_commitments(
-                child_vk,
-                proofs,
-                preflights,
-                &self.params,
-                initial_commitments,
-                required_merkle_verify,
-            )?,
-            None => merkle_verify::generate_trace(
-                child_vk,
-                proofs,
-                preflights,
-                &self.params,
-                required_merkle_verify,
-            ),
-        };
-        let Some((merkle_verify_trace, poseidon2_compression_inputs)) = merkle else {
-            return Ok(None);
-        };
-        let transcript_artifacts = {
-            let mut poseidon2_perm_inputs = Vec::new();
-            let mut poseidon2_compress_inputs = poseidon2_compression_inputs;
-            for preflight in preflights {
-                poseidon2_perm_inputs.extend_from_slice(&preflight.poseidon2_perm_inputs);
-                poseidon2_compress_inputs.extend_from_slice(&preflight.poseidon2_compress_inputs);
-            }
-            let logs = preflights
-                .iter()
-                .map(|preflight| &preflight.transcript)
-                .collect_vec();
-            self.build_transcript_trace_artifacts_with_optional_checkpoints(
-                &logs,
-                &[],
-                checkpoint_targets,
-                poseidon2_perm_inputs,
-                poseidon2_compress_inputs,
-                required_transcript,
-            )
-        };
-        let Some(TranscriptTraceArtifacts {
-            transcript_trace,
-            mut poseidon2_perm_inputs,
-            mut poseidon2_compress_inputs,
-        }) = transcript_artifacts
-        else {
-            return Ok(None);
-        };
-        poseidon2_perm_inputs.extend_from_slice(external_poseidon2_permutation_inputs);
-        poseidon2_compress_inputs.extend_from_slice(external_poseidon2_compression_inputs);
-
-        Ok(Some(TranscriptSharedPoseidonCpuPacket {
-            contexts: vec![
-                AirProvingContext::simple_no_pis(transcript_trace),
-                AirProvingContext::simple_no_pis(RowMajorMatrix::new(
-                    merkle_verify_trace,
-                    MerkleVerifyCols::<F>::width(),
-                )),
-            ],
-            poseidon2_permutation_inputs: poseidon2_perm_inputs,
-            poseidon2_compression_inputs: poseidon2_compress_inputs,
-        }))
     }
 
     /// Build one physical Poseidon AIR with a distinct multiplicity pair for
@@ -659,8 +458,8 @@ impl<const SBOX_REGISTERS: usize> TranscriptModule<SBOX_REGISTERS> {
     ///
     /// Deduplication stays on the host: it is a hash over the request states,
     /// small next to the permutation trace itself, which is what this avoids
-    /// materialising and then copying. The native WARP history circuit builds
-    /// this trace per transition and it is 67% of the cells that transition
+    /// materialising and then copying. The reduced-SWIRL wrapper builds this
+    /// trace per transition and it is 67% of the cells that transition
     /// hands to the transporter, so building it where it is consumed removes
     /// both the host tracegen and the upload.
     #[cfg(feature = "cuda")]
@@ -785,7 +584,7 @@ impl<const SBOX_REGISTERS: usize> TranscriptModule<SBOX_REGISTERS> {
             .chain(keyed_compress_states)
             .collect_vec();
         // Parallel because this sorts one entry per Poseidon2 request, and a
-        // native WARP history step makes ~417k of them with 64-byte keys.
+        // wide reduced-SWIRL transition makes ~417k of them with 64-byte keys.
         // Unstable ordering is still fine: two entries share a key only when
         // their canonical limbs agree, so they carry the same state, and the
         // dedup below only counts them.
@@ -1170,10 +969,9 @@ pub(crate) mod cuda_tracegen {
                 proofs,
                 preflights,
                 external_poseidon2_inputs,
-                None,
                 true,
             )
-            .expect("legacy Merkle inputs must match verifier preflight")
+            .expect("Merkle inputs must match verifier preflight")
         }
 
         /// Builds the transcript-side CUDA data for a verifier that stops
@@ -1189,35 +987,13 @@ pub(crate) mod cuda_tracegen {
                 &Vec<[F; POSEIDON2_WIDTH]>,
                 &GpuDeviceCtx,
             ),
-        ) -> Result<Self, MerkleVerifyTraceError> {
+        ) -> Option<Self> {
             Self::new_inner(
                 child_vk,
                 proofs,
                 preflights,
                 external_poseidon2_inputs,
-                None,
                 false,
-            )
-        }
-
-        pub fn new_with_initial_commitments(
-            child_vk: &VerifyingKeyGpu,
-            proofs: &[ProofGpu],
-            preflights: &[PreflightGpu],
-            external_poseidon2_inputs: &(
-                &Vec<[F; POSEIDON2_WIDTH]>,
-                &Vec<[F; POSEIDON2_WIDTH]>,
-                &GpuDeviceCtx,
-            ),
-            initial_commitments: &[Vec<MerkleInitialCommitment>],
-        ) -> Result<Self, MerkleVerifyTraceError> {
-            Self::new_inner(
-                child_vk,
-                proofs,
-                preflights,
-                external_poseidon2_inputs,
-                Some(initial_commitments),
-                true,
             )
         }
 
@@ -1230,9 +1006,8 @@ pub(crate) mod cuda_tracegen {
                 &Vec<[F; POSEIDON2_WIDTH]>,
                 &GpuDeviceCtx,
             ),
-            direct_initial_commitments: Option<&[Vec<MerkleInitialCommitment>]>,
             merkle_verify_enabled: bool,
-        ) -> Result<Self, MerkleVerifyTraceError> {
+        ) -> Option<Self> {
             let external_poseidon2_permute_inputs = external_poseidon2_inputs.0;
             let external_poseidon2_compress_inputs = external_poseidon2_inputs.1;
             let device_ctx = external_poseidon2_inputs.2;
@@ -1250,27 +1025,15 @@ pub(crate) mod cuda_tracegen {
             let mut num_compress_inputs = poseidon2_compress_inputs.len();
 
             let merkle_verify_blob = if merkle_verify_enabled {
-                match direct_initial_commitments {
-                    Some(initial_commitments) => MerkleVerifyBlob::new_with_initial_commitments(
-                        child_vk,
-                        proofs,
-                        preflights,
-                        num_prefix_perms + num_compress_inputs,
-                        Some(initial_commitments),
-                    )?,
-                    None => MerkleVerifyBlob::new(
-                        child_vk,
-                        proofs,
-                        preflights,
-                        num_prefix_perms + num_compress_inputs,
-                    ),
-                }
+                MerkleVerifyBlob::new(
+                    child_vk,
+                    proofs,
+                    preflights,
+                    num_prefix_perms + num_compress_inputs,
+                )
             } else {
                 if proofs.len() != preflights.len() {
-                    return Err(MerkleVerifyTraceError::ProofPreflightCount {
-                        proofs: proofs.len(),
-                        preflights: preflights.len(),
-                    });
+                    return None;
                 }
                 MerkleVerifyBlob::empty(num_prefix_perms + num_compress_inputs, proofs.len())
             };
@@ -1292,7 +1055,7 @@ pub(crate) mod cuda_tracegen {
                 .copy_to_on(&mut poseidon2_buffer, device_ctx)
                 .unwrap();
 
-            Ok(Self {
+            Some(Self {
                 merkle_verify_blob,
                 transcript_air_blob,
                 poseidon2_buffer,
@@ -1334,7 +1097,7 @@ pub(crate) mod cuda_tracegen {
             let mut blob = if self.merkle_verify_enabled {
                 TranscriptBlob::new(child_vk, proofs, preflights, ctx)
             } else {
-                TranscriptBlob::new_without_merkle(child_vk, proofs, preflights, ctx).ok()?
+                TranscriptBlob::new_without_merkle(child_vk, proofs, preflights, ctx)?
             };
 
             let merkle_trace = tracing::trace_span!("wrapper.generate_trace", air = "MerkleVerify")
@@ -1511,7 +1274,7 @@ mod row_count_tests {
             .build_transcript_trace_artifacts(&[&log], &[], &[], Vec::new(), Vec::new(), None)
             .expect("trace artifacts for a well-formed log");
         assert!(
-            artifacts.transcript_trace.values.len() > 0,
+            !artifacts.transcript_trace.values.is_empty(),
             "script {script:?} produced no trace"
         );
     }

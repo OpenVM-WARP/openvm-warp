@@ -15,10 +15,7 @@ use openvm_cuda_common::{
     memory_manager::MemTracker,
     stream::GpuDeviceCtx,
 };
-use openvm_stark_backend::{
-    p3_field::{PrimeCharacteristicRing, PrimeField32},
-    prover::AirProvingContext,
-};
+use openvm_stark_backend::{p3_field::PrimeCharacteristicRing, prover::AirProvingContext};
 use tracing::instrument;
 
 use super::{
@@ -43,7 +40,7 @@ pub struct MemoryInventoryGPU {
     pub hasher_chip: Arc<Poseidon2PeripheryChipGPU>,
     pub initial_memory: Vec<Arc<DeviceBuffer<u8>>>,
     pub merkle_records: Option<DeviceBuffer<u32>>,
-    /// One-shot setup-owned Merkle trace height for protocol-v19 segments.
+    /// Setup-owned Merkle trace height for reduced-SWIRL segments.
     forced_merkle_height: Option<usize>,
     #[cfg(feature = "metrics")]
     pub(super) unpadded_merkle_height: usize,
@@ -152,22 +149,10 @@ impl MemoryInventoryGPU {
     ) -> Vec<AirProvingContext<GpuBackend>> {
         let mem = MemTracker::start("generate mem proving ctxs");
         let partition = touched_memory;
-        if std::env::var_os("OPENVM_WARP_DEBUG_SEGMENT").is_some() {
-            eprintln!(
-                "WARP CUDA memory inventory: touched_blocks={} first_address={:?}",
-                partition.len(),
-                partition.first().map(|record| record.0)
-            );
-        }
         let boundary_records = if partition.is_empty() {
             let leftmost_values = 'left: {
                 let mut res = [F::ZERO; DIGEST_WIDTH];
                 if self.initial_memory[ADDR_SPACE_OFFSET as usize].is_empty() {
-                    if std::env::var_os("OPENVM_WARP_DEBUG_SEGMENT").is_some() {
-                        eprintln!(
-                            "WARP CUDA empty memory: leftmost address space has no allocated cells"
-                        );
-                    }
                     break 'left res;
                 }
                 let layout =
@@ -189,16 +174,6 @@ impl MemoryInventoryGPU {
                 }
                 res
             };
-            if std::env::var_os("OPENVM_WARP_DEBUG_SEGMENT").is_some() {
-                eprintln!(
-                    "WARP CUDA empty memory: leftmost_values={:?}",
-                    leftmost_values
-                        .iter()
-                        .map(|value| value.as_canonical_u32())
-                        .collect::<Vec<_>>()
-                );
-            }
-
             let values_u32 = leftmost_values.map(Self::field_to_raw_u32);
             let merkle_record = MemoryMerkleRecord {
                 address_space: ADDR_SPACE_OFFSET,

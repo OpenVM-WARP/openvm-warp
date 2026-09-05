@@ -387,8 +387,7 @@ where
             // The verification record stores the post-fold point. Scalar
             // openings instead live at `x * <omega_k>`, so compile `x` from
             // the exact authenticated query index and descriptor-bound
-            // layout. This parity-aware map is essential for the initial
-            // coefficient two-coset oracle.
+            // layout.
             let scalar_root = if scalar_rows {
                 Some(
                     terminal_whir_query_root::<F>(

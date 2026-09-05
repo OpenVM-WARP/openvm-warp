@@ -22,7 +22,7 @@ pub struct BoundaryChipGPU {
     pub records: Option<DeviceBuffer<u32>>,
     pub num_records: Option<usize>,
     pub trace_width: Option<usize>,
-    /// One-shot protocol-v19 shape pin. Zero retains the natural trace height.
+    /// Reduced-SWIRL shape pin. Zero retains the natural trace height.
     forced_height: AtomicUsize,
 }
 

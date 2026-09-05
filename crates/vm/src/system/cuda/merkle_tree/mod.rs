@@ -384,7 +384,7 @@ impl MemoryMerkleTree {
         )
     }
 
-    /// Protocol-v19 variant that pads the ordinary Merkle trace to a
+    /// Reduced-SWIRL variant that pads the ordinary Merkle trace to a
     /// setup-owned height. The kernel still writes only `unpadded_height` real
     /// rows; the additional rows remain canonical zero padding.
     pub fn update_with_touched_blocks_at_height(
@@ -961,13 +961,13 @@ mod tests {
     /// Merkle trace (there is deliberately no persistent-boundary record), so
     /// this path must agree exactly with the canonical CPU trace as well.
     ///
-    /// Exercise a larger setup-owned height too: protocol-v19 pins the trace
+    /// Exercise a larger setup-owned height too: reduced-SWIRL pins the trace
     /// shape, and padding must not change either row contents or interactions.
     #[test]
     fn test_cuda_merkle_tree_empty_trace_equivalence_with_padding() {
         let mut addr_spaces = MemoryConfig::empty_address_space_configs(5);
         // Keep the leftmost (register) address space empty. This is the shape
-        // used by the tiny terminate-only protocol-v19 test and exercises a
+        // used by the tiny terminate-only reduced-SWIRL test and exercises a
         // dummy CUDA subtree rather than an allocated leaf buffer.
         addr_spaces[RV64_MEMORY_AS as usize].num_cells = 2 * DIGEST_WIDTH;
         let mem_config = MemoryConfig::new(2, addr_spaces, 4, 29, 17);
@@ -1009,7 +1009,7 @@ mod tests {
         );
         cpu_merkle_chip.finalize(&initial_memory.memory, &BTreeMap::new(), &cpu_hasher_chip);
 
-        let mut empty_touch = vec![0u32; MERKLE_TOUCHED_BLOCK_WIDTH];
+        let mut empty_touch = [0u32; MERKLE_TOUCHED_BLOCK_WIDTH];
         // The record header is ordinary integer metadata, not a field element.
         empty_touch[0] = openvm_circuit::arch::ADDR_SPACE_OFFSET;
         let empty_touch = empty_touch.to_device_on(&device_ctx).unwrap();

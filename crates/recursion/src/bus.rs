@@ -58,6 +58,7 @@ macro_rules! define_typed_per_proof_lookup_bus {
             /// Return the underlying interaction namespace for setup-time
             /// collision and wiring checks.
             #[inline]
+            #[allow(dead_code)]
             pub fn index(&self) -> openvm_stark_backend::interaction::BusIndex {
                 self.0.index
             }
