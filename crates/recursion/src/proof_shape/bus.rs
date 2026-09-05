@@ -1,4 +1,3 @@
-use openvm_poseidon2_air::POSEIDON2_WIDTH;
 use openvm_recursion_circuit_derive::AlignedBorrow;
 use openvm_stark_sdk::config::baby_bear_poseidon2::DIGEST_SIZE;
 
@@ -48,20 +47,6 @@ pub struct StartingTidxMessage<T> {
 }
 
 define_typed_per_proof_permutation_bus!(StartingTidxBus, StartingTidxMessage);
-
-/// Caller-certified transcript checkpoint from which a partial verifier starts.
-///
-/// The companion rebasing AIR forwards the exact same `(tidx, state)` tuple to
-/// `ResumeTranscriptStateBus`, so the transcript AIR and the protocol schedule
-/// cannot be rebased independently.
-#[repr(C)]
-#[derive(AlignedBorrow, Debug, Clone)]
-pub struct RebasedTranscriptStartMessage<T> {
-    pub tidx: T,
-    pub state: [T; POSEIDON2_WIDTH],
-}
-
-define_typed_per_proof_permutation_bus!(RebasedTranscriptStartBus, RebasedTranscriptStartMessage);
 
 #[repr(C)]
 #[derive(AlignedBorrow, Debug, Clone)]

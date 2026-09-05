@@ -206,16 +206,7 @@ pub struct ReducedSwirlNativeCudaTelemetry {
     pub peak_lifetime_live_gpu_bytes: usize,
     pub peak_driver_used_gpu_bytes: usize,
     pub driver_total_gpu_bytes: usize,
-    pub accumulator_spill_count: usize,
-    pub accumulator_restore_count: usize,
-    pub accumulator_lifecycle_h2d_bytes: usize,
-    pub accumulator_lifecycle_d2h_bytes: usize,
-    pub fresh_reencodes: usize,
-    pub fresh_recommits: usize,
     pub terminal_reused_initial_roots: usize,
-    pub terminal_accumulator_reencodes: usize,
-    pub terminal_accumulator_recommits: usize,
-    pub terminal_full_message_d2h_bytes: usize,
     pub terminal_bounded_proof_d2h_bytes: usize,
     pub source_projection_ms: f64,
     pub vacc_ms: f64,
@@ -229,22 +220,10 @@ pub struct ReducedSwirlNativeCudaTelemetry {
 }
 
 impl ReducedSwirlNativeCudaTelemetry {
-    /// Structural invariant of this orchestration path.  Bounded challenge,
-    /// opened-row, Merkle-path, and proof transfers remain visible in
-    /// `transfers`; only full-payload lifecycle traffic is forbidden here.
-    pub fn assert_no_duplicate_payload_pipeline(&self) -> Result<(), &'static str> {
-        if self.accumulator_spill_count != 0
-            || self.accumulator_restore_count != 0
-            || self.accumulator_lifecycle_h2d_bytes != 0
-            || self.accumulator_lifecycle_d2h_bytes != 0
-            || self.fresh_reencodes != 0
-            || self.fresh_recommits != 0
-            || self.terminal_reused_initial_roots != 1
-            || self.terminal_accumulator_reencodes != 0
-            || self.terminal_accumulator_recommits != 0
-            || self.terminal_full_message_d2h_bytes != 0
-        {
-            return Err("duplicate or host-staged reduced-SWIRL CUDA payload pipeline");
+    /// The terminal prover must consume the existing accumulator commitment.
+    pub fn assert_resident_terminal_contract(&self) -> Result<(), &'static str> {
+        if self.terminal_reused_initial_roots != 1 {
+            return Err("terminal prover did not reuse exactly one resident accumulator root");
         }
         Ok(())
     }
@@ -263,6 +242,7 @@ pub struct ReducedSwirlNativeCudaOutput {
 /// `transcript_prefix` is the independent native verifier's exact transcript
 /// through `end_checkpoint`. It is borrowed in place; constructing this view
 /// never clones the transcript, proof history, claims, or source bindings.
+#[non_exhaustive]
 pub struct ReducedSwirlNativeCudaCompletedStep<'a> {
     pub total_source_count: usize,
     pub call_index: usize,
@@ -284,7 +264,6 @@ pub struct ReducedSwirlNativeCudaCompletedStep<'a> {
     pub authoritative_claims:
         &'a [ReducedConstrainedCodeClaim<EF, StackedRsFreshCommitment<EF, Digest>>],
     pub source_bindings: &'a [Digest],
-    _sealed: (),
 }
 
 /// Bounded owned snapshot of one completed native WARP call.
@@ -368,7 +347,6 @@ impl ReducedSwirlNativeCudaCompletedStepOwned {
             end_state: self.end_state,
             authoritative_claims: &self.authoritative_claims,
             source_bindings: &self.source_bindings,
-            _sealed: (),
         }
     }
 }
@@ -494,11 +472,6 @@ impl<'a> ReducedSwirlNativeCudaStream<'a> {
     }
 
     #[must_use]
-    pub fn expected_next_source_index(&self) -> usize {
-        self.source_bindings.len()
-    }
-
-    #[must_use]
     pub fn pending_source_count(&self) -> usize {
         self.pending_sources.len()
     }
@@ -602,7 +575,6 @@ impl<'a> ReducedSwirlNativeCudaStream<'a> {
             end_state: completed.end_state,
             authoritative_claims,
             source_bindings,
-            _sealed: (),
         }))
     }
 
@@ -1008,7 +980,7 @@ impl<'a> ReducedSwirlNativeCudaStream<'a> {
         self.telemetry.transfers = transfer_delta(self.transfer_start, pcie_counters::snapshot());
         observe_memory(&mut self.telemetry, memory_snapshot()?);
         self.telemetry
-            .assert_no_duplicate_payload_pipeline()
+            .assert_resident_terminal_contract()
             .map_err(ReducedSwirlNativeCudaError::State)?;
         let swirl_power_batch_security =
             ReducedSwirlPowerBatchSecurityBudget::derive(&self.authoritative_claims)?;
@@ -1260,9 +1232,6 @@ fn copy_terminal_telemetry(
     terminal: ResidentTerminalWhirInstrumentation,
 ) {
     telemetry.terminal_reused_initial_roots = terminal.reused_initial_roots;
-    telemetry.terminal_accumulator_reencodes = terminal.accumulator_reencodes;
-    telemetry.terminal_accumulator_recommits = terminal.accumulator_recommits;
-    telemetry.terminal_full_message_d2h_bytes = terminal.full_accumulator_message_d2h_bytes;
     telemetry.terminal_bounded_proof_d2h_bytes = terminal.bounded_proof_d2h_bytes;
 }
 
@@ -1451,10 +1420,7 @@ mod tests {
         assert_eq!(incremental_records.len(), 2);
         assert_eq!(output.telemetry.maximum_pending_sources, 2);
         assert_eq!(output.telemetry.maximum_scheduled_fresh_count, 2);
-        assert!(output
-            .telemetry
-            .assert_no_duplicate_payload_pipeline()
-            .is_ok());
+        assert!(output.telemetry.assert_resident_terminal_contract().is_ok());
 
         let verified = verify_reduced_swirl_native_recorded(
             setup.cpu_setup(),
@@ -1500,7 +1466,7 @@ mod invariant_tests {
             terminal_reused_initial_roots: 1,
             ..Default::default()
         };
-        assert!(telemetry.assert_no_duplicate_payload_pipeline().is_ok());
+        assert!(telemetry.assert_resident_terminal_contract().is_ok());
     }
 
     #[test]
@@ -1509,12 +1475,8 @@ mod invariant_tests {
             terminal_reused_initial_roots: 1,
             ..Default::default()
         };
-        telemetry.fresh_reencodes = 1;
-        assert!(telemetry.assert_no_duplicate_payload_pipeline().is_err());
-
-        telemetry.fresh_reencodes = 0;
-        telemetry.terminal_full_message_d2h_bytes = size_of::<EF>();
-        assert!(telemetry.assert_no_duplicate_payload_pipeline().is_err());
+        telemetry.terminal_reused_initial_roots = 0;
+        assert!(telemetry.assert_resident_terminal_contract().is_err());
     }
 
     #[test]

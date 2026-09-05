@@ -751,25 +751,6 @@ where
         Ok((compiled, status))
     }
 
-    /// Ensure a checked native metering artifact exists and return its stable cache path.
-    ///
-    /// This drops the temporary loaded instance before returning. A continuation prover can then
-    /// load the same artifact in its own VM without retaining duplicate native-library handles.
-    #[cfg(feature = "rvr")]
-    pub fn prepare_metered_artifact_cache(
-        &self,
-        cache_dir: &Path,
-        app_exe: impl Into<ExecutableInput>,
-    ) -> Result<(PathBuf, MeteredArtifactCacheStatus), SdkError> {
-        let (compiled, status) = self.compile_or_load_metered_cached(cache_dir, app_exe)?;
-        let lib_path = compiled
-            .artifact_identity()
-            .cache_library_path(cache_dir)
-            .map_err(SdkError::Other)?;
-        drop(compiled);
-        Ok((lib_path, status))
-    }
-
     #[cfg(feature = "rvr")]
     fn prepare_metered_artifact_for_app_prover(
         &self,

@@ -42,12 +42,12 @@ pub struct VmPvsAir {
     pub public_values_bus: PublicValuesBus,
     pub cached_commit_bus: CachedCommitBus,
     pub pvs_air_consistency_bus: PvsAirConsistencyBus,
-    /// Enabled only by History-v4 recursive sub-circuits. The message is
+    /// Enabled only by reduced-SWIRL recursive prefixes. The message is
     /// derived from the same authenticated child `VmPvs` used by this AIR.
     pub verifier_execution_identity_bus: Option<VerifierExecutionIdentityBus>,
     /// Ordinary application children source `program_commit` from the cached
-    /// ProgramAir commitment. History-v4 prefixes instead source the complete
-    /// execution identity from their authenticated History projection and
+    /// ProgramAir commitment. Reduced-SWIRL prefixes instead source the complete
+    /// execution identity from their authenticated transition projection and
     /// must not require a foreign-layout cached program commitment.
     pub receive_leaf_program_cached_commit: bool,
     pub deferral_enabled: bool,

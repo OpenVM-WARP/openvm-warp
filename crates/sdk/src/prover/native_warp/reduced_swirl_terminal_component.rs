@@ -55,8 +55,6 @@ pub struct ReducedSwirlFinalizerTranscriptSuffix {
     start: TranscriptCheckpoint,
     start_sample_count: usize,
     start_state: [F; POSEIDON2_WIDTH],
-    terminal_start: TranscriptCheckpoint,
-    terminal_end: TranscriptCheckpoint,
 }
 
 impl ReducedSwirlFinalizerTranscriptSuffix {
@@ -66,23 +64,8 @@ impl ReducedSwirlFinalizerTranscriptSuffix {
     }
 
     #[must_use]
-    pub const fn start_checkpoint(&self) -> TranscriptCheckpoint {
-        self.start
-    }
-
-    #[must_use]
     pub const fn start_sample_count(&self) -> usize {
         self.start_sample_count
-    }
-
-    #[must_use]
-    pub const fn terminal_start_checkpoint(&self) -> TranscriptCheckpoint {
-        self.terminal_start
-    }
-
-    #[must_use]
-    pub const fn terminal_end_checkpoint(&self) -> TranscriptCheckpoint {
-        self.terminal_end
     }
 
     #[must_use]
@@ -92,7 +75,6 @@ impl ReducedSwirlFinalizerTranscriptSuffix {
 
     /// Exact entry consumed by
     /// `NativeWarpTranscriptModule::generate_trace_inputs_with_external_resumed`.
-    #[must_use]
     pub const fn resume_input(&self) -> (usize, [F; POSEIDON2_WIDTH]) {
         (self.start.operations, self.start_state)
     }
@@ -236,8 +218,6 @@ pub fn prepare_reduced_swirl_finalizer_terminal_record(
             start,
             start_sample_count,
             start_state,
-            terminal_start: verification.terminal.transcript_start,
-            terminal_end: verification.terminal.transcript_end,
         },
     })
 }

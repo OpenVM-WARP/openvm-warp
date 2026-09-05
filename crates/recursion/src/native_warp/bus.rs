@@ -179,7 +179,7 @@ pub struct NativeSumcheckInitialMessage<T> {
 define_typed_permutation_bus!(NativeSumcheckInitialBus, NativeSumcheckInitialMessage);
 
 /// The batching sumcheck's initial claim authenticated by original-root and
-/// prior-accumulator openings inside the native history relation.
+/// prior-accumulator openings inside the VACC verifier relation.
 #[repr(C)]
 #[derive(AlignedBorrow, Debug, Clone)]
 pub struct NativeCertifiedBatchingClaimMessage<T> {

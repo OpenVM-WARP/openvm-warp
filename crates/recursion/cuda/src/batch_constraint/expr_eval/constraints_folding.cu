@@ -44,7 +44,6 @@ __global__ void constraints_folding_tracegen(
     const PtrArray<TraceHeight, NUM_PROOFS> sorted_trace_vdata, // [NUM_PROOFS][num_airs]
     const PtrArray<FpExt, NUM_PROOFS> eq_ns,                    // [NUM_PROOFS][n_stack]
     const FpExtWithTidx *per_proof,                             // [NUM_PROOFS]
-    uint32_t num_airs,
     uint32_t num_valid_rows,
     uint32_t l_skip
 ) {
@@ -57,7 +56,6 @@ __global__ void constraints_folding_tracegen(
     }
 
     auto [proof_idx, sort_idx] = proof_and_sort_idxs[global_row_idx];
-    bool is_last = global_row_idx + 1 == row_bounds[proof_idx];
     uint32_t proof_start_idx = proof_idx == 0 ? 0 : row_bounds[proof_idx - 1];
     uint32_t row_idx = global_row_idx - proof_start_idx;
 
@@ -109,7 +107,6 @@ __global__ void constraints_folding_tracegen_dynamic(
     TraceHeight *const *__restrict__ sorted_trace_vdata,        // [num_proofs][num_airs]
     FpExt *const *__restrict__ eq_ns,                           // [num_proofs][n_stack]
     const FpExtWithTidx *per_proof,                             // [num_proofs]
-    uint32_t num_airs,
     uint32_t num_valid_rows,
     uint32_t l_skip
 ) {
@@ -122,7 +119,6 @@ __global__ void constraints_folding_tracegen_dynamic(
     }
 
     auto [proof_idx, sort_idx] = proof_and_sort_idxs[global_row_idx];
-    bool is_last = global_row_idx + 1 == row_bounds[proof_idx];
     uint32_t proof_start_idx = proof_idx == 0 ? 0 : row_bounds[proof_idx - 1];
     uint32_t row_idx = global_row_idx - proof_start_idx;
 
@@ -198,7 +194,6 @@ extern "C" int _constraints_folding_tracegen(
     FpExt **eq_ns,
     FpExtWithTidx *d_per_proof,
     uint32_t num_proofs,
-    uint32_t num_airs,
     uint32_t num_valid_rows,
     uint32_t l_skip,
     void *d_temp_buffer,
@@ -248,7 +243,6 @@ extern "C" int _constraints_folding_tracegen(
                  PtrArray<TraceHeight, NUM_PROOFS>(d_sorted_trace_vdata),
                  PtrArray<FpExt, NUM_PROOFS>(eq_ns),
                  d_per_proof,
-                 num_airs,
                  num_valid_rows,
                  l_skip
              );),
@@ -307,7 +301,6 @@ extern "C" int _constraints_folding_tracegen(
             sorted_trace_vdata.get(),
             eq_ns_device.get(),
             d_per_proof,
-            num_airs,
             num_valid_rows,
             l_skip
         );

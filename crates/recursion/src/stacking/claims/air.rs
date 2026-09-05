@@ -24,9 +24,8 @@ use crate::{
     },
     primitives::bus::{ExpBitsLenBus, ExpBitsLenMessage},
     stacking::bus::{
-        ClaimCoefficientsBus, ClaimCoefficientsMessage, OrderedStackingOpeningBus,
-        OrderedStackingOpeningMessage, StackingModuleTidxBus, StackingModuleTidxMessage,
-        SumcheckClaimsBus, SumcheckClaimsMessage,
+        ClaimCoefficientsBus, ClaimCoefficientsMessage, StackingModuleTidxBus,
+        StackingModuleTidxMessage, SumcheckClaimsBus, SumcheckClaimsMessage,
     },
     subairs::nested_for_loop::{NestedForLoopIoCols, NestedForLoopSubAir},
     utils::{assert_one_ext, ext_field_add, ext_field_multiply, pow_tidx_count},
@@ -94,9 +93,6 @@ pub struct StackingClaimsAir {
     pub w_stack: usize,
     /// Number of PoW bits for μ batching challenge.
     pub mu_pow_bits: usize,
-    /// Verifier-owned global transcript key for ordered setup authority.
-    /// Internal buses and output transition identities retain local `proof_idx`.
-    pub authority_transcript_proof_idx: Option<usize>,
     /// False in a partial assembly without the WHIR module: gates off the
     /// stacking-index provider, the μ-PoW/μ transcript tail, and the WHIR
     /// handoff sends. The μ accumulator columns stay constrained but dead
@@ -106,10 +102,6 @@ pub struct StackingClaimsAir {
     /// native reduction endpoint input (`STACKING_OPENING`, keyed by the
     /// flat opening index) with the given consumer count.
     pub native_opening_export: Option<(NativeReductionEndpointInputBus, usize)>,
-    /// Ordered setup-PCS authority output. Every valid commitment-major
-    /// stacking opening is sent exactly once; a caller-owned statement AIR
-    /// must receive it before publishing a multi-constraint opening.
-    pub ordered_opening_export: Option<OrderedStackingOpeningBus>,
 }
 
 impl BaseAirWithPublicValues<F> for StackingClaimsAir {}
@@ -245,18 +237,6 @@ where
             );
         }
 
-        if let Some(opening_bus) = self.ordered_opening_export {
-            opening_bus.send(
-                builder,
-                local.proof_idx,
-                OrderedStackingOpeningMessage {
-                    opening_idx: local.global_col_idx.into(),
-                    value: local.stacking_claim.map(Into::into),
-                },
-                local.is_valid,
-            );
-        }
-
         /*
          * Compute the running sum of stacking_claim * claim_coefficient values and then
          * constrain the final result to be equal to s_{n_stack}(u_{n_stack}), which is
@@ -318,14 +298,10 @@ where
         let mu_pow_offset = pow_tidx_count(self.mu_pow_bits);
 
         for i in 0..D_EF {
-            let transcript_proof_idx = self
-                .authority_transcript_proof_idx
-                .map(AB::Expr::from_usize)
-                .unwrap_or_else(|| local.proof_idx.into());
             // Observe stacking_claim at tidx + 0..D_EF
             self.transcript_bus.receive(
                 builder,
-                transcript_proof_idx.clone(),
+                local.proof_idx,
                 TranscriptBusMessage {
                     tidx: AB::Expr::from_usize(i) + local.tidx,
                     value: local.stacking_claim[i].into(),
@@ -338,7 +314,7 @@ where
                 // Sample μ at tidx + D_EF + mu_pow_offset + i (after μ PoW observe/sample if any)
                 self.transcript_bus.receive(
                     builder,
-                    transcript_proof_idx,
+                    local.proof_idx,
                     TranscriptBusMessage {
                         tidx: AB::Expr::from_usize(i + D_EF + mu_pow_offset) + local.tidx,
                         value: local.mu[i].into(),
@@ -350,14 +326,10 @@ where
         }
 
         if self.mu_pow_bits > 0 && self.emit_whir_exports {
-            let transcript_proof_idx = self
-                .authority_transcript_proof_idx
-                .map(AB::Expr::from_usize)
-                .unwrap_or_else(|| local.proof_idx.into());
             // μ PoW: observe mu_pow_witness at tidx + D_EF (on last valid row only)
             self.transcript_bus.receive(
                 builder,
-                transcript_proof_idx.clone(),
+                local.proof_idx,
                 TranscriptBusMessage {
                     tidx: AB::Expr::from_usize(D_EF) + local.tidx,
                     value: local.mu_pow_witness.into(),
@@ -369,7 +341,7 @@ where
             // μ PoW: sample mu_pow_sample at tidx + D_EF + 1 (on last valid row only)
             self.transcript_bus.receive(
                 builder,
-                transcript_proof_idx,
+                local.proof_idx,
                 TranscriptBusMessage {
                     tidx: AB::Expr::from_usize(D_EF + 1) + local.tidx,
                     value: local.mu_pow_sample.into(),

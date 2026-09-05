@@ -1,3 +1,5 @@
+//! Merkle authentication for prior-accumulator shift openings.
+
 use core::borrow::{Borrow, BorrowMut};
 use std::collections::BTreeMap;
 

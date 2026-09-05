@@ -27,8 +27,7 @@ use crate::{
     },
     stacking::bus::{
         EqBaseBus, EqBaseMessage, EqKernelLookupBus, EqKernelLookupMessage, EqRandValuesLookupBus,
-        EqRandValuesLookupMessage, OrderedStackingSourcePointBus,
-        OrderedStackingSourcePointMessage,
+        EqRandValuesLookupMessage,
     },
     subairs::nested_for_loop::{NestedForLoopIoCols, NestedForLoopSubAir},
     utils::{
@@ -83,9 +82,6 @@ pub struct EqBaseCols<F> {
 pub struct EqBaseAir {
     // External buses
     pub constraint_randomness_bus: ConstraintSumcheckRandomnessBus,
-    /// Setup-authority source point in ordered mode. Legacy mode continues to
-    /// consume coordinate zero from `constraint_randomness_bus`.
-    pub ordered_source_point_bus: Option<OrderedStackingSourcePointBus>,
     pub whir_opening_point_bus: WhirOpeningPointBus,
 
     // Internal buses
@@ -204,27 +200,15 @@ where
          * Receive the values of u_0 and r_0 from the AIRs that sample them. Send u_0
          * and r_0 to EqNegAir.
          */
-        if let Some(source_point_bus) = self.ordered_source_point_bus {
-            source_point_bus.receive(
-                builder,
-                local.proof_idx,
-                OrderedStackingSourcePointMessage {
-                    coordinate_idx: AB::Expr::ZERO,
-                    value: local.r_pow.map(Into::into),
-                },
-                local.is_first,
-            );
-        } else {
-            self.constraint_randomness_bus.receive(
-                builder,
-                local.proof_idx,
-                ConstraintSumcheckRandomness {
-                    idx: AB::Expr::ZERO,
-                    challenge: local.r_pow.map(Into::into),
-                },
-                local.is_first,
-            );
-        }
+        self.constraint_randomness_bus.receive(
+            builder,
+            local.proof_idx,
+            ConstraintSumcheckRandomness {
+                idx: AB::Expr::ZERO,
+                challenge: local.r_pow.map(Into::into),
+            },
+            local.is_first,
+        );
 
         self.eq_rand_values_bus.lookup_key(
             builder,

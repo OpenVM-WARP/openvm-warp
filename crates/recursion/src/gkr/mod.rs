@@ -89,7 +89,7 @@ use crate::{
     primitives::exp_bits_len::ExpBitsLenCpuTraceGenerator,
     system::{
         AirModule, BusIndexManager, BusInventory, GkrPreflight, GlobalCtxCpu, Preflight,
-        TraceGenModule, VerifierEquationMode,
+        TraceGenModule,
     },
     tracegen::{ModuleChip, RowMajorChip},
     utils::{pow_observe_sample, pow_tidx_count},
@@ -121,7 +121,6 @@ pub struct GkrModule {
     sumcheck_input_bus: GkrSumcheckInputBus,
     sumcheck_output_bus: GkrSumcheckOutputBus,
     sumcheck_challenge_bus: GkrSumcheckChallengeBus,
-    equation_mode: VerifierEquationMode,
 }
 
 struct GkrBlobCpu {
@@ -139,15 +138,6 @@ impl GkrModule {
         b: &mut BusIndexManager,
         bus_inventory: BusInventory,
     ) -> Self {
-        Self::new_with_equation_mode(mvk, b, bus_inventory, VerifierEquationMode::AirAndLogUp)
-    }
-
-    pub fn new_with_equation_mode(
-        mvk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
-        b: &mut BusIndexManager,
-        bus_inventory: BusInventory,
-        equation_mode: VerifierEquationMode,
-    ) -> Self {
         GkrModule {
             l_skip: mvk.inner.params.l_skip,
             logup_pow_bits: mvk.inner.params.logup.pow_bits,
@@ -158,7 +148,6 @@ impl GkrModule {
             sumcheck_output_bus: GkrSumcheckOutputBus::new(b.new_bus_idx()),
             sumcheck_challenge_bus: GkrSumcheckChallengeBus::new(b.new_bus_idx()),
             xi_sampler_bus: GkrXiSamplerBus::new(b.new_bus_idx()),
-            equation_mode,
         }
     }
 
@@ -288,7 +277,6 @@ impl AirModule for GkrModule {
             xi_sampler_bus: self.xi_sampler_bus,
             constraints_folding_input_bus: self.bus_inventory.constraints_folding_input_bus,
             interactions_folding_input_bus: self.bus_inventory.interactions_folding_input_bus,
-            includes_air: self.equation_mode.includes_air(),
         };
 
         let gkr_layer_air = GkrLayerAir {
@@ -341,7 +329,7 @@ impl GkrModule {
             .par_iter()
             .zip(preflights.par_iter())
             .map(|(proof, preflight)| {
-                let start_idx = preflight.transcript_local_tidx(preflight.proof_shape.post_tidx);
+                let start_idx = preflight.proof_shape.post_tidx;
                 let mut ts = ReadOnlyTranscript::new(&preflight.transcript, start_idx);
 
                 let gkr_proof = &proof.gkr_proof;

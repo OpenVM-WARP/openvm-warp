@@ -181,17 +181,6 @@ pub struct ProofShapeAir<const NUM_LIMBS: usize, const LIMB_BITS: usize> {
     pub pre_hash_bus: PreHashBus,
     pub continuations_enabled: bool,
     pub layout_export_lookups: usize,
-    /// Whether the stacked-column shape tables (the `NeedRot` property on
-    /// `air_shape_bus` and every `lifted_heights_bus` key) are exported. The
-    /// full recursion assembly's stacking module consumes them once per
-    /// stacked column; a partial assembly without the stacking module (the
-    /// native WARP history certificate) has no consumer and disables the
-    /// export so the lookup buses stay balanced.
-    pub export_stacking_shape: bool,
-    /// Standard proofs absorb shape/commitment/public-value framing here.
-    /// A rebased LogUp-only proof has already certified that source manifest,
-    /// so every row keeps the caller-authenticated GKR cursor unchanged.
-    pub transcript_shape_enabled: bool,
 }
 
 impl<F, const NUM_LIMBS: usize, const LIMB_BITS: usize> BaseAir<F>
@@ -504,21 +493,9 @@ where
         } else {
             self.idx_encoder.get_flag_expr::<AB>(0, localv.selector)
         };
-        if self.transcript_shape_enabled {
-            builder
-                .when(is_first_idx.clone())
-                .assert_eq(local.starting_tidx, AB::Expr::from_usize(2 * DIGEST_SIZE));
-        } else {
-            self.starting_tidx_bus.receive(
-                builder,
-                local.proof_idx,
-                StartingTidxMessage {
-                    air_idx: AB::Expr::ZERO,
-                    tidx: local.starting_tidx.into(),
-                },
-                is_first_idx.clone(),
-            );
-        }
+        builder
+            .when(is_first_idx.clone())
+            .assert_eq(local.starting_tidx, AB::Expr::from_usize(2 * DIGEST_SIZE));
 
         self.starting_tidx_bus.receive(
             builder,
@@ -535,66 +512,62 @@ where
         );
 
         let mut tidx = local.starting_tidx.into();
-        if self.transcript_shape_enabled {
+        self.transcript_bus.receive(
+            builder,
+            local.proof_idx,
+            TranscriptBusMessage {
+                tidx: tidx.clone(),
+                value: local.is_present.into(),
+                is_sample: AB::Expr::ZERO,
+            },
+            not::<AB::Expr>(is_required.clone()) * local.is_valid,
+        );
+        tidx += not::<AB::Expr>(is_required) * local.is_valid;
+
+        for (didx, commit_val) in preprocessed_commit.iter().enumerate() {
             self.transcript_bus.receive(
                 builder,
                 local.proof_idx,
                 TranscriptBusMessage {
-                    tidx: tidx.clone(),
-                    value: local.is_present.into(),
+                    tidx: tidx.clone() + AB::Expr::from_usize(didx),
+                    value: commit_val.clone(),
                     is_sample: AB::Expr::ZERO,
                 },
-                not::<AB::Expr>(is_required.clone()) * local.is_valid,
+                has_preprocessed.clone() * local.is_present,
             );
-            tidx += not::<AB::Expr>(is_required) * local.is_valid;
+        }
+        tidx += has_preprocessed.clone() * AB::Expr::from_usize(DIGEST_SIZE) * local.is_present;
 
-            for (didx, commit_val) in preprocessed_commit.iter().enumerate() {
+        self.transcript_bus.receive(
+            builder,
+            local.proof_idx,
+            TranscriptBusMessage {
+                tidx: tidx.clone(),
+                value: local.log_height.into(),
+                is_sample: AB::Expr::ZERO,
+            },
+            not::<AB::Expr>(has_preprocessed.clone()) * local.is_present,
+        );
+        tidx += not::<AB::Expr>(has_preprocessed.clone()) * local.is_present;
+
+        (0..self.max_cached).for_each(|i| {
+            for didx in 0..DIGEST_SIZE {
                 self.transcript_bus.receive(
                     builder,
                     local.proof_idx,
                     TranscriptBusMessage {
-                        tidx: tidx.clone() + AB::Expr::from_usize(didx),
-                        value: commit_val.clone(),
+                        tidx: tidx.clone(),
+                        value: localv.cached_commits[i][didx].into(),
                         is_sample: AB::Expr::ZERO,
                     },
-                    has_preprocessed.clone() * local.is_present,
+                    cached_present[i].clone() * local.is_present,
                 );
+                tidx += cached_present[i].clone() * local.is_present;
             }
-            tidx += has_preprocessed.clone() * AB::Expr::from_usize(DIGEST_SIZE) * local.is_present;
-
-            self.transcript_bus.receive(
-                builder,
-                local.proof_idx,
-                TranscriptBusMessage {
-                    tidx: tidx.clone(),
-                    value: local.log_height.into(),
-                    is_sample: AB::Expr::ZERO,
-                },
-                not::<AB::Expr>(has_preprocessed.clone()) * local.is_present,
-            );
-            tidx += not::<AB::Expr>(has_preprocessed.clone()) * local.is_present;
-
-            (0..self.max_cached).for_each(|i| {
-                for didx in 0..DIGEST_SIZE {
-                    self.transcript_bus.receive(
-                        builder,
-                        local.proof_idx,
-                        TranscriptBusMessage {
-                            tidx: tidx.clone(),
-                            value: localv.cached_commits[i][didx].into(),
-                            is_sample: AB::Expr::ZERO,
-                        },
-                        cached_present[i].clone() * local.is_present,
-                    );
-                    tidx += cached_present[i].clone() * local.is_present;
-                }
-            });
-        }
+        });
 
         let num_pvs_tidx = tidx.clone();
-        if self.transcript_shape_enabled {
-            tidx += num_pvs.clone() * local.is_present;
-        }
+        tidx += num_pvs.clone() * local.is_present;
 
         self.starting_tidx_bus.send(
             builder,
@@ -606,30 +579,28 @@ where
             local.is_valid,
         );
 
-        if self.transcript_shape_enabled {
-            for didx in 0..DIGEST_SIZE {
-                self.transcript_bus.receive(
-                    builder,
-                    local.proof_idx,
-                    TranscriptBusMessage {
-                        tidx: AB::Expr::from_usize(didx),
-                        value: localv.cached_commits[self.max_cached - 1][didx].into(),
-                        is_sample: AB::Expr::ZERO,
-                    },
-                    local.is_last,
-                );
+        for didx in 0..DIGEST_SIZE {
+            self.transcript_bus.receive(
+                builder,
+                local.proof_idx,
+                TranscriptBusMessage {
+                    tidx: AB::Expr::from_usize(didx),
+                    value: localv.cached_commits[self.max_cached - 1][didx].into(),
+                    is_sample: AB::Expr::ZERO,
+                },
+                local.is_last,
+            );
 
-                self.transcript_bus.receive(
-                    builder,
-                    local.proof_idx,
-                    TranscriptBusMessage {
-                        tidx: AB::Expr::from_usize(didx + DIGEST_SIZE),
-                        value: localv.cached_commits[self.max_cached - 1][didx].into(),
-                        is_sample: AB::Expr::ZERO,
-                    },
-                    is_min_cached.clone() * local.is_valid,
-                );
-            }
+            self.transcript_bus.receive(
+                builder,
+                local.proof_idx,
+                TranscriptBusMessage {
+                    tidx: AB::Expr::from_usize(didx + DIGEST_SIZE),
+                    value: localv.cached_commits[self.max_cached - 1][didx].into(),
+                    is_sample: AB::Expr::ZERO,
+                },
+                is_min_cached.clone() * local.is_valid,
+            );
         }
 
         ///////////////////////////////////////////////////////////////////////////////////////////
@@ -645,11 +616,7 @@ where
             },
             local.is_present
                 * (local.num_air_id_lookups
-                    + if self.transcript_shape_enabled {
-                        AB::Expr::TWO
-                    } else {
-                        AB::Expr::ONE
-                    }
+                    + AB::Expr::TWO
                     + AB::Expr::from_usize(self.layout_export_lookups)),
         );
 
@@ -679,7 +646,6 @@ where
             + preprocessed_stacked_width.clone()
             + cached_widths.iter().cloned().sum::<AB::Expr>();
 
-        let export_stacking_shape = AB::Expr::from_bool(self.export_stacking_shape);
         self.air_shape_bus.add_key_with_lookups(
             builder,
             local.proof_idx,
@@ -688,7 +654,7 @@ where
                 property_idx: AirShapeProperty::NeedRot.to_field(),
                 value: need_rot.clone(),
             },
-            local.is_present * total_width * export_stacking_shape.clone(),
+            local.is_present * total_width,
         );
 
         ///////////////////////////////////////////////////////////////////////////////////////////
@@ -757,7 +723,7 @@ where
                 lifted_height: lifted_height.clone(),
                 log_lifted_height: log_lifted_height.clone(),
             },
-            local.is_present * main_common_width * export_stacking_shape.clone(),
+            local.is_present * main_common_width,
         );
 
         builder
@@ -776,7 +742,7 @@ where
                 lifted_height: lifted_height.clone(),
                 log_lifted_height: log_lifted_height.clone(),
             },
-            local.is_present * preprocessed_stacked_width * export_stacking_shape.clone(),
+            local.is_present * preprocessed_stacked_width,
         );
 
         self.commitments_bus.add_key_with_lookups(
@@ -803,9 +769,7 @@ where
                     lifted_height: lifted_height.clone(),
                     log_lifted_height: log_lifted_height.clone(),
                 },
-                local.is_present
-                    * cached_widths[cached_idx].clone()
-                    * export_stacking_shape.clone(),
+                local.is_present * cached_widths[cached_idx].clone(),
             );
 
             self.commitments_bus.add_key_with_lookups(
@@ -1121,17 +1085,15 @@ where
         // Send n_lift to constraint folding air
         let n_lift = (local.log_height - AB::Expr::from_usize(self.l_skip))
             * (AB::Expr::ONE - local.n_sign_bit);
-        if self.transcript_shape_enabled {
-            self.n_lift_bus.send(
-                builder,
-                local.proof_idx,
-                NLiftMessage {
-                    air_idx,
-                    n_lift: n_lift.clone(),
-                },
-                local.is_present,
-            );
-        }
+        self.n_lift_bus.send(
+            builder,
+            local.proof_idx,
+            NLiftMessage {
+                air_idx,
+                n_lift: n_lift.clone(),
+            },
+            local.is_present,
+        );
         self.eq_3b_shape_bus.add_key_with_lookups(
             builder,
             local.proof_idx,

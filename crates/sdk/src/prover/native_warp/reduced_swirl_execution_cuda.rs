@@ -943,7 +943,7 @@ where
     drop(stream);
     native
         .telemetry
-        .assert_no_duplicate_payload_pipeline()
+        .assert_resident_terminal_contract()
         .map_err(|error| ReducedSwirlCudaExecutionError::Setup(error.to_owned()))?;
     let segment_metadata = Rc::try_unwrap(segment_metadata)
         .map_err(|_| ReducedSwirlCudaExecutionError::EmptyExecution)?
@@ -1070,7 +1070,7 @@ where
     // The exact original codeword matrices are WARP's fresh commitment.  This
     // policy must have been installed before AppProver construction so the PK
     // and cached program own those matrices too.  Fail closed instead of
-    // recommitting either object or selecting a regenerative fallback.
+    // recommitting either object or selecting a host reconstruction fallback.
     let prover_config = app_prover.vm().engine.device().prover_config();
     if !prover_config.cache_rs_code_matrix || prover_config.rs_code_matrix_tile_columns != 0 {
         return Err(ReducedSwirlCudaExecutionError::Setup(
@@ -1208,7 +1208,7 @@ where
     drop(stream);
     native
         .telemetry
-        .assert_no_duplicate_payload_pipeline()
+        .assert_resident_terminal_contract()
         .map_err(|error| ReducedSwirlCudaExecutionError::Setup(error.to_owned()))?;
     let retained_prefixes = Rc::try_unwrap(retained_prefixes)
         .map_err(|_| ReducedSwirlCudaExecutionError::EmptyExecution)?

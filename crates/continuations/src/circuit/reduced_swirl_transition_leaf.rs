@@ -918,7 +918,6 @@ pub(crate) fn state_digest(
 
 /// Canonical digest exported through `VmPvs::{initial_root,final_root}` by a
 /// transition leaf and opened again by the terminal finalizer.
-#[must_use]
 pub fn reduced_swirl_transition_state_digest(state: &ReducedSwirlTransitionState) -> Digest {
     state_digest(state, &mut Vec::new()).boundary
 }
@@ -926,7 +925,6 @@ pub fn reduced_swirl_transition_state_digest(state: &ReducedSwirlTransitionState
 /// Canonical domain and global schedule coordinates committed by one rolling
 /// transition-manifest link.  The local manifest digest is compressed with
 /// this value before it is appended to the chain.
-#[must_use]
 pub fn reduced_swirl_transition_chain_metadata(
     transition: &ReducedSwirlVaccTransitionReceiptMessage<F>,
 ) -> Digest {
@@ -961,7 +959,6 @@ where
 }
 
 /// Fixed second input of the transition-manifest genesis compression.
-#[must_use]
 pub fn reduced_swirl_transition_chain_genesis_metadata() -> Digest {
     core::array::from_fn(|i| match i {
         0 => F::from_u32(REDUCED_SWIRL_TRANSITION_CHAIN_GENESIS_TAG),
@@ -972,7 +969,6 @@ pub fn reduced_swirl_transition_chain_genesis_metadata() -> Digest {
 
 /// Initial rolling manifest state shared by the native stream, transition
 /// leaves, and the terminal reconciliation circuit.
-#[must_use]
 pub fn reduced_swirl_transition_chain_genesis(source_protocol_digest: Digest) -> Digest {
     poseidon2_compress_with_capacity(
         source_protocol_digest,
@@ -985,7 +981,6 @@ pub fn reduced_swirl_transition_chain_genesis(source_protocol_digest: Digest) ->
 /// This helper is deliberately the host-side oracle for the boundary AIR and
 /// the terminal flat-manifest reconciliation, preventing the three users from
 /// acquiring subtly different call-coordinate encodings.
-#[must_use]
 pub fn reduced_swirl_transition_chain_append(
     chain_before: Digest,
     transition: &ReducedSwirlVaccTransitionReceiptMessage<F>,

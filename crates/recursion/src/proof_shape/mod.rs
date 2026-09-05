@@ -23,16 +23,10 @@ use crate::{
     },
     proof_shape::{
         bus::{
-            NumPublicValuesBus, ProofShapeMetadataBus, ProofShapePermutationBus,
-            RebasedTranscriptStartBus, StartingTidxBus,
+            NumPublicValuesBus, ProofShapeMetadataBus, ProofShapePermutationBus, StartingTidxBus,
         },
         proof_shape::{generate_metadata_dummy_trace, ProofShapeAir, ProofShapeMetadataAir},
         pvs::PublicValuesAir,
-        rebased::{
-            RebasedProofShapeStartAir, RebasedProofShapeStartTraceGenerator,
-            BATCH_CONSTRAINT_LOGUP_ONLY_MODE, BATCH_CONSTRAINT_MODE_SEPARATOR_LEN,
-            BATCH_CONSTRAINT_MODE_TAG, BATCH_CONSTRAINT_MODE_VERSION,
-        },
     },
     system::{
         frame::MultiStarkVkeyFrame, AirModule, BusIndexManager, BusInventory, GlobalCtxCpu,
@@ -45,14 +39,6 @@ pub mod bus;
 #[allow(clippy::module_inception)]
 pub mod proof_shape;
 pub mod pvs;
-pub mod rebased;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ProofShapeTranscriptMode {
-    #[default]
-    Standard,
-    RebasedLogUpOnly,
-}
 
 #[cfg(feature = "cuda")]
 mod cuda_abi;
@@ -100,11 +86,6 @@ pub struct ProofShapeModule {
     // Module sends extra public values message for use outside of verifier
     // sub-circuit if true
     continuations_enabled: bool,
-    /// See [`ProofShapeAir::export_stacking_shape`]; true for the full
-    /// assembly, false for a partial assembly without the stacking module.
-    export_stacking_shape: bool,
-    transcript_mode: ProofShapeTranscriptMode,
-    rebased_start_bus: Option<RebasedTranscriptStartBus>,
 }
 
 /// Above this child-AIR count, a one-proof verifier with no cached child mains
@@ -137,8 +118,8 @@ pub const RECURSION_MAX_CHILD_AIRS: usize = 1 << 12;
 
 /// Bit width of [`ProofShapeAir`]'s AIR-index gap range check.
 ///
-/// Eight before native WARP history spans, ten for the first 1024-AIR bounded profile, and twelve
-/// for the single-proof 4096-AIR heavy-block profile. Sparse equal-height runs can span almost
+/// Eight in the upstream verifier, ten for the first 1024-AIR bounded profile, and twelve for
+/// the single-proof 4096-AIR heavy-block profile. Sparse equal-height runs can span almost
 /// the complete child key, so the gap width must track the accepted key envelope.
 ///
 /// This width has its own [`RangeCheckerAir`] because the range bus is keyed `(value, max_bits)`
@@ -146,9 +127,6 @@ pub const RECURSION_MAX_CHILD_AIRS: usize = 1 << 12;
 /// decompositions and cannot also answer the larger-width query. `PowerCheckerAir` is the same
 /// bus's third provider, at width 5.
 pub const RECURSION_AIR_IDX_GAP_BITS: usize = 12;
-
-/// Widest AIR-index gap [`ProofShapeAir`]'s range check can carry.
-pub const RECURSION_MAX_AIR_IDX_GAP: usize = (1 << RECURSION_AIR_IDX_GAP_BITS) - 1;
 
 impl ProofShapeModule {
     pub fn new(
@@ -163,41 +141,6 @@ impl ProofShapeModule {
             "recursion circuit only supports child verifying keys with at most {RECURSION_MAX_CHILD_AIRS} AIRs"
         );
 
-        Self::new_with_transcript_mode(
-            mvk,
-            b,
-            bus_inventory,
-            continuations_enabled,
-            max_num_proofs,
-            ProofShapeTranscriptMode::Standard,
-        )
-    }
-
-    pub fn new_rebased_logup_only(
-        mvk: &MultiStarkVkeyFrame,
-        b: &mut BusIndexManager,
-        bus_inventory: BusInventory,
-        continuations_enabled: bool,
-        max_num_proofs: usize,
-    ) -> Self {
-        Self::new_with_transcript_mode(
-            mvk,
-            b,
-            bus_inventory,
-            continuations_enabled,
-            max_num_proofs,
-            ProofShapeTranscriptMode::RebasedLogUpOnly,
-        )
-    }
-
-    fn new_with_transcript_mode(
-        mvk: &MultiStarkVkeyFrame,
-        b: &mut BusIndexManager,
-        bus_inventory: BusInventory,
-        continuations_enabled: bool,
-        max_num_proofs: usize,
-        transcript_mode: ProofShapeTranscriptMode,
-    ) -> Self {
         let idx_encoder = Arc::new(Encoder::new(mvk.per_air.len(), 2, true));
 
         let (min_cached_idx, min_cached) = mvk
@@ -265,38 +208,12 @@ impl ProofShapeModule {
             commit_mult: mvk.params.whir.rounds.first().unwrap().num_queries,
             layout_export_lookups: 0,
             continuations_enabled,
-            export_stacking_shape: true,
-            transcript_mode,
-            rebased_start_bus: matches!(
-                transcript_mode,
-                ProofShapeTranscriptMode::RebasedLogUpOnly
-            )
-            .then(|| RebasedTranscriptStartBus::new(b.new_bus_idx())),
         }
     }
 
-    #[must_use]
-    pub fn rebased_start_bus(&self) -> Option<RebasedTranscriptStartBus> {
-        self.rebased_start_bus
-    }
-
-    /// Configure the module for a partial assembly without the stacking and
-    /// WHIR modules (the pre-v29 native WARP history certificate): the
-    /// stacked-column shape tables have no consumer and every commitment
-    /// observation is bound exactly once by the enclosing circuit's
-    /// authenticated-root bridge instead of `commit_mult` Merkle queries.
-    pub fn set_partial_assembly_exports(&mut self, commit_mult: usize) {
-        self.export_stacking_shape = false;
-        self.commit_mult = commit_mult;
-    }
-
-    /// Configure the module for a partial assembly that keeps the stacking
-    /// module but drops WHIR (the v29 native WARP history certificate): the
-    /// stacked-column shape tables keep their consumer (`OpeningClaimsAir`),
-    /// while commitment observations are bound `commit_mult` times by the
-    /// enclosing circuit instead of WHIR's Merkle queries.
-    pub fn set_partial_assembly_exports_with_stacking(&mut self, commit_mult: usize) {
-        self.export_stacking_shape = true;
+    /// Configure how many consumers authenticate each commitment when WHIR
+    /// is deferred to an enclosing reduced-SWIRL WARP proof.
+    pub fn set_deferred_whir_commitment_multiplicity(&mut self, commit_mult: usize) {
         self.commit_mult = commit_mult;
     }
 
@@ -317,7 +234,6 @@ impl ProofShapeModule {
     ) where
         TS: FiatShamirTranscript<BabyBearPoseidon2Config> + TranscriptHistory,
     {
-        assert_eq!(self.transcript_mode, ProofShapeTranscriptMode::Standard);
         ts.observe_commit(child_vk.pre_hash);
         ts.observe_commit(proof.common_main_commit);
 
@@ -362,55 +278,6 @@ impl ProofShapeModule {
             starting_tidx,
             pvs_tidx,
             ts.len(),
-            None,
-        );
-    }
-
-    /// Begin the verifier after a caller-certified source-manifest checkpoint.
-    /// The local transcript must contain only the retained suffix. Its AIR
-    /// representation is resumed at `start.start_tidx` from `start.state`.
-    pub fn run_preflight_rebased_logup_only<TS>(
-        &self,
-        child_vk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
-        proof: &Proof<BabyBearPoseidon2Config>,
-        preflight: &mut Preflight,
-        ts: &mut TS,
-        start: crate::system::RebasedTranscriptPreflight,
-    ) where
-        TS: FiatShamirTranscript<BabyBearPoseidon2Config> + TranscriptHistory,
-    {
-        assert_eq!(
-            self.transcript_mode,
-            ProofShapeTranscriptMode::RebasedLogUpOnly
-        );
-        assert_eq!(
-            ts.len(),
-            start.start_tidx,
-            "rebased verifier must start at the certified absolute cursor"
-        );
-        ts.observe(F::from_u64(BATCH_CONSTRAINT_MODE_TAG));
-        ts.observe(F::from_u32(BATCH_CONSTRAINT_MODE_VERSION));
-        ts.observe(F::from_u32(BATCH_CONSTRAINT_LOGUP_ONLY_MODE));
-        debug_assert_eq!(
-            ts.len(),
-            start.start_tidx + BATCH_CONSTRAINT_MODE_SEPARATOR_LEN
-        );
-
-        let gkr_start = ts.len();
-        let pvs_tidx = proof
-            .public_values
-            .iter()
-            .filter(|values| !values.is_empty())
-            .map(|_| gkr_start)
-            .collect();
-        self.finish_preflight(
-            child_vk,
-            proof,
-            preflight,
-            vec![gkr_start; child_vk.inner.per_air.len()],
-            pvs_tidx,
-            gkr_start,
-            Some(start),
         );
     }
 
@@ -423,7 +290,6 @@ impl ProofShapeModule {
         starting_tidx: Vec<usize>,
         pvs_tidx: Vec<usize>,
         post_tidx: usize,
-        rebased_start: Option<crate::system::RebasedTranscriptPreflight>,
     ) {
         let l_skip = child_vk.inner.params.l_skip;
         let mut sorted_trace_vdata: Vec<_> = proof
@@ -448,7 +314,6 @@ impl ProofShapeModule {
         let num_layers = proof.gkr_proof.claims_per_layer.len();
         let n_logup = num_layers.saturating_sub(l_skip);
 
-        preflight.rebased_transcript = rebased_start;
         preflight.proof_shape = ProofShapePreflight {
             sorted_trace_vdata,
             starting_tidx,
@@ -465,7 +330,7 @@ impl AirModule for ProofShapeModule {
     fn num_airs(&self) -> usize {
         // ProofShape, PublicValues, and one RangeChecker per width the AIR queries: `<8>` for the
         // `LIMB_BITS` decompositions and `<RECURSION_AIR_IDX_GAP_BITS>` for the AIR-index gap.
-        4 + usize::from(self.metadata_bus.is_some()) + usize::from(self.rebased_start_bus.is_some())
+        4 + usize::from(self.metadata_bus.is_some())
     }
 
     fn airs<SC: StarkProtocolConfig<F = F>>(&self) -> Vec<AirRef<SC>> {
@@ -500,18 +365,12 @@ impl AirModule for ProofShapeModule {
             pre_hash_bus: self.bus_inventory.pre_hash_bus,
             continuations_enabled: self.continuations_enabled,
             layout_export_lookups: self.layout_export_lookups,
-            export_stacking_shape: self.export_stacking_shape,
-            transcript_shape_enabled: matches!(
-                self.transcript_mode,
-                ProofShapeTranscriptMode::Standard
-            ),
         };
         let pvs_air = PublicValuesAir {
             public_values_bus: self.bus_inventory.public_values_bus,
             num_pvs_bus: self.num_pvs_bus,
             transcript_bus: self.bus_inventory.transcript_bus,
             continuations_enabled: self.continuations_enabled,
-            transcript_enabled: matches!(self.transcript_mode, ProofShapeTranscriptMode::Standard),
         };
         let range_checker = RangeCheckerAir::<8> {
             bus: self.range_bus,
@@ -536,14 +395,6 @@ impl AirModule for ProofShapeModule {
                 l_skip: self.l_skip,
                 min_cached_idx: self.min_cached_idx,
                 bus,
-            }) as AirRef<_>);
-        }
-        if let Some(start_bus) = self.rebased_start_bus {
-            airs.push(Arc::new(RebasedProofShapeStartAir {
-                start_bus,
-                resume_state_bus: self.bus_inventory.resume_state_bus,
-                starting_tidx_bus: self.starting_tidx_bus,
-                transcript_bus: self.bus_inventory.transcript_bus,
             }) as AirRef<_>);
         }
         airs
@@ -620,15 +471,6 @@ impl<SC: StarkProtocolConfig<F = F>> TraceGenModule<GlobalCtxCpu, CpuBackend<SC>
             }
             ctxs.push(AirProvingContext::simple_no_pis(
                 generate_metadata_dummy_trace(height),
-            ));
-        }
-        if self.rebased_start_bus.is_some() {
-            let local_idx = 4 + usize::from(self.metadata_bus.is_some());
-            ctxs.push(AirProvingContext::simple_no_pis(
-                RebasedProofShapeStartTraceGenerator.generate_trace(
-                    &preflights,
-                    required_heights.map(|heights| heights[local_idx]),
-                )?,
             ));
         }
         Some(ctxs)

@@ -355,7 +355,6 @@ pub struct ProductionReducedSwirlVaccComponent {
     digest_transcript: NativeWarpTranscriptModule,
     manifest_transcript: NativeWarpTranscriptModule,
     transition_aggregate: ReducedSwirlVaccTransitionAggregateComponent,
-    shared: BusInventory,
     source_authority_bus: openvm_recursion_circuit::native_warp::ReducedSwirlSourceAuthorityBus,
     next_bus_idx: BusIndex,
     component_digest: Digest,
@@ -559,7 +558,6 @@ impl ProductionReducedSwirlVaccComponent {
             digest_transcript,
             manifest_transcript,
             transition_aggregate,
-            shared,
             source_authority_bus: source_buses.authority,
             next_bus_idx,
             component_digest,
@@ -574,11 +572,6 @@ impl ProductionReducedSwirlVaccComponent {
     }
 
     #[must_use]
-    pub const fn shared_bus_inventory(&self) -> &BusInventory {
-        &self.shared
-    }
-
-    #[must_use]
     pub const fn source_authority_bus(
         &self,
     ) -> openvm_recursion_circuit::native_warp::ReducedSwirlSourceAuthorityBus {
@@ -590,14 +583,12 @@ impl ProductionReducedSwirlVaccComponent {
         self.next_bus_idx
     }
 
-    #[must_use]
     pub const fn protocol_digest(&self) -> Digest {
         self.component_digest
     }
 
     /// Domain-separated identity of the ordinary reduced-SWIRL WARP index.
     /// This is intentionally distinct from terminal WHIR's index digest.
-    #[must_use]
     pub const fn warp_index_digest(&self) -> Digest {
         self.profile.warp_index_digest
     }
@@ -1309,7 +1300,7 @@ mod tests {
             log_commit_rows_per_query: 0,
         };
         let receipt = ReducedSwirlSourceReceiptProfile {
-            source: source.clone(),
+            source,
             protocol_digest: digest(200),
             child_vk_pre_hash: digest(220),
             child_air_count: 1,

@@ -21,8 +21,8 @@ pub struct VerifierLayerIdentityMessage<T> {
 define_typed_per_proof_lookup_bus!(VerifierLayerIdentityBus, VerifierLayerIdentityMessage);
 
 /// Complete VM execution identity read from an authenticated child proof.
-/// History-v4 projections consume this beside their custom interval statement
-/// so the recursive key chain and the History chain cannot describe different
+/// Reduced-SWIRL recursive prefixes consume this beside their interval statement
+/// so the recursive key chain and transition tree cannot describe different
 /// programs or state boundaries.
 #[repr(C)]
 #[derive(AlignedBorrow, Debug, Clone)]

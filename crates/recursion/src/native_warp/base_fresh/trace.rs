@@ -22,7 +22,7 @@ use crate::native_warp::{
     NativeMerkleCompressionCols, NativeMerkleLeafAdapterInput,
 };
 
-/// Complete history witness for one direct-original-root VACC batch.
+/// Complete opening witness for one direct-original-root VACC batch.
 ///
 /// Each application root remains the authenticated oracle. The projection
 /// trace combines only the verifier-selected cells, so this path introduces

@@ -546,7 +546,7 @@ mod tests {
 
     #[test]
     fn vector_alphabet_reduces_the_round_evaluation_domain() {
-        // The real verifier-PESAT profile has a log-29 RS codeword and k = 4.
+        // Production reduced-SWIRL profiles use large RS codewords and k = 4.
         // WHIR's round polynomial is evaluated on the 2^(29-4) row domain,
         // which is supported by BabyBear even though a 2^29 root is not.
         let air = round_air(29, 4).unwrap();

@@ -314,17 +314,14 @@ impl ReducedSwirlTerminalProductionSetup {
         self.identity.clone()
     }
 
-    #[must_use]
     pub fn protocol_digest(&self) -> Digest {
         self.identity.protocol_digest
     }
 
-    #[must_use]
     pub fn relation_digest(&self) -> Digest {
         self.identity.relation_digest
     }
 
-    #[must_use]
     pub fn terminal_index_digest(&self) -> Digest {
         self.identity.terminal_index_digest
     }
@@ -718,7 +715,6 @@ impl ReducedSwirlTerminalSetupIdentity {
         out
     }
 
-    #[must_use]
     pub fn setup_identity_digest(&self) -> Digest {
         poseidon2_hash_slice_with_states(&self.setup_identity_material()).0
     }
@@ -751,7 +747,6 @@ pub struct ReducedSwirlTerminalProfile {
 }
 
 impl ReducedSwirlTerminalProfile {
-    #[must_use]
     pub fn setup_identity_digest(&self) -> Digest {
         self.setup.setup_identity_digest()
     }
@@ -761,7 +756,6 @@ impl ReducedSwirlTerminalProfile {
         &self.setup
     }
 
-    #[must_use]
     pub fn verifier_component_digest(&self) -> Digest {
         self.verifier_component_digest
     }
@@ -1647,7 +1641,6 @@ impl ReducedSwirlTerminalComponent {
         })
     }
 
-    #[must_use]
     pub fn protocol_digest(&self) -> Digest {
         // Deliberately excludes profile.verifier_component_digest, while
         // binding every interaction namespace used by these AIRs.
@@ -1806,7 +1799,6 @@ impl ReducedSwirlTerminalComponent {
                 inner_tree_id_offset: p.round_count(),
                 outer_tree_id_offset: 0,
                 evaluation_layout: true,
-                coefficient_two_coset_initial: false,
             },
         );
         add_air(

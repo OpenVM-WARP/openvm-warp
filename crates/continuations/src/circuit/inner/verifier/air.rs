@@ -56,7 +56,7 @@ pub struct VerifierPvsAir {
     pub pre_hash_bus: PreHashBus,
     pub range_bus: RangeCheckerBus,
     pub pvs_air_consistency_bus: PvsAirConsistencyBus,
-    /// Enabled only by History-v4 recursive sub-circuits. The message is
+    /// Enabled only by reduced-SWIRL recursive prefixes. The message is
     /// derived from authenticated child verifier PVS on every valid row.
     pub verifier_layer_identity_bus: Option<VerifierLayerIdentityBus>,
     pub deferral_config: VerifierDeferralConfig,

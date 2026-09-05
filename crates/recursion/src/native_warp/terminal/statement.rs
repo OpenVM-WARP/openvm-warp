@@ -63,8 +63,8 @@ pub enum NativeTerminalTranscriptBindingError {
 
 impl NativeTerminalTranscriptBinding {
     /// Construct the exact binding used by the coefficient-native SWIRL
-    /// terminal.  Ordinary-subgroup and two-coset layouts are rejected: this
-    /// module certifies the reduced-SWIRL Eq relation and accepts only the
+    /// terminal. Ordinary-subgroup layouts are rejected: this module
+    /// certifies the reduced-SWIRL Eq relation and accepts only the
     /// coefficient-subgroup layout.
     pub fn coefficient_subgroup<Obs>(
         descriptor: &TerminalDescriptor<Digest>,

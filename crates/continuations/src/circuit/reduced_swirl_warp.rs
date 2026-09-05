@@ -263,7 +263,7 @@ where
             builder,
             ReducedSwirlExecutionMessage {
                 vm_pvs: VmPvs {
-                    program_commit: core::array::from_fn(|i| v(i)),
+                    program_commit: core::array::from_fn(&v),
                     initial_pc: v(DIGEST_SIZE),
                     final_pc: v(DIGEST_SIZE + 1),
                     exit_code: v(DIGEST_SIZE + 2),

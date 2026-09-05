@@ -57,9 +57,10 @@ impl InteractionsFoldingBlob {
         let mut folded = MultiProofVecVec::new();
         for (pidx, preflight) in preflights.iter().enumerate() {
             let beta_tidx = preflight.proof_shape.post_tidx + logup_pow_offset + D_EF;
-            let beta =
-                EF::from_basis_coefficients_slice(preflight.transcript_values_at(beta_tidx, D_EF))
-                    .unwrap();
+            let beta = EF::from_basis_coefficients_slice(
+                &preflight.transcript.values()[beta_tidx..beta_tidx + D_EF],
+            )
+            .unwrap();
 
             let eq_3bs = &eq_3b_blob.all_stacked_ids[pidx];
             let mut cur_eq3b_idx = 0;
@@ -200,7 +201,7 @@ impl RowMajorChip<F> for InteractionsFoldingTraceGenerator {
         let mut cur_height = 0;
         for (pidx, preflight) in preflights.iter().enumerate() {
             let beta_tidx = preflight.proof_shape.post_tidx + logup_pow_offset + D_EF;
-            let beta_slice = preflight.transcript_values_at(beta_tidx, D_EF);
+            let beta_slice = &preflight.transcript.values()[beta_tidx..beta_tidx + D_EF];
             let records = &if_blob.records[pidx];
             let eq_3bs = &eq_3b_blob.all_stacked_ids[pidx];
 
@@ -369,7 +370,7 @@ pub(in crate::batch_constraint) mod cuda {
             for (pidx, preflight) in preflights.iter().enumerate() {
                 let beta_tidx = preflight.proof_shape.post_tidx + logup_pow_offset + D_EF;
                 let beta = EF::from_basis_coefficients_slice(
-                    preflight.cpu.transcript_values_at(beta_tidx, D_EF),
+                    &preflight.cpu.transcript.values()[beta_tidx..beta_tidx + D_EF],
                 )
                 .unwrap();
 

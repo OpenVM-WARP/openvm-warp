@@ -52,25 +52,11 @@ use crate::{
 };
 
 mod deferred_opening;
-mod deferred_stacking;
 mod dummy;
-mod logup_only;
 pub use deferred_opening::{
     DeferredOpeningCheckpoint, DeferredOpeningCheckpointAir, DeferredOpeningCheckpointWitness,
 };
-pub use deferred_stacking::{ConstraintReductionCheckpointAir, ConstraintReductionClaimsAir};
-pub use logup_only::{
-    LogUpOnlyPartialVerifier, LogUpOnlyPartialVerifierExports, LogUpOnlyPrefixTranscript,
-};
-/// Public so a circuit outside this crate can assemble the modules itself.
-///
-/// The native WARP history certificate needs `ProofShapeModule` +  `GkrModule` +
-/// `BatchConstraintModule` without `StackingModule` or `WhirModule`: it evaluates the batched
-/// constraint claim at a point, which is the accumulation decider's job, while the PCS opening
-/// those last two verify is exactly what WARP accumulation replaces. `ProofShapeModule::new`
-/// takes a [`frame::MultiStarkVkeyFrame`], so that partial assembly is only expressible with
-/// this module reachable.
-pub mod frame;
+pub(crate) mod frame;
 
 const BATCH_CONSTRAINT_MOD_IDX: usize = 0;
 #[cfg(feature = "cuda")]
@@ -85,26 +71,7 @@ const LARGE_VERIFIER_BATCH_CUTOFF: usize = 16;
 /// implementation spawned one operating-system thread per child because its
 /// intended arity was three or four.
 const LARGE_VERIFIER_PREFLIGHT_WIDTH: usize = 32;
-/// Public so a circuit outside this crate can add the `PowerCheckerAir` that
-/// [`AggregationSubCircuit::airs`] adds outside any module. The native WARP history certificate
-/// assembles three of the six modules itself, so it has to supply that table.
-pub const POW_CHECKER_HEIGHT: usize = 32;
-
-/// Equation checked by the recursive SWIRL batch-constraint verifier.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(u32)]
-pub enum VerifierEquationMode {
-    #[default]
-    AirAndLogUp = 0,
-    LogUpOnly = 1,
-}
-
-impl VerifierEquationMode {
-    #[must_use]
-    pub const fn includes_air(self) -> bool {
-        matches!(self, Self::AirAndLogUp)
-    }
-}
+pub(crate) const POW_CHECKER_HEIGHT: usize = 32;
 
 pub enum CachedTraceCtx<PB: ProverBackend> {
     PcsData(CommittedTraceData<PB>),
@@ -123,17 +90,9 @@ pub enum VerifierTailMode {
     Complete,
     /// Verify stacking, but defer WHIR to a same-root terminal obligation.
     DeferredWhir,
-    /// Stop after AIR/LogUp and defer both stacking and WHIR to one block-wide
-    /// terminal reduction over the original commitments.
-    DeferredStacking,
 }
 
 impl VerifierTailMode {
-    #[must_use]
-    const fn includes_stacking(self) -> bool {
-        !matches!(self, Self::DeferredStacking)
-    }
-
     #[must_use]
     const fn includes_whir(self) -> bool {
         matches!(self, Self::Complete)
@@ -261,18 +220,17 @@ pub trait AggregationSubCircuit {
 
     /// Optional circuit-specific bus on which the ordinary continuations PVS
     /// AIR republishes each authenticated child's `(internal_flag,
-    /// recursion_depth)`.  Generic recursive circuits leave this disabled;
-    /// History v4 uses it to bind its custom proof-kind/depth statement to the
-    /// already authenticated OpenVM verifier public values without consuming
-    /// `PublicValuesBus` coordinates twice.
+    /// recursion_depth)`. Generic recursive circuits leave this disabled; the
+    /// reduced-SWIRL wrapper prefix uses it to bind child proof type and depth
+    /// without consuming `PublicValuesBus` coordinates twice.
     fn verifier_layer_identity_bus_idx(&self) -> Option<BusIndex> {
         None
     }
 
     /// Optional companion bus carrying the authenticated child `VmPvs` for
-    /// each proof slot. History v4 uses it to bind program and execution
-    /// endpoints to its custom statement. Generic recursive circuits leave it
-    /// disabled.
+    /// each proof slot. The reduced-SWIRL wrapper prefix uses it to bind
+    /// program and execution endpoints to its own statement. Generic recursive
+    /// circuits leave it disabled.
     fn verifier_execution_identity_bus_idx(&self) -> Option<BusIndex> {
         None
     }
@@ -411,9 +369,6 @@ pub struct Preflight {
     /// The concatenated sequence of observes/samples. Not available during preflight; populated
     /// after.
     pub transcript: TranscriptLog<F, [F; POSEIDON2_WIDTH]>,
-    /// Present exactly when the transcript log is a suffix resumed from a
-    /// caller-certified checkpoint.
-    pub rebased_transcript: Option<RebasedTranscriptPreflight>,
     pub proof_shape: ProofShapePreflight,
     pub gkr: GkrPreflight,
     pub batch_constraint: BatchConstraintPreflight,
@@ -424,124 +379,6 @@ pub struct Preflight {
     pub initial_row_states: Vec<Vec<Vec<Vec<[F; POSEIDON2_WIDTH]>>>>,
     /// Indexed by `[round][query][coset]`. Stores post-permutation state.
     pub codeword_states: Vec<Vec<Vec<[F; POSEIDON2_WIDTH]>>>,
-}
-
-/// Backend-neutral transcript checkpoint used by a partial recursion verifier.
-///
-/// The operation index is absolute. `Preflight::transcript` stores only the
-/// suffix beginning at this checkpoint, while all AIR-visible transcript
-/// indices remain absolute.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RebasedTranscriptPreflight {
-    pub start_tidx: usize,
-    pub state: [F; POSEIDON2_WIDTH],
-}
-
-/// Proof material retained at the reduced-SWIRL deferred-opening boundary.
-///
-/// Stacking and WHIR data are deliberately absent. The conversion helper only
-/// supplies empty placeholders so the established trace generators can be
-/// reused without constructing a complete WHIR proof.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RetainedLogUpOnlyProof {
-    pub common_main_commit: [F; CHUNK],
-    pub trace_vdata: Vec<Option<TraceVData<BabyBearPoseidon2Config>>>,
-    pub public_values: Vec<Vec<F>>,
-    pub gkr_proof: GkrProof<BabyBearPoseidon2Config>,
-    pub batch_constraint_proof: BatchConstraintProof<BabyBearPoseidon2Config>,
-}
-
-impl From<&Proof<BabyBearPoseidon2Config>> for RetainedLogUpOnlyProof {
-    fn from(proof: &Proof<BabyBearPoseidon2Config>) -> Self {
-        Self {
-            common_main_commit: proof.common_main_commit,
-            trace_vdata: proof.trace_vdata.clone(),
-            public_values: proof.public_values.clone(),
-            gkr_proof: proof.gkr_proof.clone(),
-            batch_constraint_proof: proof.batch_constraint_proof.clone(),
-        }
-    }
-}
-
-impl RetainedLogUpOnlyProof {
-    /// Adapter for complete-proof trace-generator APIs. The empty tail is never read
-    /// by ProofShape/GKR/BatchConstraint partial assemblies.
-    #[must_use]
-    pub fn into_partial_proof(self) -> Proof<BabyBearPoseidon2Config> {
-        Proof {
-            common_main_commit: self.common_main_commit,
-            trace_vdata: self.trace_vdata,
-            public_values: self.public_values,
-            gkr_proof: self.gkr_proof,
-            batch_constraint_proof: self.batch_constraint_proof,
-            stacking_proof: StackingProof {
-                univariate_round_coeffs: Vec::new(),
-                sumcheck_round_polys: Vec::new(),
-                stacking_openings: Vec::new(),
-            },
-            whir_proof: WhirProof {
-                mu_pow_witness: F::ZERO,
-                whir_sumcheck_polys: Vec::new(),
-                codeword_commits: Vec::new(),
-                ood_values: Vec::new(),
-                folding_pow_witnesses: Vec::new(),
-                query_phase_pow_witnesses: Vec::new(),
-                initial_round_opened_rows: Vec::new(),
-                initial_round_merkle_proofs: Vec::new(),
-                codeword_opened_values: Vec::new(),
-                codeword_merkle_proofs: Vec::new(),
-                final_poly: Vec::new(),
-            },
-        }
-    }
-}
-
-/// Complete AIR-plus-LogUp proof prefix retained before SWIRL stacking.
-///
-/// This is intentionally a distinct type from [`RetainedLogUpOnlyProof`]: the
-/// two prefixes use different equations and cannot share a WARP relation
-/// index. The empty tail bridge is private to trace generation and is never a
-/// standalone proof.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RetainedConstraintReductionProof {
-    pub common_main_commit: [F; CHUNK],
-    pub trace_vdata: Vec<Option<TraceVData<BabyBearPoseidon2Config>>>,
-    pub public_values: Vec<Vec<F>>,
-    pub gkr_proof: GkrProof<BabyBearPoseidon2Config>,
-    pub batch_constraint_proof: BatchConstraintProof<BabyBearPoseidon2Config>,
-}
-
-impl RetainedConstraintReductionProof {
-    /// Compatibility value consumed only by a verifier configured with
-    /// [`VerifierTailMode::DeferredStacking`].
-    #[must_use]
-    pub fn into_partial_proof(self) -> Proof<BabyBearPoseidon2Config> {
-        Proof {
-            common_main_commit: self.common_main_commit,
-            trace_vdata: self.trace_vdata,
-            public_values: self.public_values,
-            gkr_proof: self.gkr_proof,
-            batch_constraint_proof: self.batch_constraint_proof,
-            stacking_proof: StackingProof {
-                univariate_round_coeffs: Vec::new(),
-                sumcheck_round_polys: Vec::new(),
-                stacking_openings: Vec::new(),
-            },
-            whir_proof: WhirProof {
-                mu_pow_witness: F::ZERO,
-                whir_sumcheck_polys: Vec::new(),
-                codeword_commits: Vec::new(),
-                ood_values: Vec::new(),
-                folding_pow_witnesses: Vec::new(),
-                query_phase_pow_witnesses: Vec::new(),
-                initial_round_opened_rows: Vec::new(),
-                initial_round_merkle_proofs: Vec::new(),
-                codeword_opened_values: Vec::new(),
-                codeword_merkle_proofs: Vec::new(),
-                final_poly: Vec::new(),
-            },
-        }
-    }
 }
 
 /// Proof prefix retained when SWIRL has completed AIR/LogUp and stacking but
@@ -673,33 +510,6 @@ impl ProofShapePreflight {
     }
 }
 
-impl Preflight {
-    #[must_use]
-    pub fn transcript_base_tidx(&self) -> usize {
-        self.rebased_transcript.map_or(0, |start| start.start_tidx)
-    }
-
-    /// Convert an AIR-visible absolute transcript index into the local index
-    /// of the retained suffix log.
-    #[must_use]
-    pub fn transcript_local_tidx(&self, absolute_tidx: usize) -> usize {
-        absolute_tidx
-            .checked_sub(self.transcript_base_tidx())
-            .expect("absolute transcript index precedes the certified rebase")
-    }
-
-    #[must_use]
-    pub fn transcript_absolute_tidx(&self, local_tidx: usize) -> usize {
-        self.transcript_base_tidx() + local_tidx
-    }
-
-    #[must_use]
-    pub fn transcript_values_at(&self, absolute_tidx: usize, len: usize) -> &[F] {
-        let local = self.transcript_local_tidx(absolute_tidx);
-        &self.transcript.values()[local..local + len]
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct GkrPreflight {
     pub post_tidx: usize,
@@ -708,7 +518,6 @@ pub struct GkrPreflight {
 
 #[derive(Clone, Debug, Default)]
 pub struct BatchConstraintPreflight {
-    pub equation_mode: VerifierEquationMode,
     pub lambda_tidx: usize,
     pub tidx_before_univariate: usize,
     pub tidx_before_multilinear: usize,
@@ -720,7 +529,6 @@ pub struct BatchConstraintPreflight {
     pub eq_sharp_ns: Vec<EF>,
     pub eq_ns_frontloaded: Vec<EF>,
     pub eq_sharp_ns_frontloaded: Vec<EF>,
-    pub final_claim: EF,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -953,9 +761,7 @@ pub struct VerifierSubCircuit<
     whir: WhirModule,
     tail_mode: VerifierTailMode,
     deferred_checkpoint: Option<DeferredOpeningCheckpointAir<MAX_NUM_PROOFS>>,
-    constraint_claims: Option<ConstraintReductionClaimsAir>,
-    constraint_checkpoint: Option<ConstraintReductionCheckpointAir<MAX_NUM_PROOFS>>,
-    deferred_stacking_endpoint: Option<crate::native_warp::NativeReductionEndpointInputBus>,
+    deferred_whir_endpoint: Option<crate::native_warp::NativeReductionEndpointInputBus>,
 }
 
 impl<const MAX_NUM_PROOFS: usize, const TRANSCRIPT_SBOX_REGISTERS: usize>
@@ -974,10 +780,10 @@ impl<const MAX_NUM_PROOFS: usize, const TRANSCRIPT_SBOX_REGISTERS: usize>
             return Err("deferred-SWIRL exports require the DeferredWhir verifier tail");
         }
         let endpoint = self
-            .deferred_stacking_endpoint
+            .deferred_whir_endpoint
             .ok_or("deferred-SWIRL stacking endpoint")?;
         self.proof_shape
-            .set_partial_assembly_exports_with_stacking(1);
+            .set_deferred_whir_commitment_multiplicity(1);
         self.proof_shape.set_layout_export_lookups(1);
         // The receipt replaces the public deferred-opening checkpoint AIR.
         // Export the exact transcript length so its private checkpoint cannot
@@ -1006,7 +812,7 @@ impl<const MAX_NUM_PROOFS: usize, const TRANSCRIPT_SBOX_REGISTERS: usize>
                 + self.transcript.num_airs()
                 + self.proof_shape.num_airs()
                 + self.gkr.num_airs()
-                + usize::from(self.tail_mode.includes_stacking()) * self.stacking.num_airs()
+                + self.stacking.num_airs()
                 + usize::from(self.tail_mode.includes_whir()) * self.whir.num_airs()
         })
     }
@@ -1131,9 +937,8 @@ impl<const MAX_NUM_PROOFS: usize, const TRANSCRIPT_SBOX_REGISTERS: usize>
             bus_inventory.clone(),
             child_mvk.inner.params.clone(),
             config.final_state_bus_enabled || config.tail_mode.is_deferred(),
-            // The generic recursion verifier always starts its transcripts at
-            // the canonical zero sponge; only the native WARP history ladder
-            // continues one.
+            // Every child verifier starts its transcript from the canonical
+            // zero sponge.
             false,
         );
         let child_mvk_frame = child_mvk.as_ref().into();
@@ -1145,35 +950,25 @@ impl<const MAX_NUM_PROOFS: usize, const TRANSCRIPT_SBOX_REGISTERS: usize>
             MAX_NUM_PROOFS,
         );
         let gkr = GkrModule::new(&child_mvk, &mut bus_idx_manager, bus_inventory.clone());
-        let batch_constraint = if config.tail_mode == VerifierTailMode::DeferredStacking {
-            BatchConstraintModule::new_deferred_stacking(
-                &child_mvk,
-                &mut bus_idx_manager,
-                bus_inventory.clone(),
-                MAX_NUM_PROOFS,
-                config.has_cached,
-            )
-        } else {
-            BatchConstraintModule::new(
-                &child_mvk,
-                &mut bus_idx_manager,
-                bus_inventory.clone(),
-                MAX_NUM_PROOFS,
-                config.has_cached,
-            )
-        };
+        let batch_constraint = BatchConstraintModule::new(
+            &child_mvk,
+            &mut bus_idx_manager,
+            bus_inventory.clone(),
+            MAX_NUM_PROOFS,
+            config.has_cached,
+        );
         let mut stacking =
             StackingModule::new(&child_mvk, &mut bus_idx_manager, bus_inventory.clone());
         let whir = WhirModule::new(&child_mvk, &mut bus_idx_manager, bus_inventory.clone());
-        let mut deferred_stacking_endpoint = None;
+        let mut deferred_whir_endpoint = None;
         let deferred_checkpoint = (config.tail_mode == VerifierTailMode::DeferredWhir).then(|| {
             // Roots and stacking claims remain ordinary transcript inputs, but
             // WHIR no longer consumes their lookup fanout in this circuit.
-            proof_shape.set_partial_assembly_exports_with_stacking(0);
+            proof_shape.set_deferred_whir_commitment_multiplicity(0);
             let endpoint = crate::native_warp::NativeReductionEndpointInputBus::new(
                 bus_idx_manager.new_bus_idx(),
             );
-            deferred_stacking_endpoint = Some(endpoint);
+            deferred_whir_endpoint = Some(endpoint);
             stacking.set_partial_assembly_exports(crate::stacking::StackingNativeExports {
                 endpoint_input_bus: endpoint,
                 point_lookups: 0,
@@ -1185,26 +980,6 @@ impl<const MAX_NUM_PROOFS: usize, const TRANSCRIPT_SBOX_REGISTERS: usize>
                 bus_inventory.final_state_bus,
             )
         });
-        let (constraint_claims, constraint_checkpoint) =
-            if config.tail_mode == VerifierTailMode::DeferredStacking {
-                proof_shape.set_partial_assembly_exports(0);
-                transcript.enable_end_index_bus();
-                transcript.disable_merkle_verify();
-                (
-                    Some(ConstraintReductionClaimsAir::new(
-                        bus_inventory.stacking_module_bus,
-                        bus_inventory.column_claims_bus,
-                        bus_inventory.transcript_bus,
-                    )),
-                    Some(ConstraintReductionCheckpointAir::new(
-                        bus_inventory.final_state_bus,
-                        bus_inventory.transcript_end_index_bus,
-                    )),
-                )
-            } else {
-                (None, None)
-            };
-
         VerifierSubCircuit {
             bus_inventory,
             bus_idx_manager,
@@ -1216,9 +991,7 @@ impl<const MAX_NUM_PROOFS: usize, const TRANSCRIPT_SBOX_REGISTERS: usize>
             whir,
             tail_mode: config.tail_mode,
             deferred_checkpoint,
-            constraint_claims,
-            constraint_checkpoint,
-            deferred_stacking_endpoint,
+            deferred_whir_endpoint,
         }
     }
 
@@ -1253,12 +1026,10 @@ impl<const MAX_NUM_PROOFS: usize, const TRANSCRIPT_SBOX_REGISTERS: usize>
             VerifierTailMode::DeferredWhir => {
                 self.stacking
                     .run_preflight_without_mu_tail(proof, &mut preflight, &mut sponge);
-                // The post-stacking compatibility mode retains its explicit
-                // terminal squeeze. New protocols should prefer the typed
-                // pre-stacking manifest below.
+                // Bind the typed post-stacking checkpoint to an explicit
+                // terminal challenge before the transcript is retained.
                 let _checkpoint_challenge = sponge.sample_ext();
             }
-            VerifierTailMode::DeferredStacking => {}
         }
         preflight.transcript = sponge.into_log();
 
@@ -1595,12 +1366,10 @@ impl<const MAX_NUM_PROOFS: usize, const TRANSCRIPT_SBOX_REGISTERS: usize>
         let t_n = self.transcript.num_airs();
         let ps_n = self.proof_shape.num_airs();
         let gkr_n = self.gkr.num_airs();
-        let st_n = usize::from(self.tail_mode.includes_stacking()) * self.stacking.num_airs();
+        let st_n = self.stacking.num_airs();
         let w_n = usize::from(self.tail_mode.includes_whir()) * self.whir.num_airs();
         let module_air_counts = [bc_n, t_n, ps_n, gkr_n, st_n, w_n];
-        let statement_n = usize::from(self.deferred_checkpoint.is_some())
-            + usize::from(self.constraint_claims.is_some())
-            + usize::from(self.constraint_checkpoint.is_some());
+        let statement_n = usize::from(self.deferred_checkpoint.is_some());
 
         let Some(heights) = required_heights else {
             return (vec![None; module_air_counts.len()], None, None, None);
@@ -1649,19 +1418,11 @@ impl<const MAX_NUM_PROOFS: usize, const TRANSCRIPT_SBOX_REGISTERS: usize> Aggreg
             .chain(self.proof_shape.airs())
             .chain(self.gkr.airs())
             .collect::<Vec<_>>();
-        if self.tail_mode.includes_stacking() {
-            airs.extend(self.stacking.airs());
-        }
+        airs.extend(self.stacking.airs());
         if self.tail_mode.includes_whir() {
             airs.extend(self.whir.airs());
         }
         if let Some(checkpoint) = self.deferred_checkpoint {
-            airs.push(Arc::new(checkpoint) as AirRef<_>);
-        }
-        if let Some(claims) = self.constraint_claims {
-            airs.push(Arc::new(claims) as AirRef<_>);
-        }
-        if let Some(checkpoint) = self.constraint_checkpoint {
             airs.push(Arc::new(checkpoint) as AirRef<_>);
         }
         airs.extend([
@@ -1802,9 +1563,7 @@ impl<
             TraceModuleRef::ProofShape(&self.proof_shape),
             TraceModuleRef::Gkr(&self.gkr),
         ];
-        if self.tail_mode.includes_stacking() {
-            modules.push(TraceModuleRef::Stacking(&self.stacking));
-        }
+        modules.push(TraceModuleRef::Stacking(&self.stacking));
         if self.tail_mode.includes_whir() {
             modules.push(TraceModuleRef::Whir(&self.whir));
         }
@@ -1887,16 +1646,6 @@ impl<
         let mut ctx_per_trace = ctxs_by_module.into_iter().flatten().collect::<Vec<_>>();
         if let Some(checkpoint) = self.deferred_checkpoint {
             let required = statement_required.and_then(|heights| heights.first().copied());
-            let (trace, public_values) = checkpoint.generate_trace(&preflights, required)?;
-            ctx_per_trace.push(AirProvingContext::simple(trace, public_values));
-        }
-        if let Some(claims) = self.constraint_claims {
-            let required = statement_required.and_then(|heights| heights.first().copied());
-            let trace = claims.generate_trace(child_vk, proofs, &preflights, required)?;
-            ctx_per_trace.push(AirProvingContext::simple(trace, Vec::new()));
-        }
-        if let Some(checkpoint) = self.constraint_checkpoint {
-            let required = statement_required.and_then(|heights| heights.get(1).copied());
             let (trace, public_values) = checkpoint.generate_trace(&preflights, required)?;
             ctx_per_trace.push(AirProvingContext::simple(trace, public_values));
         }
@@ -2162,18 +1911,6 @@ pub mod cuda_tracegen {
                 let required = statement_required.and_then(|heights| heights.first().copied());
                 statement_traces.push(checkpoint.generate_trace(&preflights_cpu, required)?);
             }
-            if let Some(claims) = self.constraint_claims {
-                let required = statement_required.and_then(|heights| heights.first().copied());
-                statement_traces.push((
-                    claims.generate_trace(child_vk, proofs, &preflights_cpu, required)?,
-                    Vec::new(),
-                ));
-            }
-            if let Some(checkpoint) = self.constraint_checkpoint {
-                let required = statement_required.and_then(|heights| heights.get(1).copied());
-                statement_traces.push(checkpoint.generate_trace(&preflights_cpu, required)?);
-            }
-
             // NOTE: avoid par_iter for now so H2D transfer all happens on same stream to avoid sync
             // issues
             let preflights_gpu = zip(proofs, preflights_cpu)
@@ -2187,9 +1924,7 @@ pub mod cuda_tracegen {
                 TraceModuleRef::ProofShape(&self.proof_shape),
                 TraceModuleRef::Gkr(&self.gkr),
             ];
-            if self.tail_mode.includes_stacking() {
-                modules.push(TraceModuleRef::Stacking(&self.stacking));
-            }
+            modules.push(TraceModuleRef::Stacking(&self.stacking));
             if self.tail_mode.includes_whir() {
                 modules.push(TraceModuleRef::Whir(&self.whir));
             }

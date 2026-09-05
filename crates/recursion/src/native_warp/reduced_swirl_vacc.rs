@@ -667,7 +667,7 @@ pub fn reduced_swirl_authoritative_claim_digest(
     if claim.roots.is_empty()
         || claim.roots.len() > profile.source.maximum_roots_per_source
         || claim.roots.len() != claim.widths.len()
-        || claim.widths.iter().any(|&width| width == 0)
+        || claim.widths.contains(&0)
         || claim.alpha.len() != profile.source.log_codeword_len()
         || claim.alpha.iter().any(|&value| value != EF::ZERO)
         || claim.beta.len() != profile.source.log_message_len()
@@ -789,7 +789,7 @@ fn authoritative_claim_observations(
     if claim.roots.is_empty()
         || claim.roots.len() > profile.source.maximum_roots_per_source
         || claim.roots.len() != claim.widths.len()
-        || claim.widths.iter().any(|&width| width == 0)
+        || claim.widths.contains(&0)
         || claim.alpha.len() != profile.source.log_codeword_len()
         || claim.alpha.iter().any(|&value| value != EF::ZERO)
         || claim.beta.len() != profile.source.log_message_len()
@@ -1896,7 +1896,7 @@ where
                 // Call zero owns the complete transcript prefix and starts at
                 // the canonical `(tidx=0, state=0)`. Continuations are suffix
                 // traces resumed at the preceding authenticated call end.
-                tidx: (local.prior_count * local.batch_start_tidx).into(),
+                tidx: local.prior_count * local.batch_start_tidx,
                 state: local.start_state.map(Into::into),
             },
             active.clone(),
@@ -1994,80 +1994,6 @@ fn adapter_trace_height(rows: usize, minimum: usize) -> usize {
     rows.max(minimum).next_power_of_two()
 }
 
-pub fn generate_reduced_swirl_vacc_schedule_trace(
-    profile: &ReducedSwirlVaccProfile,
-    source_count: usize,
-    calls: &[ReducedSwirlVaccCallRecord],
-) -> Result<RowMajorMatrix<F>, &'static str> {
-    profile.validate()?;
-    let expected = reduced_swirl_vacc_schedule(source_count, profile.input_arity)?;
-    if calls.len() != expected.len() || calls.is_empty() {
-        return Err("reduced-SWIRL VACC schedule record count");
-    }
-    let header_end = reduced_swirl_vacc_header_elements(profile, source_count)?.len() * D_EF;
-    let width = ReducedSwirlVaccScheduleCols::<F>::width();
-    let height = adapter_trace_height(calls.len(), profile.maximum_call_count());
-    let mut values = F::zero_vec(width * height);
-    for (index, (record, &expected_call)) in calls.iter().zip(&expected).enumerate() {
-        if record.call != expected_call
-            || record.batch_start_tidx
-                != if index == 0 {
-                    header_end
-                } else {
-                    calls[index - 1].vacc_end_tidx
-                }
-            || record.vacc_start_tidx
-                != record.batch_start_tidx
-                    + (8 + REDUCED_SWIRL_VACC_SOURCE_BATCH_TAG.len()
-                        + 3 * 8
-                        + DIGEST_SIZE * record.call.fresh_count)
-                        * D_EF
-            || record.end_sample_count > CHUNK
-            || record.output_root.iter().all(|&value| value == F::ZERO)
-            || record.output_digest.iter().all(|&value| value == F::ZERO)
-            || (index == 0
-                && (record.prior_root.is_some()
-                    || record.prior_digest.is_some()
-                    || record.start_sample_count != 0
-                    || record.start_state != [F::ZERO; POSEIDON2_WIDTH]))
-            || (index != 0
-                && (record.prior_root != Some(calls[index - 1].output_root)
-                    || record.prior_digest != Some(calls[index - 1].output_digest)
-                    || record.start_sample_count != calls[index - 1].end_sample_count
-                    || record.start_state != calls[index - 1].end_state))
-        {
-            return Err("reduced-SWIRL VACC schedule record");
-        }
-        let row = &mut values[index * width..(index + 1) * width];
-        let cols: &mut ReducedSwirlVaccScheduleCols<F> = row.borrow_mut();
-        cols.active = F::ONE;
-        cols.chunk_last = F::from_bool(index + 1 == calls.len());
-        cols.is_last = F::from_bool(index + 1 == calls.len());
-        cols.local_proof_idx = F::from_usize(index);
-        cols.step = F::from_usize(record.call.step);
-        cols.source_count = F::from_usize(source_count);
-        cols.source_start = F::from_usize(record.call.source_start);
-        cols.fresh_count = F::from_usize(record.call.fresh_count);
-        cols.prior_count = F::from_usize(record.call.prior_count);
-        cols.batch_start_tidx = F::from_usize(record.batch_start_tidx);
-        cols.vacc_start_tidx = F::from_usize(record.vacc_start_tidx);
-        cols.vacc_end_tidx = F::from_usize(record.vacc_end_tidx);
-        cols.fresh_selector[record.call.fresh_count] = F::ONE;
-        cols.start_sample_count = F::from_usize(record.start_sample_count);
-        cols.start_state = record.start_state;
-        cols.end_sample_count = F::from_usize(record.end_sample_count);
-        cols.end_state = record.end_state;
-        cols.prior_root = record.prior_root.unwrap_or([F::ZERO; DIGEST_SIZE]);
-        cols.output_root = record.output_root;
-        cols.prior_digest = record.prior_digest.unwrap_or([F::ZERO; DIGEST_SIZE]);
-        cols.output_digest = record.output_digest;
-    }
-    Ok(RowMajorMatrix::new(values, width))
-}
-
-/// One fixed-capacity recursive-leaf slice of the canonical global schedule.
-/// Global call/source indices and absolute transcript positions are retained;
-/// only `local_proof_idx` is rebased to the physical leaf.
 pub fn generate_reduced_swirl_vacc_schedule_range_trace(
     profile: &ReducedSwirlVaccProfile,
     total_source_count: usize,
@@ -3241,7 +3167,7 @@ where
         self.entry_digest_bus.lookup_key(
             builder,
             ReducedSwirlSourceEntryDigestMessage {
-                source: (AB::Expr::from(local.source_offset) + local.source).into(),
+                source: AB::Expr::from(local.source_offset) + local.source,
                 digest: local.entry_digest.map(Into::into),
             },
             local.active,
@@ -3356,20 +3282,6 @@ fn reduced_swirl_manifest_digest_with_log(
         return Err("reduced-SWIRL manifest transcript mismatch");
     }
     Ok((digest, TranscriptHistory::into_log(transcript)))
-}
-
-pub fn generate_reduced_swirl_manifest_digest_trace(
-    maximum_sources: usize,
-    entry_digests: &[Digest],
-) -> Result<
-    (
-        RowMajorMatrix<F>,
-        Digest,
-        TranscriptLog<F, [F; POSEIDON2_WIDTH]>,
-    ),
-    &'static str,
-> {
-    generate_reduced_swirl_manifest_digest_range_trace(0, maximum_sources, entry_digests)
 }
 
 /// Generate the canonical local manifest for a bounded source interval while
@@ -3495,7 +3407,7 @@ pub struct ReducedSwirlManifestReconciliationCols<T> {
     pub chain_after: [T; DIGEST_SIZE],
 }
 
-/// Setup-fixed reconciliation of the old flat terminal manifest with the
+/// Setup-fixed reconciliation of the canonical terminal manifest with the
 /// WARP-call rolling commitment authenticated by transition leaves.  Every
 /// source is consumed exactly once under its global index.  Heterogeneity is
 /// in private digest values only; the schedule and relation shape are fixed by
@@ -4157,7 +4069,7 @@ where
             builder,
             ReducedSwirlVaccChainEndMessage {
                 source_count: local.total_source_count.into(),
-                call_count: (AB::Expr::from(local.call_index) + AB::Expr::ONE).into(),
+                call_count: AB::Expr::from(local.call_index) + AB::Expr::ONE,
                 proof_idx: local.call_index.into(),
                 footer_start_tidx: local.vacc_end_tidx.into(),
                 final_accumulator_digest: local.output_digest.map(Into::into),
@@ -4385,38 +4297,6 @@ where
             local.active,
         );
     }
-}
-
-pub fn generate_reduced_swirl_vacc_footer_range_trace(
-    profile: &ReducedSwirlVaccProfile,
-    source_count: usize,
-    call_count: usize,
-    last: &ReducedSwirlVaccCallRecord,
-    manifest_digest: Digest,
-    local_proof_idx: usize,
-) -> Result<RowMajorMatrix<F>, &'static str> {
-    if call_count == 0 || last.call.step + 1 != call_count {
-        return Err("reduced-SWIRL VACC footer call count");
-    }
-    generate_reduced_swirl_vacc_footer_record_trace(
-        profile,
-        source_count,
-        call_count,
-        last.call.step,
-        local_proof_idx,
-        last.vacc_end_tidx,
-        last.vacc_end_tidx
-            .checked_add(
-                reduced_swirl_vacc_footer_elements(source_count, manifest_digest)?
-                    .len()
-                    .checked_mul(D_EF)
-                    .ok_or("reduced-SWIRL footer width overflow")?,
-            )
-            .ok_or("reduced-SWIRL footer interval overflow")?,
-        manifest_digest,
-        last.output_digest,
-        last.output_root,
-    )
 }
 
 /// Generate the one-row VACC footer from an already authenticated terminal

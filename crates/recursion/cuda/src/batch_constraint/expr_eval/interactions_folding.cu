@@ -86,8 +86,6 @@ __global__ void interactions_folding_tracegen(
     idx_keys[global_row_idx].y = sort_idx;
 
     uint32_t air_start_interaction_idx = sort_idx == 0 ? 0 : interaction_bounds[sort_idx - 1];
-    uint32_t air_end_interaction_idx = interaction_bounds[sort_idx] - 1;
-
     auto [interaction_num_rows, global_start_row, stacked_idx] =
         records[proof_idx][global_interaction_idx];
     uint32_t interaction_idx = global_interaction_idx - air_start_interaction_idx;
@@ -100,8 +98,6 @@ __global__ void interactions_folding_tracegen(
     bool is_first_in_message = interaction_row_idx == 0;
     bool is_last_in_message = interaction_row_idx + 1 == interaction_num_rows;
     bool is_first_in_air = is_first_in_message && interaction_idx == 0;
-    bool is_last_in_air = global_interaction_idx == air_end_interaction_idx && is_last_in_message;
-    bool is_last_in_proof = is_last_in_air && sort_idx + 1 == num_airs[proof_idx];
 
     COL_WRITE_VALUE(row, InteractionsFoldingCols, is_valid, Fp::one());
     COL_WRITE_VALUE(row, InteractionsFoldingCols, is_first, is_first_in_air && sort_idx == 0);
@@ -215,7 +211,6 @@ __global__ void interactions_folding_tracegen_dynamic(
     idx_keys[global_row_idx].y = sort_idx;
 
     uint32_t air_start_interaction_idx = sort_idx == 0 ? 0 : interaction_bounds[sort_idx - 1];
-    uint32_t air_end_interaction_idx = interaction_bounds[sort_idx] - 1;
 
     auto [interaction_num_rows, global_start_row, stacked_idx] =
         records[proof_idx][global_interaction_idx];
@@ -229,8 +224,6 @@ __global__ void interactions_folding_tracegen_dynamic(
     bool is_first_in_message = interaction_row_idx == 0;
     bool is_last_in_message = interaction_row_idx + 1 == interaction_num_rows;
     bool is_first_in_air = is_first_in_message && interaction_idx == 0;
-    bool is_last_in_air = global_interaction_idx == air_end_interaction_idx && is_last_in_message;
-    bool is_last_in_proof = is_last_in_air && sort_idx + 1 == num_airs[proof_idx];
 
     COL_WRITE_VALUE(row, InteractionsFoldingCols, is_valid, Fp::one());
     COL_WRITE_VALUE(row, InteractionsFoldingCols, is_first, is_first_in_air && sort_idx == 0);

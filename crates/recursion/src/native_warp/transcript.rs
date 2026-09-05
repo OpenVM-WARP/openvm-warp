@@ -65,7 +65,7 @@ impl NativeWarpTranscriptModule {
         )
     }
 
-    /// Build the history transcript with two authenticated intermediate
+    /// Build the VACC transcript with two authenticated intermediate
     /// checkpoints (pre-VACC and post-VACC).  Other recursive transcripts keep
     /// their existing width and bus inventory.
     #[must_use]
@@ -91,7 +91,7 @@ impl NativeWarpTranscriptModule {
     ///
     /// Native terminal-WHIR verification has its own transcript namespace but
     /// contributes permutations to the same Poseidon table as the VACC
-    /// history. Accepting the bus directly avoids allocating an otherwise
+    /// transition verifier. Accepting the bus directly avoids allocating an otherwise
     /// unused native-PCD bus inventory.
     #[must_use]
     pub fn new_for_bus(

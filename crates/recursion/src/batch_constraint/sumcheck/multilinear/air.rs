@@ -15,8 +15,7 @@ use p3_matrix::Matrix;
 use crate::{
     batch_constraint::bus::{
         BatchConstraintConductorBus, BatchConstraintConductorMessage,
-        BatchConstraintInnerMessageType, LogUpOnlyOpeningPointBus, LogUpOnlyOpeningPointMessage,
-        SumcheckClaimBus, SumcheckClaimMessage,
+        BatchConstraintInnerMessageType, SumcheckClaimBus, SumcheckClaimMessage,
     },
     bus::{
         ConstraintSumcheckRandomness, ConstraintSumcheckRandomnessBus, StackingModuleBus,
@@ -70,8 +69,6 @@ pub struct MultilinearSumcheckAir {
     pub randomness_bus: ConstraintSumcheckRandomnessBus,
     pub batch_constraint_conductor_bus: BatchConstraintConductorBus,
     pub stacking_module_bus: StackingModuleBus,
-    /// Present only in the partial LogUp-only verifier.
-    pub opening_point_export_bus: Option<LogUpOnlyOpeningPointBus>,
 }
 
 impl<F> BaseAirWithPublicValues<F> for MultilinearSumcheckAir {}
@@ -320,17 +317,6 @@ where
             },
             local.is_first_eval * is_not_dummy.clone(),
         );
-        if let Some(bus) = self.opening_point_export_bus {
-            bus.send(
-                builder,
-                local.proof_idx,
-                LogUpOnlyOpeningPointMessage {
-                    index: local.round_idx + AB::Expr::ONE,
-                    value: local.r.map(Into::into),
-                },
-                local.is_first_eval * is_not_dummy.clone(),
-            );
-        }
         // Here idx > 0 and all idx are distinct within one proof_idx
         self.batch_constraint_conductor_bus.add_key_with_lookups(
             builder,

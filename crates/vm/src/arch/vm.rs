@@ -1641,12 +1641,6 @@ where
         self.metered_artifact_path = Some(path.into());
     }
 
-    /// Clear the selected native metering artifact and compile metering code on the next run.
-    #[cfg(feature = "rvr")]
-    pub fn clear_metered_artifact_path(&mut self) {
-        self.metered_artifact_path = None;
-    }
-
     #[instrument(name = "vm.reset_state", level = "debug", skip_all)]
     pub fn reset_state(&mut self, inputs: impl Into<Streams<Val<E::SC>>>) {
         let state = self.state.as_mut().unwrap();

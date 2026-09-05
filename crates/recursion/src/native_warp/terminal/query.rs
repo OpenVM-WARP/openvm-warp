@@ -57,9 +57,6 @@ pub struct NativeTerminalWhirQueryCols<T> {
     pub raw_omega: T,
     pub subgroup_root: T,
     pub coordinate_exponent: T,
-    pub coordinate_coset_bit: T,
-    pub is_coefficient_initial: T,
-    pub round_inverse: T,
     pub yi: [T; D_EF],
     pub gamma: [T; D_EF],
     pub gamma_pow: [T; D_EF],
@@ -87,9 +84,6 @@ pub struct NativeTerminalWhirQueryAir {
     /// Scalar rows are evaluations on a `2^k` coset. Their authenticated
     /// coset root and post-fold query point are distinct values.
     pub evaluation_layout: bool,
-    /// The first scalar oracle uses the parity-aware coefficient two-coset
-    /// coordinate map `2t+b -> g^b * omega^t`.
-    pub coefficient_two_coset_initial: bool,
 }
 
 impl BaseAirWithPublicValues<F> for NativeTerminalWhirQueryAir {}
@@ -167,7 +161,6 @@ where
         same.assert_eq(next.query_domain_size, local.query_domain_size);
         same.assert_eq(next.omega, local.omega);
         same.assert_eq(next.raw_omega, local.raw_omega);
-        same.assert_eq(next.is_coefficient_initial, local.is_coefficient_initial);
         assert_array_eq(&mut same, next.gamma, local.gamma);
         assert_array_eq(
             &mut same,
@@ -190,19 +183,7 @@ where
         advance.assert_eq(local.query_domain_size, next.query_domain_size * AB::F::TWO);
         advance.assert_eq(next.omega, local.omega * local.omega);
         if self.evaluation_layout {
-            // The coefficient two-coset first oracle and the ordinary scalar
-            // oracle in round one share the same order-2^(m-1) subgroup.
-            // Every subsequent WHIR round squares that subgroup generator.
-            if self.coefficient_two_coset_initial {
-                advance
-                    .when(local.is_coefficient_initial)
-                    .assert_eq(next.raw_omega, local.raw_omega);
-                advance
-                    .when(AB::Expr::ONE - local.is_coefficient_initial)
-                    .assert_eq(next.raw_omega, local.raw_omega * local.raw_omega);
-            } else {
-                advance.assert_eq(next.raw_omega, local.raw_omega * local.raw_omega);
-            }
+            advance.assert_eq(next.raw_omega, local.raw_omega * local.raw_omega);
         }
 
         assert_array_eq(
@@ -252,39 +233,14 @@ where
             local.active,
         );
         if self.evaluation_layout {
-            let initial_raw_omega = F::two_adic_generator(
-                self.initial_log_domain_size - usize::from(self.coefficient_two_coset_initial),
-            );
+            let initial_raw_omega = F::two_adic_generator(self.initial_log_domain_size);
             builder
                 .when_first_row()
                 .when(local.active)
                 .assert_eq(local.raw_omega, initial_raw_omega);
-            builder.assert_bool(local.coordinate_coset_bit);
-            builder.assert_bool(local.is_coefficient_initial);
-            if self.coefficient_two_coset_initial {
-                builder
-                    .when(local.active * local.is_coefficient_initial)
-                    .assert_zero(local.round);
-                builder
-                    .when(local.active * (AB::Expr::ONE - local.is_coefficient_initial))
-                    .assert_one(local.round * local.round_inverse);
-            } else {
-                builder
-                    .when(local.active)
-                    .assert_zero(local.is_coefficient_initial);
-            }
             builder
-                .when(local.active * local.is_coefficient_initial)
-                .assert_eq(
-                    local.merkle_index,
-                    AB::Expr::TWO * local.coordinate_exponent + local.coordinate_coset_bit,
-                );
-            builder
-                .when(local.active * (AB::Expr::ONE - local.is_coefficient_initial))
+                .when(local.active)
                 .assert_eq(local.coordinate_exponent, local.merkle_index);
-            builder
-                .when(local.active * (AB::Expr::ONE - local.is_coefficient_initial))
-                .assert_zero(local.coordinate_coset_bit);
             self.exp_bits_len_bus.lookup_key(
                 builder,
                 ExpBitsLenMessage {
@@ -295,11 +251,9 @@ where
                 },
                 local.active,
             );
-            let coset_multiplier =
-                AB::Expr::ONE + local.coordinate_coset_bit * (AB::F::GENERATOR - AB::F::ONE);
             builder
                 .when(local.active)
-                .assert_eq(local.zi_root, local.subgroup_root * coset_multiplier);
+                .assert_eq(local.zi_root, local.subgroup_root);
             self.exp_bits_len_bus.lookup_key(
                 builder,
                 ExpBitsLenMessage {
@@ -436,12 +390,7 @@ pub fn generate_native_terminal_whir_query_trace(
         // Merkle queries range over the remaining row domain.
         let omega = F::two_adic_generator(initial_log_domain_size - k - round_index);
         let evaluation_layout = layout != TerminalWhirLayout::VectorAlphabet;
-        let coefficient_initial = evaluation_layout
-            && layout == TerminalWhirLayout::ScalarCoefficientTwoCoset
-            && round_index == 0;
-        let raw_omega = if coefficient_initial {
-            F::two_adic_generator(initial_log_domain_size.checked_sub(1)?)
-        } else if evaluation_layout {
+        let raw_omega = if evaluation_layout {
             F::two_adic_generator(usize::try_from(round.log_rs_domain_size).ok()?)
         } else {
             F::ZERO
@@ -492,22 +441,11 @@ pub fn generate_native_terminal_whir_query_trace(
                 if zi_root.exp_power_of_2(k) != zi {
                     return None;
                 }
-                let coset_bit = usize::from(coefficient_initial && merkle_index & 1 == 1);
-                let coordinate_exponent = if coefficient_initial {
-                    merkle_index >> 1
-                } else {
-                    merkle_index
-                };
                 cols.zi_root = zi_root;
                 cols.zi = zi;
                 cols.raw_omega = raw_omega;
-                cols.coordinate_exponent = F::from_u32(coordinate_exponent);
-                cols.coordinate_coset_bit = F::from_usize(coset_bit);
-                cols.is_coefficient_initial = F::from_bool(coefficient_initial);
-                if layout == TerminalWhirLayout::ScalarCoefficientTwoCoset && !coefficient_initial {
-                    cols.round_inverse = F::from_usize(round_index).inverse();
-                }
-                cols.subgroup_root = raw_omega.exp_u64(u64::from(coordinate_exponent));
+                cols.coordinate_exponent = F::from_u32(merkle_index);
+                cols.subgroup_root = raw_omega.exp_u64(u64::from(merkle_index));
             } else {
                 cols.zi_root = zi;
                 cols.zi = zi;

@@ -452,11 +452,6 @@ impl<'a> ReducedSwirlNativeCpuStream<'a> {
     }
 
     #[must_use]
-    pub fn expected_next_source_index(&self) -> usize {
-        self.source_bindings.len()
-    }
-
-    #[must_use]
     pub fn pending_source_count(&self) -> usize {
         self.pending_sources.len()
     }

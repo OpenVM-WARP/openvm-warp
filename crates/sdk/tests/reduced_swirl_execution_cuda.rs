@@ -117,19 +117,9 @@ fn segmented_cuda_vm_reuses_original_stacking_codewords_for_every_source() -> Re
     execution
         .native
         .telemetry
-        .assert_no_duplicate_payload_pipeline()
+        .assert_resident_terminal_contract()
         .map_err(eyre::Report::msg)?;
-    assert_eq!(execution.native.telemetry.fresh_reencodes, 0);
-    assert_eq!(execution.native.telemetry.fresh_recommits, 0);
-    assert_eq!(execution.native.telemetry.accumulator_spill_count, 0);
-    assert_eq!(execution.native.telemetry.accumulator_restore_count, 0);
     assert_eq!(execution.native.telemetry.terminal_reused_initial_roots, 1);
-    assert_eq!(execution.native.telemetry.terminal_accumulator_reencodes, 0);
-    assert_eq!(execution.native.telemetry.terminal_accumulator_recommits, 0);
-    assert_eq!(
-        execution.native.telemetry.terminal_full_message_d2h_bytes,
-        0
-    );
 
     let verification = verify_reduced_swirl_native_recorded(
         execution.setup.cpu_setup(),

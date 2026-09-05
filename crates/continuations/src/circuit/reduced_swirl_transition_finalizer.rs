@@ -1042,7 +1042,7 @@ where
             ReducedSwirlVaccChainEndMessage {
                 source_count: local.reconciliation.source_count.into(),
                 call_count: local.reconciliation.call_count.into(),
-                proof_idx: (AB::Expr::from(local.reconciliation.call_count) - AB::Expr::ONE).into(),
+                proof_idx: AB::Expr::from(local.reconciliation.call_count) - AB::Expr::ONE,
                 footer_start_tidx: local.final_state.transcript_tidx.into(),
                 final_accumulator_digest: local.final_state.accumulator_digest.map(Into::into),
                 final_accumulator_root: local.final_state.accumulator_root.map(Into::into),
@@ -1379,7 +1379,7 @@ mod tests {
         baby_bear_poseidon2::{
             BabyBearPoseidon2Config as NativeSC, BabyBearPoseidon2CpuEngine, DuplexSponge,
         },
-        native_warp_history_params_with_100_bits_security,
+        internal_params_with_100_bits_security,
     };
 
     use super::*;
@@ -1436,7 +1436,7 @@ mod tests {
 
     fn test_vk() -> MultiStarkVerifyingKey<NativeSC> {
         let engine: BabyBearPoseidon2CpuEngine<DuplexSponge> =
-            BabyBearPoseidon2CpuEngine::new(native_warp_history_params_with_100_bits_security());
+            BabyBearPoseidon2CpuEngine::new(internal_params_with_100_bits_security());
         let airs: Vec<AirRef<NativeSC>> = (0..=CONSTRAINT_EVAL_AIR_ID)
             .map(|air_id| {
                 Arc::new(TestAir {
@@ -1864,8 +1864,7 @@ mod tests {
                 ReducedSwirlVaccChainEndMessage {
                     source_count: local.reconciliation.source_count.into(),
                     call_count: local.reconciliation.call_count.into(),
-                    proof_idx: (AB::Expr::from(local.reconciliation.call_count) - AB::Expr::ONE)
-                        .into(),
+                    proof_idx: AB::Expr::from(local.reconciliation.call_count) - AB::Expr::ONE,
                     footer_start_tidx: local.final_state.transcript_tidx.into(),
                     final_accumulator_digest: local.final_state.accumulator_digest.map(Into::into),
                     final_accumulator_root: local.final_state.accumulator_root.map(Into::into),

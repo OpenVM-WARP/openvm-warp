@@ -212,11 +212,11 @@ pub struct ReducedSwirlVaccTranscriptCursorAir {
     /// continuation must include it because its typed prior consumers are
     /// active. This permits exactly that one protocol-prescribed skip.
     pub dynamic_optional_prior: bool,
-    /// Scalar and Appendix-D fresh commitments have dedicated consumers on
-    /// `role_bus`.  The reduced stacked-RS path instead authenticates every
-    /// descriptor field and original root directly at its exact transcript
-    /// index on `semantic_bus`; emitting a second role lookup there would be
-    /// an unconsumed duplicate statement.
+    /// Standalone fresh commitments have dedicated consumers on `role_bus`.
+    /// The reduced stacked-RS path instead authenticates every descriptor
+    /// field and original root directly at its exact transcript index on
+    /// `semantic_bus`; emitting a second role lookup there would be an
+    /// unconsumed duplicate statement.
     pub emit_fresh_root_role: bool,
 }
 

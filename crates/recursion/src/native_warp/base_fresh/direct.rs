@@ -44,11 +44,6 @@ const DIRECT_ROOT_FIELDS: usize = 2 + DIGEST_SIZE;
 pub const NATIVE_DIRECT_FRESH_PROJECTION_PACKING: usize = 32;
 const NATIVE_DIRECT_FRESH_PROJECTION_EXTRA: usize = NATIVE_DIRECT_FRESH_PROJECTION_PACKING - 1;
 
-#[must_use]
-pub const fn native_direct_fresh_header_width(max_roots: usize) -> usize {
-    DIRECT_HEADER_FIXED_FIELDS + D_EF + max_roots * DIRECT_ROOT_FIELDS
-}
-
 #[repr(C)]
 #[derive(AlignedBorrow, StructReflection)]
 pub struct NativeDirectFreshCommitmentCols<T> {
@@ -1646,7 +1641,7 @@ mod tests {
     }
 
     #[test]
-    fn packed_projection_stays_within_the_history_degree_bound() {
+    fn packed_projection_stays_within_the_wrapper_degree_bound() {
         let engine = crate::tests::test_engine_small();
         let airs = any_air_arc_vec![projection_air(0, false)];
         let (_pk, vk) = engine.keygen(&airs);

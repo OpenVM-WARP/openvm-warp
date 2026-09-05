@@ -14,7 +14,6 @@ pub mod ext;
 pub mod layout;
 pub mod leaf_hash;
 pub mod multiproof;
-#[path = "product_opening/accumulator.rs"]
 pub mod prior_accumulator;
 pub mod reduced_swirl_source;
 pub mod reduced_swirl_terminal;

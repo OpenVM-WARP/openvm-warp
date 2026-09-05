@@ -289,7 +289,6 @@ impl NativeStandardVaccProfile {
 
     /// Canonical relation digest paired with the private canonical
     /// description used to construct this complete profile.
-    #[must_use]
     pub const fn relation_digest(&self) -> Digest {
         self.relation_digest
     }

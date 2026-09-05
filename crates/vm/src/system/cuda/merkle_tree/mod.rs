@@ -1009,7 +1009,7 @@ mod tests {
         );
         cpu_merkle_chip.finalize(&initial_memory.memory, &BTreeMap::new(), &cpu_hasher_chip);
 
-        let mut empty_touch = vec![0u32; MERKLE_TOUCHED_BLOCK_WIDTH];
+        let mut empty_touch = [0u32; MERKLE_TOUCHED_BLOCK_WIDTH];
         // The record header is ordinary integer metadata, not a field element.
         empty_touch[0] = openvm_circuit::arch::ADDR_SPACE_OFFSET;
         let empty_touch = empty_touch.to_device_on(&device_ctx).unwrap();
