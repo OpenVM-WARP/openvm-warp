@@ -282,7 +282,7 @@ impl BatchConstraintModule {
     }
 
     /// Internal expression-claim permutation bus, exposed for sound partial
-    /// assemblies such as protocol-v19's interaction-only LogUp verifier.
+    /// assemblies such as reduced-SWIRL's interaction-only LogUp verifier.
     #[must_use]
     pub const fn expression_claim_bus(&self) -> ExpressionClaimBus {
         self.expression_claim_bus

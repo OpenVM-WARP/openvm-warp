@@ -2,8 +2,8 @@
 //!
 //! The leaf combines the existing deferred-SWIRL verifier prefix with the
 //! genuine ordinary-WARP VACC verifier.  Their typed receipts are joined in
-//! one AIR, so no host equality or detached certificate stands between the
-//! source claim and the fresh input consumed by WARP.
+//! one AIR, so typed bus equality directly binds the source claim and the
+//! fresh input consumed by WARP.
 
 use core::borrow::{Borrow, BorrowMut};
 use std::sync::Arc;

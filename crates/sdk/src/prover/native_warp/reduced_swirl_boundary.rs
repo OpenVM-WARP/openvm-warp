@@ -15,10 +15,9 @@ use openvm_stark_backend::{
         PendingConstrainedCodeWitness, ProverBackend,
     },
     warp_accum::{
-        observe_stacked_rs_commitment_prefix, ReducedConstrainedCodeClaim,
-        ReducedConstrainedCodeRelation, StackedRsFreshCommitment, SwirlConstrainedRsRelation,
+        ReducedConstrainedCodeClaim, ReducedConstrainedCodeRelation, StackedRsFreshCommitment,
+        SwirlConstrainedRsRelation,
     },
-    warp_pesat::AlgebraicChallenger,
     FiatShamirTranscript,
 };
 use openvm_stark_sdk::config::baby_bear_poseidon2::{
@@ -33,8 +32,6 @@ const FIELD_TAG: u32 = 0x5253_0201;
 const DIGEST_TAG: u32 = 0x5253_0202;
 const EXTENSION_TAG: u32 = 0x5253_0203;
 const END_TAG: u32 = 0x5253_02ff;
-const SWIRL_REDUCED_CODE_THETA_TAG: &[u8] =
-    b"openvm.swirl.stacking-prefix.column-batching-theta.v2";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReducedSwirlVmState {
@@ -104,21 +101,6 @@ impl PendingConstrainedCodePublicClaim {
             push_extension_slice(&mut observations, opening)?;
         }
         digest_observations(SOURCE_DIGEST_TAG ^ 0x30, &observations)
-    }
-
-    pub fn derive_authoritative_constrained_rs_claim<Ch>(
-        &self,
-        row_zero_claim: OriginalRootProjectedRowZeroClaim,
-        challenger: &mut Ch,
-    ) -> Result<AuthoritativeSwirlConstrainedRsClaim, ReducedSwirlBoundaryError>
-    where
-        Ch: AlgebraicChallenger<EF>,
-    {
-        self.validate()?;
-        self.validate_row_zero_claim(&row_zero_claim)?;
-        observe_authoritative_theta_statement(self, challenger)?;
-        let theta = challenger.sample();
-        self.authoritative_constrained_rs_claim_for_theta(theta, row_zero_claim)
     }
 
     pub fn authoritative_constrained_rs_claim_for_theta(
@@ -258,12 +240,6 @@ impl AuthoritativeSwirlConstrainedRsClaim {
     #[must_use]
     pub const fn log_message_len(&self) -> usize {
         self.l_skip + self.n_stack
-    }
-
-    #[must_use]
-    pub fn has_canonical_codeword_point(&self) -> bool {
-        self.alpha.len() == self.log_message_len() + self.log_blowup
-            && self.alpha.iter().all(|value| *value == EF::ZERO)
     }
 
     pub fn digest(&self) -> Result<Digest, ReducedSwirlBoundaryError> {
@@ -487,51 +463,6 @@ fn push_vm_pvs(observations: &mut Vec<Observation>, vm: ReducedSwirlVmBoundary) 
     observations.push(Observation::Digest(vm.final_state.memory_root));
     observations.push(Observation::Field(vm.exit_code));
     observations.push(Observation::Field(vm.is_terminate));
-}
-
-fn observe_authoritative_theta_statement<Ch>(
-    claim: &PendingConstrainedCodePublicClaim,
-    challenger: &mut Ch,
-) -> Result<(), ReducedSwirlBoundaryError>
-where
-    Ch: AlgebraicChallenger<EF>,
-{
-    let point_dimension = claim.metadata.point_dimension();
-    let log_codeword_len = point_dimension
-        .checked_add(claim.metadata.log_blowup())
-        .ok_or(ReducedSwirlBoundaryError::CountOverflow(
-            "theta codeword dimension",
-        ))?;
-    let descriptor = StackedRsFreshCommitment {
-        roots: claim.metadata.ordered_commitments().to_vec(),
-        widths: claim.metadata.commitment_widths().to_vec(),
-        l_skip: claim.metadata.l_skip(),
-        native_log_message_len: point_dimension,
-        log_message_len: point_dimension,
-        log_codeword_len,
-        rows_per_query: checked_rows_per_query(&claim.metadata)?,
-        theta: EF::ZERO,
-    };
-    observe_theta_bytes(SWIRL_REDUCED_CODE_THETA_TAG, challenger);
-    observe_stacked_rs_commitment_prefix(&descriptor, challenger);
-    challenger.observe(EF::from_usize(claim.swirl_tilde_u.len()));
-    challenger.observe_slice(&claim.swirl_tilde_u);
-    challenger.observe(EF::from_usize(claim.stacking_openings.len()));
-    for opening in &claim.stacking_openings {
-        challenger.observe(EF::from_usize(opening.len()));
-        challenger.observe_slice(opening);
-    }
-    Ok(())
-}
-
-fn observe_theta_bytes<Ch>(bytes: &[u8], challenger: &mut Ch)
-where
-    Ch: AlgebraicChallenger<EF>,
-{
-    challenger.observe(EF::from_usize(bytes.len()));
-    for &byte in bytes {
-        challenger.observe(EF::from_u8(byte));
-    }
 }
 
 fn fold_ordered_openings(openings: &[Vec<EF>], theta: EF) -> EF {

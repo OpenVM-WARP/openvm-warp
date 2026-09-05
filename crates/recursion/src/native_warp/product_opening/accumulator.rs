@@ -12,24 +12,19 @@ use openvm_stark_backend::{
     },
     BaseAirWithPublicValues, PartitionedBaseAir,
 };
-use openvm_stark_sdk::config::baby_bear_poseidon2::{Digest, DIGEST_SIZE, D_EF, EF, F};
+use openvm_stark_sdk::config::baby_bear_poseidon2::{Digest, D_EF, EF, F};
 use p3_air::{Air, AirBuilder, BaseAir};
 use p3_field::{BasedVectorSpace, PrimeCharacteristicRing};
 use p3_matrix::{dense::RowMajorMatrix, Matrix};
 
-use crate::{
-    bus::TranscriptBus,
-    native_warp::{
-        bus::{
-            NativeAccumulatorRootBus, NativeAccumulatorRootMessage, NativeAuthenticatedShiftBus,
-            NativeAuthenticatedShiftMessage, NativeInputSlotLayoutBus,
-            NativeInputSlotLayoutMessage, NativeLeafValueBus, NativeLeafValueMessage,
-            NativeMerkleRootBus, NativeMerkleRootMessage, NativeShiftIndexBus,
-            NativeShiftIndexMessage,
-        },
-        leaf_hash::NativeLeafHashInput,
-        multiproof::NativeMerkleLeafAdapterInput,
+use crate::native_warp::{
+    bus::{
+        NativeAuthenticatedShiftBus, NativeAuthenticatedShiftMessage, NativeInputSlotLayoutBus,
+        NativeInputSlotLayoutMessage, NativeLeafValueBus, NativeLeafValueMessage,
+        NativeShiftIndexBus, NativeShiftIndexMessage,
     },
+    leaf_hash::NativeLeafHashInput,
+    multiproof::NativeMerkleLeafAdapterInput,
 };
 
 #[derive(Clone, Debug)]
@@ -144,108 +139,6 @@ impl<AB: AirBuilder<F = F> + InteractionBuilder> Air<AB> for NativeAccumulatorPr
     }
 }
 
-#[repr(C)]
-#[derive(AlignedBorrow, StructReflection)]
-pub struct NativePriorRootCols<T> {
-    pub active: T,
-    pub root: [T; DIGEST_SIZE],
-    pub proof_idx: T,
-    pub tidx: T,
-}
-
-#[derive(ColumnsAir)]
-#[columns_via(NativePriorRootCols<u8>)]
-pub struct NativePriorRootAir {
-    pub merkle_root_bus: NativeMerkleRootBus,
-    pub accumulator_root_bus: NativeAccumulatorRootBus,
-    pub transcript_bus: TranscriptBus,
-    /// The prior accumulator's outer tree id and depth.
-    ///
-    /// Both were witness columns fed straight into the Merkle root bus, so this
-    /// row could claim to authenticate any tree at any depth. There is exactly one
-    /// prior accumulator per step and its tree is fixed at keygen, so both are
-    /// constants.
-    pub expected_tree_id: usize,
-    pub expected_depth: usize,
-}
-
-impl BaseAirWithPublicValues<F> for NativePriorRootAir {}
-impl PartitionedBaseAir<F> for NativePriorRootAir {}
-impl<F> BaseAir<F> for NativePriorRootAir {
-    fn width(&self) -> usize {
-        NativePriorRootCols::<F>::width()
-    }
-}
-
-impl<AB: AirBuilder<F = F> + InteractionBuilder> Air<AB> for NativePriorRootAir {
-    fn eval(&self, builder: &mut AB) {
-        let main = builder.main();
-        let row = main.row_slice(0).expect("native prior root row");
-        let local: &NativePriorRootCols<AB::Var> = (*row).borrow();
-        builder.assert_bool(local.active);
-        self.merkle_root_bus.receive(
-            builder,
-            NativeMerkleRootMessage {
-                proof_idx: local.proof_idx.into(),
-                tree_id: AB::Expr::from_usize(self.expected_tree_id),
-                depth: AB::Expr::from_usize(self.expected_depth),
-                digest: local.root.map(Into::into),
-            },
-            local.active,
-        );
-        self.accumulator_root_bus.receive(
-            builder,
-            NativeAccumulatorRootMessage {
-                proof_idx: local.proof_idx.into(),
-                state: AB::Expr::ZERO,
-                digest: local.root.map(Into::into),
-            },
-            local.active,
-        );
-        for (limb, value) in local.root.into_iter().enumerate() {
-            let extension: [AB::Expr; D_EF] = core::array::from_fn(|coordinate| {
-                if coordinate == 0 {
-                    value.into()
-                } else {
-                    AB::Expr::ZERO
-                }
-            });
-            self.transcript_bus.observe_ext(
-                builder,
-                local.proof_idx,
-                local.tidx + AB::Expr::from_usize(limb * D_EF),
-                extension,
-                local.active,
-            );
-        }
-    }
-}
-
-/// `tree_id` and `depth` are the AIR's keygen constants rather than columns, so they
-/// are accepted here only to be checked: a caller disagreeing with the key would
-/// otherwise emit a row that authenticates a different tree than the one constrained.
-pub fn generate_native_prior_root_trace(
-    tree_id: usize,
-    depth: usize,
-    expected_tree_id: usize,
-    expected_depth: usize,
-    root: Digest,
-    proof_idx: usize,
-    tidx: usize,
-) -> Option<RowMajorMatrix<F>> {
-    if tree_id != expected_tree_id || depth != expected_depth {
-        return None;
-    }
-    let width = NativePriorRootCols::<F>::width();
-    let mut trace = vec![F::ZERO; width];
-    let cols: &mut NativePriorRootCols<F> = trace.as_mut_slice().borrow_mut();
-    cols.active = F::ONE;
-    cols.root = root;
-    cols.proof_idx = F::from_usize(proof_idx);
-    cols.tidx = F::from_usize(tidx);
-    Some(RowMajorMatrix::new(trace, width))
-}
-
 #[derive(Clone, Debug)]
 pub struct NativeAccumulatorProjectionTrace {
     pub matrix: RowMajorMatrix<F>,
@@ -270,40 +163,8 @@ impl NativeAccumulatorProjectionTrace {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn generate_native_accumulator_projection_trace<H>(
-    hasher: &H,
-    proof_idx: usize,
-    verification: &MerkleBatchOpeningVerification<EF, Digest>,
-    log_codeword_len: usize,
-    rows_per_query: usize,
-    row_tree_id_offset: usize,
-    outer_tree_id: u32,
-    prior_source: usize,
-    input_arity: usize,
-    required_height: Option<usize>,
-) -> Option<NativeAccumulatorProjectionTrace>
-where
-    H: MerkleHasher<F = F, Digest = Digest>,
-{
-    generate_native_accumulator_projection_trace_checked(
-        hasher,
-        proof_idx,
-        verification,
-        log_codeword_len,
-        rows_per_query,
-        row_tree_id_offset,
-        outer_tree_id,
-        prior_source,
-        input_arity,
-        required_height,
-    )
-    .ok()
-}
-
 /// Fallible projection generator with a stable failure label for untrusted
-/// native proof material. The legacy `Option` API above remains available to
-/// callers which do not need diagnostics.
+/// native proof material.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_native_accumulator_projection_trace_checked<H>(
     hasher: &H,

@@ -279,18 +279,6 @@ define_typed_permutation_bus!(
 
 #[repr(C)]
 #[derive(AlignedBorrow, Debug, Clone)]
-pub struct NativeTerminalLinearizerDescriptorMessage<T> {
-    pub tidx: T,
-    pub root: [T; DIGEST_SIZE],
-}
-
-define_typed_permutation_bus!(
-    NativeTerminalLinearizerDescriptorBus,
-    NativeTerminalLinearizerDescriptorMessage
-);
-
-#[repr(C)]
-#[derive(AlignedBorrow, Debug, Clone)]
 pub struct NativeTerminalLinearizerEndMessage<T> {
     pub tidx: T,
     pub root: [T; DIGEST_SIZE],

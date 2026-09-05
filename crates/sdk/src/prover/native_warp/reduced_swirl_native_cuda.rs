@@ -12,7 +12,7 @@
 //! spill/restore policy and no CPU source fallback.  The terminal prover reuses
 //! that accumulator's exact coefficient-subgroup codeword and Merkle root.
 
-use core::{fmt::Display, mem::size_of};
+use core::mem::size_of;
 use std::{sync::Arc, time::Instant};
 
 use openvm_circuit::arch::POSEIDON2_WIDTH;
@@ -26,23 +26,18 @@ use openvm_cuda_backend::{
     resident_warp::{
         CudaResidentWarpCode, CudaResidentWarpOpeningBackend, CudaResidentWarpProverData,
     },
-    stacked_reduction::StackedPcsData2,
     warp_batching_sumcheck::GpuBatchingSumcheck,
-    GpuBackend,
 };
 use openvm_cuda_common::{
     copy::pcie_counters,
     memory_manager::{device_memory_snapshot, DeviceMemorySnapshot},
     stream::GpuDeviceCtx,
 };
-use openvm_recursion_circuit::system::RetainedStackingProof;
 use openvm_stark_backend::{
     native_warp::NativeWarpChallenger,
     p3_field::{BasedVectorSpace, PrimeCharacteristicRing},
-    proof::{BatchConstraintProof, GkrProof, StackingProof},
-    prover::{NativeStackingReduction, PendingConstrainedCodeWitness},
     warp_accum::{
-        derive_swirl_constrained_rs_terminal_statement, finish_exact_finite_warp_call, Accumulator,
+        derive_swirl_constrained_rs_terminal_statement, finish_warp_call, Accumulator,
         ExternalCommittedConstrainedCodeSource, FieldElementDigestObserver,
         ReducedConstrainedCodeClaim, ReducedConstrainedCodeRelation, ReducedWarpVaccRootProof,
         StackedRsFreshCommitment, StackedRsOpeningBackend, TerminalDescriptor, WarpAccumError,
@@ -71,16 +66,6 @@ const REDUCED_SWIRL_NATIVE_SOURCE_BATCH_TAG: &[u8] =
 const REDUCED_SWIRL_NATIVE_MANIFEST_FOOTER_TAG: &[u8] =
     b"openvm.native-warp.swirl-reduced-source.manifest-footer.v3";
 
-pub type ReducedSwirlCudaPendingWitness =
-    PendingConstrainedCodeWitness<Digest, Vec<EF>, Vec<StackedPcsData2<Digest>>>;
-pub type ReducedSwirlCudaNativeReduction = NativeStackingReduction<
-    SC,
-    GpuBackend,
-    (GkrProof<SC>, BatchConstraintProof<SC>),
-    StackingProof<SC>,
-    Vec<EF>,
-    Vec<StackedPcsData2<Digest>>,
->;
 pub type ReducedSwirlCudaCode = CudaResidentWarpCode<
     <SC as StarkProtocolConfig>::Hasher,
     Poseidon2MerkleHash,
@@ -621,66 +606,6 @@ impl<'a> ReducedSwirlNativeCudaStream<'a> {
         }))
     }
 
-    /// Consume a genuine pending SWIRL source.  `source_challenger` is the
-    /// segment-prefix transcript used to derive SWIRL's theta challenge; the
-    /// block-wide WARP challenger remains independently owned by this stream.
-    pub fn push_pending<Ch>(
-        &mut self,
-        source_binding: Digest,
-        pending: ReducedSwirlCudaPendingWitness,
-        stacking_openings: &[Vec<EF>],
-        source_challenger: &mut Ch,
-    ) -> Result<(), ReducedSwirlNativeCudaError>
-    where
-        Ch: AlgebraicChallenger<EF>,
-    {
-        self.ensure_live()?;
-        let started = Instant::now();
-        let transfer_start = pcie_counters::snapshot();
-        let source = match CudaReducedSwirlConstrainedCodeSource::try_from_pending(
-            pending,
-            stacking_openings,
-            source_challenger,
-            self.setup.device_ctx.clone(),
-        ) {
-            Ok(source) => source,
-            Err(error) => {
-                self.poisoned = true;
-                return Err(ReducedSwirlNativeCudaError::Source(error));
-            }
-        };
-        let projection_ms = elapsed_ms(started);
-        let projection_transfers = transfer_delta(transfer_start, pcie_counters::snapshot());
-        self.push_source_with_projection_telemetry(
-            source_binding,
-            source,
-            projection_ms,
-            projection_transfers,
-        )
-    }
-
-    /// Split a native reduction exactly once.  The retained recursive prefix
-    /// is returned to the caller for the succinct wrapper; the opaque pending
-    /// PCS owner moves directly into this CUDA stream.
-    pub fn push_native_reduction<Ch>(
-        &mut self,
-        source_binding: Digest,
-        reduction: ReducedSwirlCudaNativeReduction,
-        source_challenger: &mut Ch,
-    ) -> Result<RetainedStackingProof, ReducedSwirlNativeCudaError>
-    where
-        Ch: AlgebraicChallenger<EF>,
-    {
-        let (retained, pending) = RetainedStackingProof::split_native_reduction(reduction);
-        self.push_pending(
-            source_binding,
-            pending,
-            &retained.stacking_proof.stacking_openings,
-            source_challenger,
-        )?;
-        Ok(retained)
-    }
-
     /// Accept an already constructed device-authoritative source.  This is
     /// useful when the caller owns the retained-prefix transcript machinery.
     pub fn push_source(
@@ -824,7 +749,7 @@ impl<'a> ReducedSwirlNativeCudaStream<'a> {
                 &accumulator_openings,
                 &self.accelerator,
             )?;
-        if let Some(boundary) = finish_exact_finite_warp_call(&mut self.challenger, step_index) {
+        if let Some(boundary) = finish_warp_call(&mut self.challenger, step_index) {
             record.transcript_phases.push(boundary);
         }
 
@@ -873,8 +798,7 @@ impl<'a> ReducedSwirlNativeCudaStream<'a> {
                 &fresh_verifier,
                 &accumulator_verifier,
             )?;
-        if let Some(boundary) = finish_exact_finite_warp_call(&mut verifier_challenger, step_index)
-        {
+        if let Some(boundary) = finish_warp_call(&mut verifier_challenger, step_index) {
             verification.transcript_phases.push(boundary);
         }
         let verifier_transcript = verifier_challenger.into_inner();
@@ -1121,47 +1045,6 @@ impl<'a> ReducedSwirlNativeCudaStream<'a> {
     }
 }
 
-/// Supplier-oriented adapter for callers that already stream pending owners.
-pub fn prove_reduced_swirl_native_cuda_streaming<Supply, SupplyError>(
-    setup: &ReducedSwirlNativeCudaSetup,
-    statement: ReducedSwirlNativeStatement,
-    mut supply: Supply,
-) -> Result<ReducedSwirlNativeCudaOutput, ReducedSwirlNativeCudaError>
-where
-    Supply: FnMut(
-        usize,
-    ) -> Result<
-        (
-            ReducedSwirlCudaPendingWitness,
-            Vec<Vec<EF>>,
-            NativeWarpChallenger<SC, DuplexSpongeRecorder>,
-        ),
-        SupplyError,
-    >,
-    SupplyError: Display,
-{
-    statement.validate()?;
-    let source_count = statement.source_bindings.len();
-    let mut stream = ReducedSwirlNativeCudaStream::new(setup, source_count)?;
-    for source_index in 0..source_count {
-        let (pending, openings, mut source_challenger) = supply(source_index)
-            .map_err(|error| ReducedSwirlNativeCudaError::SourceProvider(error.to_string()))?;
-        stream.push_pending(
-            statement.source_bindings[source_index],
-            pending,
-            &openings,
-            &mut source_challenger,
-        )?;
-    }
-    let output = stream.finish()?;
-    if output.native.proof.statement != statement {
-        return Err(ReducedSwirlNativeCudaError::State(
-            "streamed public statement mismatch",
-        ));
-    }
-    Ok(output)
-}
-
 fn validate_source(
     setup: &ReducedSwirlNativeCudaSetup,
     source: &CudaReducedSwirlConstrainedCodeSource,
@@ -1386,10 +1269,7 @@ fn copy_terminal_telemetry(
 #[cfg(all(test, feature = "test-utils"))]
 mod tests {
     use openvm_circuit::system::connector::DEFAULT_SUSPEND_EXIT_CODE;
-    use openvm_continuations::circuit::{
-        reduced_swirl_source_receipt::ReducedSwirlSourceReceiptBlock,
-        reduced_swirl_warp::ReducedSwirlSourceReceiptBus,
-    };
+    use openvm_continuations::circuit::reduced_swirl_warp::ReducedSwirlSourceReceiptBus;
     use openvm_cuda_backend::BabyBearPoseidon2GpuEngine;
     use openvm_recursion_circuit::{
         native_warp::{ReducedSwirlSourceAuthorityBus, ReducedSwirlSourceProfile},
@@ -1410,9 +1290,7 @@ mod tests {
         reduced_swirl_source_receipt::{
             reduced_swirl_source_receipt_profile, ProductionReducedSwirlSourceReceiptComponent,
         },
-        reduced_swirl_vacc_component::{
-            build_reduced_swirl_vacc_aggregate_record, ProductionReducedSwirlVaccComponent,
-        },
+        reduced_swirl_vacc_component::ProductionReducedSwirlVaccComponent,
     };
 
     #[test]
@@ -1485,8 +1363,6 @@ mod tests {
         let mut source_bindings = Vec::new();
         let mut incremental_records = Vec::new();
         let mut incremental_checkpoints = Vec::new();
-        let mut incremental_receipts = Vec::new();
-        let mut receipt_sources = Vec::new();
         for (source_index, (a, b)) in [(0, 1), (2, 3), (5, 8)].into_iter().enumerate() {
             let fixture = PreprocessedFibFixture::new(a, b, selectors.clone());
             let proving_context = engine
@@ -1533,7 +1409,7 @@ mod tests {
                 incremental_records.push(completed.verification.clone());
                 incremental_checkpoints.push(completed.end_checkpoint);
                 let source_end = completed.source_start + completed.fresh_count;
-                let source_packet = source_component.generate_cpu_in_flight_inline_packet(
+                let source_packet = source_component.generate_cpu_in_flight_packet(
                     &vk,
                     &retained[completed.source_start..source_end],
                     &wrapper_claims[completed.source_start..source_end],
@@ -1555,12 +1431,12 @@ mod tests {
                     ),
                     Err(crate::prover::native_warp::reduced_swirl_vacc_component::ReducedSwirlVaccComponentError::SourceBinding { .. })
                 ));
-                incremental_receipts.push((
-                    packet.receipt,
-                    packet.entry_digests,
-                    packet.manifest_digest,
-                ));
-                receipt_sources.extend(source_packet.block.sources);
+                assert_eq!(packet.entry_digests.len(), completed.fresh_count);
+                assert_eq!(
+                    packet.receipt.call_index,
+                    F::from_usize(completed.call_index)
+                );
+                assert_eq!(packet.receipt.manifest_digest, packet.manifest_digest);
             }
         }
         let output = stream.finish()?;
@@ -1573,7 +1449,6 @@ mod tests {
         assert_eq!(output.native.proof.statement, statement);
         assert_eq!(output.native.proof.vacc.steps.len(), 2);
         assert_eq!(incremental_records.len(), 2);
-        assert_eq!(incremental_receipts.len(), 2);
         assert_eq!(output.telemetry.maximum_pending_sources, 2);
         assert_eq!(output.telemetry.maximum_scheduled_fresh_count, 2);
         assert!(output
@@ -1593,28 +1468,6 @@ mod tests {
         );
         assert_eq!(verified.terminal.root, verified.final_instance.rt);
         assert_eq!(incremental_records, verified.transition_records);
-        let source_block = ReducedSwirlSourceReceiptBlock {
-            source_offset: 0,
-            sources: receipt_sources,
-            manifest_digest: statement.block_manifest_digest,
-        };
-        let aggregate_record = build_reduced_swirl_vacc_aggregate_record(
-            vacc_component.profile(),
-            &output.native,
-            &verified,
-            &source_block,
-        )?;
-        for (call_index, expected) in incremental_receipts.iter().enumerate() {
-            let legacy = vacc_component.generate_transition_cpu_packet(
-                &output.native,
-                &verified,
-                &aggregate_record,
-                call_index,
-            )?;
-            assert_eq!(&legacy.receipt, &expected.0);
-            assert_eq!(&legacy.entry_digests, &expected.1);
-            assert_eq!(&legacy.manifest_digest, &expected.2);
-        }
         for (checkpoint, record) in incremental_checkpoints
             .iter()
             .zip(&verified.transition_records)
@@ -1625,7 +1478,7 @@ mod tests {
                 .find(|phase| {
                     matches!(
                         phase.phase,
-                        openvm_stark_backend::warp_accum::NativeTranscriptPhase::ExactFiniteCallBoundary { .. }
+                        openvm_stark_backend::warp_accum::NativeTranscriptPhase::CallBoundary { .. }
                     )
                 })
                 .ok_or_else(|| eyre::eyre!("missing incremental call boundary"))?;

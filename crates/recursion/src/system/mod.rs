@@ -73,6 +73,7 @@ pub use logup_only::{
 pub mod frame;
 
 const BATCH_CONSTRAINT_MOD_IDX: usize = 0;
+#[cfg(feature = "cuda")]
 const TRANSCRIPT_MOD_IDX: usize = 1;
 /// The ordinary recursive lane verifies only a handful of children at once,
 /// but the reduced-SWIRL terminal wrapper can replay hundreds of deferred
@@ -436,11 +437,11 @@ pub struct RebasedTranscriptPreflight {
     pub state: [F; POSEIDON2_WIDTH],
 }
 
-/// The proof material retained by protocol-v19's segment LogUp verifier.
+/// Proof material retained at the reduced-SWIRL deferred-opening boundary.
 ///
 /// Stacking and WHIR data are deliberately absent. The conversion helper only
 /// supplies empty placeholders so the established trace generators can be
-/// reused while a partial assembly is being migrated to this input type.
+/// reused without constructing a complete WHIR proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetainedLogUpOnlyProof {
     pub common_main_commit: [F; CHUNK],
@@ -463,7 +464,7 @@ impl From<&Proof<BabyBearPoseidon2Config>> for RetainedLogUpOnlyProof {
 }
 
 impl RetainedLogUpOnlyProof {
-    /// Bridge to legacy module trace generators. The empty tail is never read
+    /// Adapter for complete-proof trace-generator APIs. The empty tail is never read
     /// by ProofShape/GKR/BatchConstraint partial assemblies.
     #[must_use]
     pub fn into_partial_proof(self) -> Proof<BabyBearPoseidon2Config> {
@@ -615,8 +616,8 @@ impl RetainedStackingProof {
         )
     }
 
-    /// Temporarily expose the legacy `Proof` carrier required by OpenVM's
-    /// established trace generator.  The value cannot escape this closure and
+    /// Expose the complete `Proof` carrier required by OpenVM's established
+    /// trace generator. The value cannot escape this closure and
     /// contains an empty WHIR tail, so callers cannot accidentally serialize
     /// or accept it as a complete child proof.
     pub fn with_deferred_whir_input<R>(

@@ -394,7 +394,7 @@ fn prove_transition_leaf_jobs(
         let packet_started = Instant::now();
         let completed_view = completed.as_borrowed();
         let source_packet = source_component
-            .generate_cuda_in_flight_inline_packet_with_cached_vk(
+            .generate_cuda_in_flight_packet_with_cached_vk(
                 app_vk,
                 &prefixes,
                 &claims,

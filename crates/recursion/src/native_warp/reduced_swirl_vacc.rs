@@ -10,13 +10,12 @@
 //!    with [`super::generate_native_direct_fresh_opening_traces`];
 //! 3. constrains the fixed-arity linear schedule, including a final partial fresh batch and
 //!    distinct bootstrap/continuation modes;
-//! 4. replays the corrected outer header, ordered source-entry batches, the externally-bound
-//!    ordinary-WARP prefix, and the derived-manifest footer;
-//! 5. exports a constant-size chain receipt for a continuations-side adapter.
+//! 4. constrains the call header, ordered source-entry batch, ordinary-WARP prefix, and transition
+//!    receipt used by the recursive transition tree.
 //!
 //! The remaining twin/constraint sumcheck, prior authentication, output
-//! commitment, and batching sumcheck are the existing v19 direct VACC
-//! verifier machinery.  Keeping that algebra unchanged is the transcript and
+//! commitment, and batching sumcheck use the standard VACC verifier
+//! machinery. Keeping that algebra unchanged is the transcript and
 //! accumulator anchor for this adapter.
 
 use core::borrow::{Borrow, BorrowMut};
@@ -26,7 +25,6 @@ use openvm_circuit_primitives::{ColumnsAir, StructReflection, StructReflectionHe
 use openvm_poseidon2_air::POSEIDON2_WIDTH;
 use openvm_recursion_circuit_derive::AlignedBorrow;
 use openvm_stark_backend::{
-    hasher::MerkleHasher,
     interaction::InteractionBuilder,
     transcript::{TranscriptHistory, TranscriptLog},
     warp_accum::{
@@ -52,17 +50,16 @@ use crate::{
         ResumeTranscriptStateMessage, TranscriptBus,
     },
     native_warp::{
-        generate_native_direct_fresh_opening_traces, NativeClaimValueBus, NativeClaimValueMessage,
-        NativeDirectFreshOpeningTraces, NativeDirectFreshRootBus, NativeDirectFreshRootMessage,
-        NativeDirectFreshSourceBus, NativeDirectFreshSourceMessage, NativeFreshCountBus,
-        NativeFreshCountMessage, NativeInputSlotLayoutBus, NativeInputSlotLayoutMessage,
-        NativeStandardVaccDigestBus, NativeStandardVaccDigestMessage, NativeStandardVaccEndBus,
-        NativeStandardVaccEndMessage, NativeStandardVaccRootBus, NativeStandardVaccRootMessage,
-        NativeVaccPhaseCursorBus, NativeVaccPhaseCursorMessage, RecursiveReducedSwirlClaim,
-        ReducedSwirlSourceBetaBus, ReducedSwirlSourceBetaMessage, ReducedSwirlSourceClaimBus,
-        ReducedSwirlSourceClaimMessage, ReducedSwirlSourceProfile, ReducedSwirlSourceRootBus,
-        ReducedSwirlSourceRootMessage, CLAIM_SECTION_ALPHA, CLAIM_SECTION_BETA, CLAIM_SECTION_ETA,
-        CLAIM_SECTION_MU,
+        NativeClaimValueBus, NativeClaimValueMessage, NativeDirectFreshRootBus,
+        NativeDirectFreshRootMessage, NativeDirectFreshSourceBus, NativeDirectFreshSourceMessage,
+        NativeFreshCountBus, NativeFreshCountMessage, NativeInputSlotLayoutBus,
+        NativeInputSlotLayoutMessage, NativeStandardVaccDigestBus, NativeStandardVaccDigestMessage,
+        NativeStandardVaccEndBus, NativeStandardVaccEndMessage, NativeStandardVaccRootBus,
+        NativeStandardVaccRootMessage, NativeVaccPhaseCursorBus, NativeVaccPhaseCursorMessage,
+        RecursiveReducedSwirlClaim, ReducedSwirlSourceBetaBus, ReducedSwirlSourceBetaMessage,
+        ReducedSwirlSourceClaimBus, ReducedSwirlSourceClaimMessage, ReducedSwirlSourceProfile,
+        ReducedSwirlSourceRootBus, ReducedSwirlSourceRootMessage, CLAIM_SECTION_ALPHA,
+        CLAIM_SECTION_BETA, CLAIM_SECTION_ETA, CLAIM_SECTION_MU,
     },
 };
 
@@ -71,7 +68,6 @@ use crate::{
 pub const REDUCED_SWIRL_VACC_HEADER_TAG: &[u8] = b"openvm.native-warp.swirl-reduced-source.v3";
 pub const REDUCED_SWIRL_VACC_SOURCE_BATCH_TAG: &[u8] =
     b"openvm.native-warp.swirl-reduced-source.batch.v3";
-pub const REDUCED_SWIRL_VACC_SOURCE_ENTRY_TAG: u64 = 0x5357_454e;
 pub const REDUCED_SWIRL_VACC_MANIFEST_TAG: &[u8] =
     b"openvm.native-warp.swirl-reduced-source.manifest.v3";
 pub const REDUCED_SWIRL_VACC_FOOTER_TAG: &[u8] =
@@ -83,12 +79,6 @@ pub const REDUCED_SWIRL_VACC_PROTOCOL_VERSION: u32 = 3;
 pub const REDUCED_SWIRL_VACC_MAX_INPUT_ARITY: usize = 64;
 pub const REDUCED_SWIRL_VACC_MAX_ROOTS: usize = 64;
 pub const REDUCED_SWIRL_VACC_MAX_LOG_CODEWORD_LEN: usize = 32;
-/// Must remain equal to the fixed source-certificate leaf capacity. Detached
-/// VACC recomputes the same contiguous partition and rolling chunk chain.
-/// Must equal the fixed source-certification arity. This is independent of
-/// the WARP streaming arity bound above.
-pub const REDUCED_SWIRL_VACC_SOURCE_LEAF_CAPACITY: usize = 8;
-pub const REDUCED_SWIRL_VACC_SOURCE_LEAF_PROTOCOL_VERSION: u32 = 1;
 /// Setup-fixed maximum for the terminal manifest reconciliation.  This is a
 /// finite statement over one block, not a selector-tagged universal relation.
 pub const REDUCED_SWIRL_MANIFEST_RECONCILIATION_MAX_SOURCES: usize = 1024;
@@ -100,8 +90,6 @@ pub const REDUCED_SWIRL_MANIFEST_RECONCILIATION_MAX_SOURCES: usize = 1024;
 pub const REDUCED_SWIRL_TRANSITION_CHAIN_METADATA_TAG: u32 = 0x5254_4c01;
 pub const REDUCED_SWIRL_TRANSITION_LEAF_PROTOCOL_VERSION: u32 = 2;
 pub const REDUCED_SWIRL_TRANSITION_CHAIN_GENESIS_TAG: u32 = 0x5254_4c03;
-const REDUCED_SWIRL_VACC_SOURCE_CHAIN_METADATA_TAG: u32 = 0x5253_4c01;
-const REDUCED_SWIRL_VACC_SOURCE_LEAF_LOG_CAPACITY: usize = 3;
 const REDUCED_SWIRL_SCHEDULE_BITS: usize = 16;
 const REDUCED_SWIRL_AUTHORITY_BITS: usize = 30;
 const REDUCED_SWIRL_SOURCE_DIGEST_TAG: u32 = 0x5253_0101;
@@ -136,18 +124,6 @@ crate::define_typed_permutation_bus!(ReducedSwirlVaccChainEndBus, ReducedSwirlVa
 crate::define_typed_lookup_bus!(
     ReducedSwirlVaccChainReceiptBus,
     ReducedSwirlVaccChainReceiptMessage
-);
-crate::define_typed_permutation_bus!(
-    ReducedSwirlVaccDetachedSourceBus,
-    ReducedSwirlVaccDetachedSourceMessage
-);
-crate::define_typed_permutation_bus!(
-    ReducedSwirlVaccSummaryManifestBus,
-    ReducedSwirlVaccSummaryManifestMessage
-);
-crate::define_typed_lookup_bus!(
-    ReducedSwirlVaccSourceSummaryBus,
-    ReducedSwirlVaccSourceSummaryMessage
 );
 crate::define_typed_permutation_bus!(
     ReducedSwirlVaccTransitionEndBus,
@@ -267,49 +243,6 @@ pub struct ReducedSwirlVaccChainReceiptMessage<T> {
     pub call_count: T,
     pub final_accumulator_digest: [T; DIGEST_SIZE],
     pub final_accumulator_root: [T; DIGEST_SIZE],
-}
-
-/// Private source row handed from the canonical VACC digest AIR to the
-/// detached summary AIR. This is an internal typed permutation, not a source
-/// certificate authority bus.
-#[repr(C)]
-#[derive(AlignedBorrow, Debug, Clone)]
-pub struct ReducedSwirlVaccDetachedSourceMessage<T> {
-    pub source: T,
-    pub entry_digest: [T; DIGEST_SIZE],
-    pub program_commitment: [T; DIGEST_SIZE],
-    pub initial_pc: T,
-    pub initial_root: [T; DIGEST_SIZE],
-    pub final_pc: T,
-    pub final_root: [T; DIGEST_SIZE],
-    pub exit_code: T,
-    pub is_terminate: T,
-}
-
-#[repr(C)]
-#[derive(AlignedBorrow, Debug, Clone)]
-pub struct ReducedSwirlVaccSummaryManifestMessage<T> {
-    pub source_count: T,
-    pub manifest_digest: [T; DIGEST_SIZE],
-}
-
-/// Tail-link statement emitted by detached VACC and consumed by the future
-/// source-tree bridge. The ordinary VACC receipt remains wire-compatible.
-#[repr(C)]
-#[derive(AlignedBorrow, Debug, Clone, PartialEq, Eq)]
-pub struct ReducedSwirlVaccSourceSummaryMessage<T> {
-    pub protocol_digest: [T; DIGEST_SIZE],
-    pub manifest_digest: [T; DIGEST_SIZE],
-    pub source_count: T,
-    pub source_leaf_capacity: T,
-    pub program_commitment: [T; DIGEST_SIZE],
-    pub initial_pc: T,
-    pub initial_root: [T; DIGEST_SIZE],
-    pub final_pc: T,
-    pub final_root: [T; DIGEST_SIZE],
-    pub exit_code: T,
-    pub is_terminate: T,
-    pub chunk_chain_endpoint: [T; DIGEST_SIZE],
 }
 
 /// Complete authenticated boundary of one native reduced-SWIRL WARP call.
@@ -454,33 +387,6 @@ impl ReducedSwirlVaccProfile {
     }
 }
 
-/// Setup-fixed source-linkage policy for the reduced-SWIRL VACC adapter.
-///
-/// Inline mode receives the four authority families exported by the source
-/// receipt component in the same MultiSTARK. Detached mode deliberately has
-/// no interactions on those buses: a separately proven source certificate is
-/// linked later by equality of the canonical ordered manifest in the two
-/// constant-size receipts. In both modes the claim, roots, and beta values are
-/// constrained against the ordinary WARP verifier buses below.
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReducedSwirlVaccSourceMode {
-    Inline = 0,
-    Detached = 1,
-}
-
-impl ReducedSwirlVaccSourceMode {
-    #[must_use]
-    pub const fn setup_tag(self) -> usize {
-        self as usize
-    }
-
-    #[must_use]
-    const fn has_inline_source_receives(self) -> bool {
-        matches!(self, Self::Inline)
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReducedSwirlVaccCall {
     pub step: usize,
@@ -595,28 +501,6 @@ pub fn reduced_swirl_vacc_header_elements(
     push_bytes_ext(&mut values, &profile.source_domain);
     values.extend_from_slice(&profile.relation_binding);
     values.extend_from_slice(&profile.code_binding);
-    Ok(values)
-}
-
-pub fn reduced_swirl_vacc_batch_elements(
-    call: ReducedSwirlVaccCall,
-    entry_digests: &[Digest],
-) -> Result<Vec<EF>, &'static str> {
-    if entry_digests.len() != call.fresh_count
-        || entry_digests
-            .iter()
-            .any(|digest| digest.iter().all(|value| *value == F::ZERO))
-    {
-        return Err("reduced-SWIRL source-entry batch");
-    }
-    let mut values = Vec::new();
-    push_bytes_ext(&mut values, REDUCED_SWIRL_VACC_SOURCE_BATCH_TAG);
-    for value in [call.step, call.source_start, call.fresh_count] {
-        push_u64_ext(&mut values, value as u64);
-    }
-    for digest in entry_digests {
-        values.extend(digest.iter().copied().map(EF::from));
-    }
     Ok(values)
 }
 
@@ -745,59 +629,6 @@ pub fn validate_reduced_swirl_fresh_batch<AccProof>(
         }
     }
     Ok(())
-}
-
-/// Generate the exact original-root Merkle/projection witnesses after the
-/// authoritative claim check above.  This function never hashes a replacement
-/// scalar codeword and never performs RS encoding.
-#[allow(clippy::too_many_arguments)]
-pub fn generate_reduced_swirl_direct_opening_traces<H, AccProof>(
-    profile: &ReducedSwirlVaccProfile,
-    hasher: &H,
-    sources: &[RecursiveReducedSwirlClaim],
-    step_proof: &ReducedWarpVaccStepProof<
-        EF,
-        Digest,
-        StackedRsBatchOpeningProof<F, Digest>,
-        AccProof,
-        StackedRsFreshCommitment<EF, Digest>,
-    >,
-    verification: &WarpVaccStepVerification<
-        EF,
-        Digest,
-        StackedRsBatchOpeningVerification<F, EF, Digest>,
-        MerkleBatchOpeningVerification<EF, Digest>,
-    >,
-    commitment_tidxs: &[usize],
-    proof_idx: usize,
-    first_tree_id: u32,
-    root_tree_stride: u32,
-    projection_sources_per_shard: usize,
-    max_projection_height: usize,
-) -> Result<NativeDirectFreshOpeningTraces, &'static str>
-where
-    H: MerkleHasher<F = F, Digest = Digest>,
-{
-    validate_reduced_swirl_fresh_batch(profile, sources, step_proof, verification)?;
-    generate_native_direct_fresh_opening_traces(
-        hasher,
-        &step_proof
-            .inner()
-            .fresh_claims
-            .iter()
-            .map(|claim| claim.commitment.clone())
-            .collect::<Vec<_>>(),
-        &verification.fresh_authentication,
-        commitment_tidxs,
-        proof_idx,
-        profile.input_arity,
-        profile.source.maximum_roots_per_source,
-        first_tree_id,
-        root_tree_stride,
-        projection_sources_per_shard,
-        max_projection_height,
-    )
-    .ok_or("reduced-SWIRL direct opening traces")
 }
 
 /// One source's retained checkpoint and VM boundary, used by the canonical
@@ -1173,8 +1004,8 @@ pub fn reduced_swirl_manifest_digest(entry_digests: &[Digest]) -> Result<Digest,
     }))
 }
 
-// Complete adapter AIRs and trace generators follow.  They consume the
-// existing standard-v19 VACC verifier's authenticated buses; no success bit
+// Adapter AIRs and trace generators consume the standard VACC verifier's
+// authenticated buses; no success bit
 // or host-side verification result enters the statement.
 
 fn observe_ext_expr<AB: AirBuilder<F = F> + InteractionBuilder>(
@@ -2321,14 +2152,6 @@ pub fn generate_reduced_swirl_vacc_schedule_range_trace(
     Ok(RowMajorMatrix::new(values, width))
 }
 
-fn generate_reduced_swirl_vacc_batch_trace(
-    profile: &ReducedSwirlVaccProfile,
-    calls: &[ReducedSwirlVaccCallRecord],
-) -> RowMajorMatrix<F> {
-    generate_reduced_swirl_vacc_batch_range_trace(calls, profile.maximum_call_count())
-        .expect("whole-block VACC batch trace")
-}
-
 pub fn generate_reduced_swirl_vacc_batch_range_trace(
     calls: &[ReducedSwirlVaccCallRecord],
     physical_call_capacity: usize,
@@ -2357,14 +2180,6 @@ pub fn generate_reduced_swirl_vacc_batch_range_trace(
         fill_bits(&mut cols.fresh_count_bits, record.call.fresh_count);
     }
     Ok(RowMajorMatrix::new(values, width))
-}
-
-fn generate_reduced_swirl_vacc_prefix_trace(
-    profile: &ReducedSwirlVaccProfile,
-    calls: &[ReducedSwirlVaccCallRecord],
-) -> RowMajorMatrix<F> {
-    generate_reduced_swirl_vacc_prefix_range_trace(calls, profile.maximum_call_count())
-        .expect("whole-block VACC prefix trace")
 }
 
 pub fn generate_reduced_swirl_vacc_prefix_range_trace(
@@ -2615,16 +2430,14 @@ pub struct ReducedSwirlSourceDigestCols<T> {
 #[columns_via(ReducedSwirlSourceDigestCols<u8>)]
 pub struct ReducedSwirlSourceDigestAir {
     pub profile: ReducedSwirlVaccProfile,
-    pub source_mode: ReducedSwirlVaccSourceMode,
     pub root_tree_stride: usize,
     pub digest_transcript_bus: TranscriptBus,
     pub main_transcript_bus: TranscriptBus,
     pub slot_bus: ReducedSwirlVaccSourceSlotBus,
-    pub authority_bus: Option<ReducedSwirlSourceAuthorityBus>,
-    pub source_claim_bus: Option<ReducedSwirlSourceClaimBus>,
-    pub source_root_bus: Option<ReducedSwirlSourceRootBus>,
-    pub source_beta_bus: Option<ReducedSwirlSourceBetaBus>,
-    pub detached_source_bus: Option<ReducedSwirlVaccDetachedSourceBus>,
+    pub authority_bus: ReducedSwirlSourceAuthorityBus,
+    pub source_claim_bus: ReducedSwirlSourceClaimBus,
+    pub source_root_bus: ReducedSwirlSourceRootBus,
+    pub source_beta_bus: ReducedSwirlSourceBetaBus,
     pub direct_source_bus: NativeDirectFreshSourceBus,
     pub direct_root_bus: NativeDirectFreshRootBus,
     pub vacc_claim_bus: NativeClaimValueBus,
@@ -2647,22 +2460,6 @@ where
     fn eval(&self, builder: &mut AB) {
         assert!(self.profile.validate().is_ok());
         assert!(self.root_tree_stride > 0);
-        assert_eq!(
-            self.source_mode.has_inline_source_receives(),
-            self.authority_bus.is_some()
-                && self.source_claim_bus.is_some()
-                && self.source_root_bus.is_some()
-                && self.source_beta_bus.is_some()
-        );
-        if self.source_mode == ReducedSwirlVaccSourceMode::Detached {
-            assert!(self.authority_bus.is_none());
-            assert!(self.source_claim_bus.is_none());
-            assert!(self.source_root_bus.is_none());
-            assert!(self.source_beta_bus.is_none());
-            assert!(self.detached_source_bus.is_some());
-        } else {
-            assert!(self.detached_source_bus.is_none());
-        }
         let main = builder.main();
         let row = main.row_slice(0).expect("reduced-SWIRL source digest row");
         let next_row = main
@@ -2713,58 +2510,54 @@ where
             },
             active.clone(),
         );
-        if let Some(authority_bus) = self.authority_bus {
-            authority_bus.receive(
-                builder,
-                ReducedSwirlSourceAuthorityMessage {
-                    source: local.source.into(),
-                    segment_index: local.segment_index.into(),
-                    common_main_root: local.common_main_root.map(Into::into),
-                    trace_layout_digest: local.trace_layout_digest.map(Into::into),
-                    pending_claim_digest: local.pending_claim_digest.map(Into::into),
-                    checkpoint_tidx: local.checkpoint_tidx.into(),
-                    checkpoint_state: local.checkpoint_state.map(Into::into),
-                    program_commitment: local.program_commitment.map(Into::into),
-                    initial_pc: local.initial_pc.into(),
-                    initial_root: local.initial_root.map(Into::into),
-                    final_pc: local.final_pc.into(),
-                    final_root: local.final_root.map(Into::into),
-                    exit_code: local.exit_code.into(),
-                    is_terminate: local.is_terminate.into(),
-                },
-                active.clone(),
-            );
-        }
-        if let Some(source_claim_bus) = self.source_claim_bus {
-            source_claim_bus.lookup_key(
-                builder,
-                ReducedSwirlSourceClaimMessage {
-                    source: local.source.into(),
-                    root_count: local.root_count.into(),
-                    opening_count: local.opening_count.into(),
-                    l_skip: AB::Expr::from_usize(self.profile.source.l_skip),
-                    n_stack: AB::Expr::from_usize(self.profile.source.n_stack),
-                    log_blowup: AB::Expr::from_usize(self.profile.source.log_blowup),
-                    log_commit_rows_per_query: AB::Expr::from_usize(
-                        self.profile.source.log_commit_rows_per_query,
-                    ),
-                    log_message_len: AB::Expr::from_usize(self.profile.source.log_message_len()),
-                    log_codeword_len: AB::Expr::from_usize(self.profile.source.log_codeword_len()),
-                    rows_per_query: AB::Expr::from_usize(self.profile.source.rows_per_query()),
-                    coefficient_layout_tag: AB::Expr::from_u64(
-                        super::REDUCED_SWIRL_COEFFICIENT_SUBGROUP_TAG,
-                    ),
-                    coefficient_layout_version: AB::Expr::from_u32(
-                        super::REDUCED_SWIRL_COEFFICIENT_SUBGROUP_VERSION,
-                    ),
-                    alpha_is_zero: AB::Expr::ONE,
-                    theta: local.theta.map(Into::into),
-                    mu: local.mu.map(Into::into),
-                    eta: local.eta.map(Into::into),
-                },
-                active.clone(),
-            );
-        }
+        self.authority_bus.receive(
+            builder,
+            ReducedSwirlSourceAuthorityMessage {
+                source: local.source.into(),
+                segment_index: local.segment_index.into(),
+                common_main_root: local.common_main_root.map(Into::into),
+                trace_layout_digest: local.trace_layout_digest.map(Into::into),
+                pending_claim_digest: local.pending_claim_digest.map(Into::into),
+                checkpoint_tidx: local.checkpoint_tidx.into(),
+                checkpoint_state: local.checkpoint_state.map(Into::into),
+                program_commitment: local.program_commitment.map(Into::into),
+                initial_pc: local.initial_pc.into(),
+                initial_root: local.initial_root.map(Into::into),
+                final_pc: local.final_pc.into(),
+                final_root: local.final_root.map(Into::into),
+                exit_code: local.exit_code.into(),
+                is_terminate: local.is_terminate.into(),
+            },
+            active.clone(),
+        );
+        self.source_claim_bus.lookup_key(
+            builder,
+            ReducedSwirlSourceClaimMessage {
+                source: local.source.into(),
+                root_count: local.root_count.into(),
+                opening_count: local.opening_count.into(),
+                l_skip: AB::Expr::from_usize(self.profile.source.l_skip),
+                n_stack: AB::Expr::from_usize(self.profile.source.n_stack),
+                log_blowup: AB::Expr::from_usize(self.profile.source.log_blowup),
+                log_commit_rows_per_query: AB::Expr::from_usize(
+                    self.profile.source.log_commit_rows_per_query,
+                ),
+                log_message_len: AB::Expr::from_usize(self.profile.source.log_message_len()),
+                log_codeword_len: AB::Expr::from_usize(self.profile.source.log_codeword_len()),
+                rows_per_query: AB::Expr::from_usize(self.profile.source.rows_per_query()),
+                coefficient_layout_tag: AB::Expr::from_u64(
+                    super::REDUCED_SWIRL_COEFFICIENT_SUBGROUP_TAG,
+                ),
+                coefficient_layout_version: AB::Expr::from_u32(
+                    super::REDUCED_SWIRL_COEFFICIENT_SUBGROUP_VERSION,
+                ),
+                alpha_is_zero: AB::Expr::ONE,
+                theta: local.theta.map(Into::into),
+                mu: local.mu.map(Into::into),
+                eta: local.eta.map(Into::into),
+            },
+            active.clone(),
+        );
         self.direct_source_bus.lookup_key(
             builder,
             NativeDirectFreshSourceMessage {
@@ -2804,18 +2597,16 @@ where
                 AB::Expr::from(local.first_tree_id)
                     + AB::Expr::from_usize(ordinal * self.root_tree_stride),
             );
-            if let Some(source_root_bus) = self.source_root_bus {
-                source_root_bus.lookup_key(
-                    builder,
-                    ReducedSwirlSourceRootMessage {
-                        source: local.source.into(),
-                        root_ordinal: AB::Expr::from_usize(ordinal),
-                        width: local.root_width[ordinal].into(),
-                        root: local.roots[ordinal].map(Into::into),
-                    },
-                    root_active,
-                );
-            }
+            self.source_root_bus.lookup_key(
+                builder,
+                ReducedSwirlSourceRootMessage {
+                    source: local.source.into(),
+                    root_ordinal: AB::Expr::from_usize(ordinal),
+                    width: local.root_width[ordinal].into(),
+                    root: local.roots[ordinal].map(Into::into),
+                },
+                root_active,
+            );
             self.direct_root_bus.lookup_key(
                 builder,
                 NativeDirectFreshRootMessage {
@@ -2847,17 +2638,15 @@ where
         }
         for coordinate in 0..self.profile.source.log_message_len() {
             let beta = local.beta[coordinate].map(Into::into);
-            if let Some(source_beta_bus) = self.source_beta_bus {
-                source_beta_bus.lookup_key(
-                    builder,
-                    ReducedSwirlSourceBetaMessage {
-                        source: local.source.into(),
-                        coordinate: AB::Expr::from_usize(coordinate),
-                        value: beta.clone(),
-                    },
-                    active.clone(),
-                );
-            }
+            self.source_beta_bus.lookup_key(
+                builder,
+                ReducedSwirlSourceBetaMessage {
+                    source: local.source.into(),
+                    coordinate: AB::Expr::from_usize(coordinate),
+                    value: beta.clone(),
+                },
+                active.clone(),
+            );
             self.vacc_claim_bus.receive(
                 builder,
                 NativeClaimValueMessage {
@@ -2928,23 +2717,6 @@ where
             },
             active,
         );
-        if let Some(detached_source_bus) = self.detached_source_bus {
-            detached_source_bus.send(
-                builder,
-                ReducedSwirlVaccDetachedSourceMessage {
-                    source: local.source.into(),
-                    entry_digest: local.entry_digest.map(Into::into),
-                    program_commitment: local.program_commitment.map(Into::into),
-                    initial_pc: local.initial_pc.into(),
-                    initial_root: local.initial_root.map(Into::into),
-                    final_pc: local.final_pc.into(),
-                    final_root: local.final_root.map(Into::into),
-                    exit_code: local.exit_code.into(),
-                    is_terminate: local.is_terminate.into(),
-                },
-                local.active,
-            );
-        }
     }
 }
 
@@ -3411,7 +3183,6 @@ pub struct ReducedSwirlManifestDigestAir {
     pub transcript_bus: TranscriptBus,
     pub entry_digest_bus: ReducedSwirlSourceEntryDigestBus,
     pub manifest_digest_bus: ReducedSwirlManifestDigestBus,
-    pub summary_manifest_bus: Option<ReducedSwirlVaccSummaryManifestBus>,
 }
 
 impl BaseAirWithPublicValues<F> for ReducedSwirlManifestDigestAir {}
@@ -3547,16 +3318,6 @@ where
             },
             local.active * local.is_last,
         );
-        if let Some(summary_manifest_bus) = self.summary_manifest_bus {
-            summary_manifest_bus.send(
-                builder,
-                ReducedSwirlVaccSummaryManifestMessage {
-                    source_count: local.source_count.into(),
-                    manifest_digest: local.manifest_digest.map(Into::into),
-                },
-                local.active * local.is_last,
-            );
-        }
     }
 }
 
@@ -3691,6 +3452,21 @@ pub fn reduced_swirl_reconciliation_chain_append(
 ) -> Digest {
     let chunk = poseidon2_compress_with_capacity(metadata, local_manifest_digest).0;
     poseidon2_compress_with_capacity(chain_before, chunk).0
+}
+
+fn record_reconciliation_compression(
+    left: Digest,
+    right: Digest,
+    requests: &mut Vec<[F; 2 * DIGEST_SIZE]>,
+) -> Digest {
+    requests.push(core::array::from_fn(|index| {
+        if index < DIGEST_SIZE {
+            left[index]
+        } else {
+            right[index - DIGEST_SIZE]
+        }
+    }));
+    poseidon2_compress_with_capacity(left, right).0
 }
 
 #[repr(C)]
@@ -4202,7 +3978,7 @@ pub fn generate_reduced_swirl_manifest_reconciliation_trace(
         1 => F::from_u32(REDUCED_SWIRL_TRANSITION_LEAF_PROTOCOL_VERSION),
         _ => F::ZERO,
     });
-    let mut chain_before = record_source_summary_compression(
+    let mut chain_before = record_reconciliation_compression(
         source_protocol_digest,
         genesis_metadata,
         &mut compression_inputs,
@@ -4221,12 +3997,12 @@ pub fn generate_reduced_swirl_manifest_reconciliation_trace(
             call.prior_count,
             call_end == entry_digests.len(),
         );
-        let chunk_commitment = record_source_summary_compression(
+        let chunk_commitment = record_reconciliation_compression(
             metadata,
             local_manifest_digest,
             &mut compression_inputs,
         );
-        let chain_after = record_source_summary_compression(
+        let chain_after = record_reconciliation_compression(
             chain_before,
             chunk_commitment,
             &mut compression_inputs,
@@ -4283,492 +4059,6 @@ pub fn generate_reduced_swirl_manifest_reconciliation_trace(
         local_manifest_logs,
         compression_inputs,
         receipt,
-    })
-}
-
-#[repr(C)]
-#[derive(AlignedBorrow, StructReflection)]
-pub struct ReducedSwirlVaccSourceSummaryCols<T> {
-    pub active: T,
-    pub is_last: T,
-    pub source: T,
-    pub source_count: T,
-    pub slot: T,
-    pub slot_bits: [T; REDUCED_SWIRL_VACC_SOURCE_LEAF_LOG_CAPACITY],
-    pub chunk_first: T,
-    pub chunk_last: T,
-    pub chunk_index: T,
-    pub chunk_count: T,
-    pub entry_digest: [T; DIGEST_SIZE],
-    pub program_commitment: [T; DIGEST_SIZE],
-    pub initial_pc: T,
-    pub initial_root: [T; DIGEST_SIZE],
-    pub final_pc: T,
-    pub final_root: [T; DIGEST_SIZE],
-    pub exit_code: T,
-    pub is_terminate: T,
-    pub chain_program_commitment: [T; DIGEST_SIZE],
-    pub chain_initial_pc: T,
-    pub chain_initial_root: [T; DIGEST_SIZE],
-    pub manifest_digest: [T; DIGEST_SIZE],
-    pub chunk_manifest_digest: [T; DIGEST_SIZE],
-    pub chain_before: [T; DIGEST_SIZE],
-    pub chunk_commitment: [T; DIGEST_SIZE],
-    pub chain_after: [T; DIGEST_SIZE],
-}
-
-#[derive(ColumnsAir)]
-#[columns_via(ReducedSwirlVaccSourceSummaryCols<u8>)]
-pub struct ReducedSwirlVaccSourceSummaryAir {
-    pub profile: ReducedSwirlVaccProfile,
-    pub source_bus: ReducedSwirlVaccDetachedSourceBus,
-    pub manifest_bus: ReducedSwirlVaccSummaryManifestBus,
-    pub transcript_bus: TranscriptBus,
-    pub compress_bus: Poseidon2CompressBus,
-    pub summary_bus: ReducedSwirlVaccSourceSummaryBus,
-}
-
-impl BaseAirWithPublicValues<F> for ReducedSwirlVaccSourceSummaryAir {}
-impl PartitionedBaseAir<F> for ReducedSwirlVaccSourceSummaryAir {}
-impl BaseAir<F> for ReducedSwirlVaccSourceSummaryAir {
-    fn width(&self) -> usize {
-        ReducedSwirlVaccSourceSummaryCols::<F>::width()
-    }
-}
-
-impl<AB> Air<AB> for ReducedSwirlVaccSourceSummaryAir
-where
-    AB: AirBuilder<F = F> + InteractionBuilder,
-    AB::Var: Copy,
-{
-    fn eval(&self, builder: &mut AB) {
-        assert!(self.profile.validate().is_ok());
-        assert_eq!(
-            1usize << REDUCED_SWIRL_VACC_SOURCE_LEAF_LOG_CAPACITY,
-            REDUCED_SWIRL_VACC_SOURCE_LEAF_CAPACITY
-        );
-        let main = builder.main();
-        let row = main.row_slice(0).expect("reduced-SWIRL source-summary row");
-        let next_row = main
-            .row_slice(1)
-            .expect("reduced-SWIRL source-summary next row");
-        let local: &ReducedSwirlVaccSourceSummaryCols<AB::Var> = (*row).borrow();
-        let next: &ReducedSwirlVaccSourceSummaryCols<AB::Var> = (*next_row).borrow();
-        builder.assert_bool(local.active);
-        builder.assert_bool(local.is_last);
-        builder.assert_bool(local.is_terminate);
-        builder.assert_bool(local.chunk_first);
-        builder.assert_bool(local.chunk_last);
-        builder.when_first_row().assert_one(local.active);
-        builder.when_first_row().assert_zero(local.source);
-        builder.when_first_row().assert_zero(local.slot);
-        builder.when_first_row().assert_one(local.chunk_first);
-        builder.when_first_row().assert_zero(local.chunk_index);
-        builder
-            .when_transition()
-            .assert_eq(next.active, AB::Expr::from(local.active) - local.is_last);
-
-        let active = AB::Expr::from(local.active);
-        let mut slot = AB::Expr::ZERO;
-        let mut power = AB::Expr::ONE;
-        for &bit in &local.slot_bits {
-            builder.assert_bool(bit);
-            slot += AB::Expr::from(bit) * power.clone();
-            power = power.clone() + power;
-        }
-        builder.when(active.clone()).assert_eq(local.slot, slot);
-        builder
-            .when(active.clone() * local.chunk_first)
-            .assert_zero(local.slot);
-        builder
-            .when(active.clone() * local.is_last)
-            .assert_one(local.chunk_last);
-        builder
-            .when(active.clone() * (AB::Expr::from(local.chunk_last) - local.is_last))
-            .assert_eq(
-                local.slot,
-                AB::Expr::from_usize(REDUCED_SWIRL_VACC_SOURCE_LEAF_CAPACITY - 1),
-            );
-        let chunk_last = AB::Expr::from(local.chunk_last);
-        let transition = builder.is_transition() * AB::Expr::from(next.active);
-        builder
-            .when(transition.clone())
-            .assert_eq(next.source, AB::Expr::from(local.source) + AB::Expr::ONE);
-        builder
-            .when(transition.clone())
-            .assert_eq(next.source_count, local.source_count);
-        builder.when(transition.clone()).assert_eq(
-            next.chunk_index,
-            AB::Expr::from(local.chunk_index) + chunk_last.clone(),
-        );
-        builder.when(transition.clone()).assert_eq(
-            next.slot,
-            (AB::Expr::ONE - chunk_last.clone()) * (AB::Expr::from(local.slot) + AB::Expr::ONE),
-        );
-        builder
-            .when(transition.clone())
-            .assert_eq(next.chunk_first, local.chunk_last);
-        builder
-            .when(transition.clone() * (AB::Expr::ONE - chunk_last.clone()))
-            .assert_eq(next.chunk_count, local.chunk_count);
-        builder.when(active.clone() * chunk_last.clone()).assert_eq(
-            local.chunk_count,
-            AB::Expr::from(local.slot) + AB::Expr::ONE,
-        );
-        builder
-            .when(active.clone() * AB::Expr::from(local.is_last))
-            .assert_eq(
-                AB::Expr::from(local.source) + AB::Expr::ONE,
-                local.source_count,
-            );
-
-        for limb in 0..DIGEST_SIZE {
-            for (next_value, local_value) in [
-                (
-                    next.chain_program_commitment[limb],
-                    local.chain_program_commitment[limb],
-                ),
-                (
-                    next.chain_initial_root[limb],
-                    local.chain_initial_root[limb],
-                ),
-                (next.manifest_digest[limb], local.manifest_digest[limb]),
-            ] {
-                builder
-                    .when(transition.clone())
-                    .assert_eq(next_value, local_value);
-            }
-            builder
-                .when(transition.clone() * (AB::Expr::ONE - chunk_last.clone()))
-                .assert_eq(
-                    next.chunk_manifest_digest[limb],
-                    local.chunk_manifest_digest[limb],
-                );
-            builder.when(transition.clone()).assert_eq(
-                next.chain_before[limb],
-                (AB::Expr::ONE - chunk_last.clone()) * local.chain_before[limb]
-                    + chunk_last.clone() * local.chain_after[limb],
-            );
-        }
-        builder
-            .when(transition)
-            .assert_eq(next.chain_initial_pc, local.chain_initial_pc);
-        for limb in 0..DIGEST_SIZE {
-            builder.when_first_row().assert_eq(
-                local.chain_program_commitment[limb],
-                local.program_commitment[limb],
-            );
-            builder
-                .when_first_row()
-                .assert_eq(local.chain_initial_root[limb], local.initial_root[limb]);
-        }
-        builder
-            .when_first_row()
-            .assert_eq(local.chain_initial_pc, local.initial_pc);
-
-        self.source_bus.receive(
-            builder,
-            ReducedSwirlVaccDetachedSourceMessage {
-                source: local.source.into(),
-                entry_digest: local.entry_digest.map(Into::into),
-                program_commitment: local.program_commitment.map(Into::into),
-                initial_pc: local.initial_pc.into(),
-                initial_root: local.initial_root.map(Into::into),
-                final_pc: local.final_pc.into(),
-                final_root: local.final_root.map(Into::into),
-                exit_code: local.exit_code.into(),
-                is_terminate: local.is_terminate.into(),
-            },
-            local.active,
-        );
-        self.manifest_bus.receive(
-            builder,
-            ReducedSwirlVaccSummaryManifestMessage {
-                source_count: local.source_count.into(),
-                manifest_digest: local.manifest_digest.map(Into::into),
-            },
-            local.active * local.is_last,
-        );
-
-        let chunk_first = active.clone() * local.chunk_first;
-        let proof_idx = AB::Expr::from(local.chunk_index) + AB::Expr::ONE;
-        let mut tidx = AB::Expr::ZERO;
-        for &byte in REDUCED_SWIRL_VACC_MANIFEST_TAG {
-            observe_base_expr(
-                &self.transcript_bus,
-                builder,
-                proof_idx.clone(),
-                &mut tidx,
-                AB::Expr::from_u8(byte),
-                false,
-                chunk_first.clone(),
-            );
-        }
-        for value in [
-            AB::Expr::from_u32(REDUCED_SWIRL_VACC_PROTOCOL_VERSION),
-            local.chunk_count.into(),
-        ] {
-            observe_base_expr(
-                &self.transcript_bus,
-                builder,
-                proof_idx.clone(),
-                &mut tidx,
-                value,
-                false,
-                chunk_first.clone(),
-            );
-        }
-        let mut entry_tidx = AB::Expr::from_usize(REDUCED_SWIRL_VACC_MANIFEST_TAG.len() + 2)
-            + AB::Expr::from(local.slot) * AB::Expr::from_usize(1 + DIGEST_SIZE);
-        observe_base_expr(
-            &self.transcript_bus,
-            builder,
-            proof_idx.clone(),
-            &mut entry_tidx,
-            local.slot.into(),
-            false,
-            active.clone(),
-        );
-        for &limb in &local.entry_digest {
-            observe_base_expr(
-                &self.transcript_bus,
-                builder,
-                proof_idx.clone(),
-                &mut entry_tidx,
-                limb.into(),
-                false,
-                active.clone(),
-            );
-        }
-        let mut sample_tidx = AB::Expr::from_usize(REDUCED_SWIRL_VACC_MANIFEST_TAG.len() + 2)
-            + AB::Expr::from(local.chunk_count) * AB::Expr::from_usize(1 + DIGEST_SIZE);
-        for &limb in &local.chunk_manifest_digest {
-            observe_base_expr(
-                &self.transcript_bus,
-                builder,
-                proof_idx.clone(),
-                &mut sample_tidx,
-                limb.into(),
-                true,
-                active.clone() * chunk_last.clone(),
-            );
-        }
-
-        let genesis_domain = core::array::from_fn(|index| match index {
-            0 => AB::Expr::from_u32(REDUCED_SWIRL_VACC_SOURCE_CHAIN_METADATA_TAG),
-            1 => AB::Expr::from_u32(REDUCED_SWIRL_VACC_SOURCE_LEAF_PROTOCOL_VERSION),
-            _ => AB::Expr::ZERO,
-        });
-        self.lookup_compression(
-            builder,
-            self.profile.protocol_digest.map(AB::Expr::from),
-            genesis_domain,
-            local.chain_before.map(Into::into),
-            builder.is_first_row(),
-        );
-        let chunk_offset = AB::Expr::from(local.source) - local.slot;
-        let chunk_metadata = core::array::from_fn(|index| match index {
-            0 => AB::Expr::from_u32(REDUCED_SWIRL_VACC_SOURCE_CHAIN_METADATA_TAG),
-            1 => AB::Expr::from_u32(REDUCED_SWIRL_VACC_SOURCE_LEAF_PROTOCOL_VERSION),
-            2 => chunk_offset.clone(),
-            3 => local.chunk_count.into(),
-            _ => AB::Expr::ZERO,
-        });
-        self.lookup_compression(
-            builder,
-            chunk_metadata,
-            local.chunk_manifest_digest.map(Into::into),
-            local.chunk_commitment.map(Into::into),
-            active.clone() * chunk_last.clone(),
-        );
-        self.lookup_compression(
-            builder,
-            local.chain_before.map(Into::into),
-            local.chunk_commitment.map(Into::into),
-            local.chain_after.map(Into::into),
-            active.clone() * chunk_last.clone(),
-        );
-        self.summary_bus.add_key_with_lookups(
-            builder,
-            ReducedSwirlVaccSourceSummaryMessage {
-                protocol_digest: self.profile.protocol_digest.map(AB::Expr::from),
-                manifest_digest: local.manifest_digest.map(Into::into),
-                source_count: local.source_count.into(),
-                source_leaf_capacity: AB::Expr::from_usize(REDUCED_SWIRL_VACC_SOURCE_LEAF_CAPACITY),
-                program_commitment: local.chain_program_commitment.map(Into::into),
-                initial_pc: local.chain_initial_pc.into(),
-                initial_root: local.chain_initial_root.map(Into::into),
-                final_pc: local.final_pc.into(),
-                final_root: local.final_root.map(Into::into),
-                exit_code: local.exit_code.into(),
-                is_terminate: local.is_terminate.into(),
-                chunk_chain_endpoint: local.chain_after.map(Into::into),
-            },
-            active * local.is_last,
-        );
-    }
-}
-
-impl ReducedSwirlVaccSourceSummaryAir {
-    fn lookup_compression<AB: AirBuilder<F = F> + InteractionBuilder>(
-        &self,
-        builder: &mut AB,
-        left: [AB::Expr; DIGEST_SIZE],
-        right: [AB::Expr; DIGEST_SIZE],
-        output: [AB::Expr; DIGEST_SIZE],
-        enabled: AB::Expr,
-    ) {
-        self.compress_bus.lookup_key(
-            builder,
-            Poseidon2CompressMessage {
-                input: core::array::from_fn(|index| {
-                    if index < DIGEST_SIZE {
-                        left[index].clone()
-                    } else {
-                        right[index - DIGEST_SIZE].clone()
-                    }
-                }),
-                output,
-            },
-            enabled,
-        );
-    }
-}
-
-pub struct ReducedSwirlVaccSourceSummaryTraceArtifacts {
-    pub trace: RowMajorMatrix<F>,
-    pub manifest_transcript_logs: Vec<TranscriptLog<F, [F; POSEIDON2_WIDTH]>>,
-    pub compression_inputs: Vec<[F; 2 * DIGEST_SIZE]>,
-    pub summary: ReducedSwirlVaccSourceSummaryMessage<F>,
-}
-
-fn record_source_summary_compression(
-    left: Digest,
-    right: Digest,
-    inputs: &mut Vec<[F; 2 * DIGEST_SIZE]>,
-) -> Digest {
-    inputs.push(core::array::from_fn(|index| {
-        if index < DIGEST_SIZE {
-            left[index]
-        } else {
-            right[index - DIGEST_SIZE]
-        }
-    }));
-    poseidon2_compress_with_capacity(left, right).0
-}
-
-pub fn generate_reduced_swirl_vacc_source_summary_trace(
-    profile: &ReducedSwirlVaccProfile,
-    sources: &[ReducedSwirlSourceDigestRecord],
-    entry_digests: &[Digest],
-    manifest_digest: Digest,
-) -> Result<ReducedSwirlVaccSourceSummaryTraceArtifacts, &'static str> {
-    profile.validate()?;
-    if sources.is_empty()
-        || sources.len() != entry_digests.len()
-        || sources.len() > profile.maximum_sources
-        || reduced_swirl_manifest_digest(entry_digests)? != manifest_digest
-    {
-        return Err("reduced-SWIRL source-summary inventory");
-    }
-    let source_count = sources.len();
-    let first = &sources[0].authority;
-    let last = &sources[source_count - 1].authority;
-    let genesis_domain = core::array::from_fn(|index| match index {
-        0 => F::from_u32(REDUCED_SWIRL_VACC_SOURCE_CHAIN_METADATA_TAG),
-        1 => F::from_u32(REDUCED_SWIRL_VACC_SOURCE_LEAF_PROTOCOL_VERSION),
-        _ => F::ZERO,
-    });
-    let mut compression_inputs = Vec::with_capacity(1 + 2 * source_count.div_ceil(64));
-    let mut chain_before = record_source_summary_compression(
-        profile.protocol_digest,
-        genesis_domain,
-        &mut compression_inputs,
-    );
-    let width = ReducedSwirlVaccSourceSummaryCols::<F>::width();
-    let height = adapter_trace_height(source_count, profile.maximum_sources);
-    let mut values = F::zero_vec(width * height);
-    let mut manifest_transcript_logs =
-        Vec::with_capacity(source_count.div_ceil(REDUCED_SWIRL_VACC_SOURCE_LEAF_CAPACITY));
-    for (chunk_index, chunk) in entry_digests
-        .chunks(REDUCED_SWIRL_VACC_SOURCE_LEAF_CAPACITY)
-        .enumerate()
-    {
-        let source_offset = chunk_index * REDUCED_SWIRL_VACC_SOURCE_LEAF_CAPACITY;
-        let (chunk_manifest_digest, chunk_log) = reduced_swirl_manifest_digest_with_log(chunk)?;
-        manifest_transcript_logs.push(chunk_log);
-        let chunk_metadata = core::array::from_fn(|index| match index {
-            0 => F::from_u32(REDUCED_SWIRL_VACC_SOURCE_CHAIN_METADATA_TAG),
-            1 => F::from_u32(REDUCED_SWIRL_VACC_SOURCE_LEAF_PROTOCOL_VERSION),
-            2 => F::from_usize(source_offset),
-            3 => F::from_usize(chunk.len()),
-            _ => F::ZERO,
-        });
-        let chunk_commitment = record_source_summary_compression(
-            chunk_metadata,
-            chunk_manifest_digest,
-            &mut compression_inputs,
-        );
-        let chain_after = record_source_summary_compression(
-            chain_before,
-            chunk_commitment,
-            &mut compression_inputs,
-        );
-        for (slot, &entry_digest) in chunk.iter().enumerate() {
-            let source = source_offset + slot;
-            let authority = &sources[source].authority;
-            let cols: &mut ReducedSwirlVaccSourceSummaryCols<F> =
-                values[source * width..(source + 1) * width].borrow_mut();
-            cols.active = F::ONE;
-            cols.is_last = F::from_bool(source + 1 == source_count);
-            cols.source = F::from_usize(source);
-            cols.source_count = F::from_usize(source_count);
-            cols.slot = F::from_usize(slot);
-            fill_bits(&mut cols.slot_bits, slot);
-            cols.chunk_first = F::from_bool(slot == 0);
-            cols.chunk_last = F::from_bool(slot + 1 == chunk.len());
-            cols.chunk_index = F::from_usize(chunk_index);
-            cols.chunk_count = F::from_usize(chunk.len());
-            cols.entry_digest = entry_digest;
-            cols.program_commitment = authority.program_commitment;
-            cols.initial_pc = authority.initial_pc;
-            cols.initial_root = authority.initial_root;
-            cols.final_pc = authority.final_pc;
-            cols.final_root = authority.final_root;
-            cols.exit_code = authority.exit_code;
-            cols.is_terminate = authority.is_terminate;
-            cols.chain_program_commitment = first.program_commitment;
-            cols.chain_initial_pc = first.initial_pc;
-            cols.chain_initial_root = first.initial_root;
-            cols.manifest_digest = manifest_digest;
-            cols.chunk_manifest_digest = chunk_manifest_digest;
-            cols.chain_before = chain_before;
-            if slot + 1 == chunk.len() {
-                cols.chunk_commitment = chunk_commitment;
-                cols.chain_after = chain_after;
-            }
-        }
-        chain_before = chain_after;
-    }
-    let summary = ReducedSwirlVaccSourceSummaryMessage {
-        protocol_digest: profile.protocol_digest,
-        manifest_digest,
-        source_count: F::from_usize(source_count),
-        source_leaf_capacity: F::from_usize(REDUCED_SWIRL_VACC_SOURCE_LEAF_CAPACITY),
-        program_commitment: first.program_commitment,
-        initial_pc: first.initial_pc,
-        initial_root: first.initial_root,
-        final_pc: last.final_pc,
-        final_root: last.final_root,
-        exit_code: last.exit_code,
-        is_terminate: last.is_terminate,
-        chunk_chain_endpoint: chain_before,
-    };
-    Ok(ReducedSwirlVaccSourceSummaryTraceArtifacts {
-        trace: RowMajorMatrix::new(values, width),
-        manifest_transcript_logs,
-        compression_inputs,
-        summary,
     })
 }
 
@@ -5097,22 +4387,6 @@ where
     }
 }
 
-fn generate_reduced_swirl_vacc_footer_trace(
-    profile: &ReducedSwirlVaccProfile,
-    source_count: usize,
-    calls: &[ReducedSwirlVaccCallRecord],
-    manifest_digest: Digest,
-) -> Result<RowMajorMatrix<F>, &'static str> {
-    generate_reduced_swirl_vacc_footer_range_trace(
-        profile,
-        source_count,
-        calls.len(),
-        calls.last().ok_or("reduced-SWIRL empty VACC footer")?,
-        manifest_digest,
-        calls.len().saturating_sub(1),
-    )
-}
-
 pub fn generate_reduced_swirl_vacc_footer_range_trace(
     profile: &ReducedSwirlVaccProfile,
     source_count: usize,
@@ -5203,11 +4477,11 @@ pub fn generate_reduced_swirl_vacc_footer_record_trace(
     Ok(RowMajorMatrix::new(values, width))
 }
 
-/// All buses needed by the recursion-local adapter.  The standard VACC buses
-/// are outputs of the existing v19 direct verifier; the reduced-SWIRL buses
+/// All buses needed by the recursion-local adapter. The standard VACC buses
+/// are outputs of the transition verifier; the reduced-SWIRL buses
 /// are supplied by the retained-prefix source verifier and consumed here.
 #[derive(Clone, Copy, Debug)]
-pub struct ReducedSwirlVaccAggregateBuses {
+pub struct ReducedSwirlVaccTransitionBuses {
     pub main_transcript: TranscriptBus,
     pub digest_transcript: TranscriptBus,
     pub manifest_transcript: TranscriptBus,
@@ -5223,267 +4497,16 @@ pub struct ReducedSwirlVaccAggregateBuses {
     pub vacc_claim: NativeClaimValueBus,
     pub input_slot_layout: NativeInputSlotLayoutBus,
     pub fresh_count: NativeFreshCountBus,
-    pub source_claim: Option<ReducedSwirlSourceClaimBus>,
-    pub source_root: Option<ReducedSwirlSourceRootBus>,
-    pub source_beta: Option<ReducedSwirlSourceBetaBus>,
-    pub source_authority: Option<ReducedSwirlSourceAuthorityBus>,
-    /// Detached-only internal permutation from the canonical source digest
-    /// AIR into the source-summary AIR.
-    pub detached_source: Option<ReducedSwirlVaccDetachedSourceBus>,
-    /// Detached-only internal permutation carrying the independently
-    /// recomputed all-source manifest into the source-summary AIR.
-    pub summary_manifest: Option<ReducedSwirlVaccSummaryManifestBus>,
-    /// Detached-only public seam consumed by the source-tree bridge.
-    pub source_summary: Option<ReducedSwirlVaccSourceSummaryBus>,
-    /// Detached-only access to the setup-owned shared Poseidon compression
-    /// table. There is deliberately no local fallback table.
-    pub poseidon_compress: Option<Poseidon2CompressBus>,
+    pub source_claim: ReducedSwirlSourceClaimBus,
+    pub source_root: ReducedSwirlSourceRootBus,
+    pub source_beta: ReducedSwirlSourceBetaBus,
+    pub source_authority: ReducedSwirlSourceAuthorityBus,
     pub call: ReducedSwirlVaccCallBus,
     pub source_slot: ReducedSwirlVaccSourceSlotBus,
     pub source_entry_digest: ReducedSwirlSourceEntryDigestBus,
     pub header_end: ReducedSwirlVaccHeaderEndBus,
     pub manifest_digest: ReducedSwirlManifestDigestBus,
     pub chain_end: ReducedSwirlVaccChainEndBus,
-    pub footer: ReducedSwirlVaccFooterBus,
-    pub receipt: ReducedSwirlVaccChainReceiptBus,
-}
-
-/// Recursion-side aggregate component.  Its AIR list deliberately excludes
-/// the standard-v19 VACC algebra and the three transcript modules: callers
-/// append those existing components using the buses above.  This keeps the
-/// dependency acyclic while making omitted VACC verification an unbalanced
-/// lookup, rather than a host boolean.
-#[derive(Clone, Debug)]
-pub struct ReducedSwirlVaccAggregateComponent {
-    pub profile: ReducedSwirlVaccProfile,
-    pub source_mode: ReducedSwirlVaccSourceMode,
-    pub buses: ReducedSwirlVaccAggregateBuses,
-    pub root_tree_stride: usize,
-}
-
-impl ReducedSwirlVaccAggregateComponent {
-    pub fn validate(&self) -> Result<(), &'static str> {
-        self.profile.validate()?;
-        if self.root_tree_stride == 0 {
-            return Err("reduced-SWIRL direct-root stride");
-        }
-        let all_inline_buses = self.buses.source_claim.is_some()
-            && self.buses.source_root.is_some()
-            && self.buses.source_beta.is_some()
-            && self.buses.source_authority.is_some();
-        let no_inline_buses = self.buses.source_claim.is_none()
-            && self.buses.source_root.is_none()
-            && self.buses.source_beta.is_none()
-            && self.buses.source_authority.is_none();
-        let all_detached_buses = self.buses.detached_source.is_some()
-            && self.buses.summary_manifest.is_some()
-            && self.buses.source_summary.is_some()
-            && self.buses.poseidon_compress.is_some();
-        let no_detached_buses = self.buses.detached_source.is_none()
-            && self.buses.summary_manifest.is_none()
-            && self.buses.source_summary.is_none()
-            && self.buses.poseidon_compress.is_none();
-        if !(self.source_mode == ReducedSwirlVaccSourceMode::Inline
-            && all_inline_buses
-            && no_detached_buses
-            || self.source_mode == ReducedSwirlVaccSourceMode::Detached
-                && no_inline_buses
-                && all_detached_buses)
-        {
-            return Err("reduced-SWIRL source-linkage mode");
-        }
-        Ok(())
-    }
-
-    /// Adapter AIRs in the exact order returned by [`Self::generate_traces`].
-    pub fn airs<PCS>(&self) -> Vec<AirRef<PCS>>
-    where
-        PCS: StarkProtocolConfig<F = F>,
-    {
-        self.validate().expect("valid reduced-SWIRL VACC component");
-        let mut airs: Vec<AirRef<PCS>> = vec![
-            Arc::new(ReducedSwirlVaccHeaderAir {
-                profile: self.profile.clone(),
-                transcript_bus: self.buses.main_transcript,
-                end_bus: self.buses.header_end,
-            }),
-            Arc::new(ReducedSwirlVaccBatchAir {
-                transcript_bus: self.buses.main_transcript,
-                call_bus: self.buses.call,
-            }),
-            Arc::new(ReducedSwirlVaccPrefixAir {
-                transcript_bus: self.buses.main_transcript,
-                phase_cursor_bus: self.buses.phase_cursor,
-                call_bus: self.buses.call,
-                profile: self.profile.clone(),
-                require_genesis_first: true,
-            }),
-            Arc::new(ReducedSwirlVaccScheduleAir {
-                profile: self.profile.clone(),
-                call_bus: self.buses.call,
-                slot_bus: self.buses.source_slot,
-                input_slot_bus: self.buses.input_slot_layout,
-                fresh_count_bus: self.buses.fresh_count,
-                header_end_bus: self.buses.header_end,
-                vacc_end_bus: self.buses.standard_vacc_end,
-                vacc_root_bus: self.buses.standard_vacc_root,
-                vacc_digest_bus: self.buses.standard_vacc_digest,
-                checkpoint_bus: self.buses.certified_checkpoint,
-                resume_bus: self.buses.resume_state,
-                transcript_end_index_bus: self.buses.transcript_end_index,
-                chain_end_bus: self.buses.chain_end,
-                require_complete_chain: true,
-                leaf_physical_end: false,
-                transition_end_bus: None,
-            }),
-            Arc::new(ReducedSwirlSourceDigestAir {
-                profile: self.profile.clone(),
-                source_mode: self.source_mode,
-                root_tree_stride: self.root_tree_stride,
-                digest_transcript_bus: self.buses.digest_transcript,
-                main_transcript_bus: self.buses.main_transcript,
-                slot_bus: self.buses.source_slot,
-                authority_bus: self.buses.source_authority,
-                source_claim_bus: self.buses.source_claim,
-                source_root_bus: self.buses.source_root,
-                source_beta_bus: self.buses.source_beta,
-                detached_source_bus: self.buses.detached_source,
-                direct_source_bus: self.buses.direct_fresh_source,
-                direct_root_bus: self.buses.direct_fresh_root,
-                vacc_claim_bus: self.buses.vacc_claim,
-                entry_digest_bus: self.buses.source_entry_digest,
-            }),
-            Arc::new(ReducedSwirlManifestDigestAir {
-                maximum_sources: self.profile.maximum_sources,
-                transcript_bus: self.buses.manifest_transcript,
-                entry_digest_bus: self.buses.source_entry_digest,
-                manifest_digest_bus: self.buses.manifest_digest,
-                summary_manifest_bus: self.buses.summary_manifest,
-            }),
-        ];
-        if self.source_mode == ReducedSwirlVaccSourceMode::Detached {
-            airs.push(Arc::new(ReducedSwirlVaccSourceSummaryAir {
-                profile: self.profile.clone(),
-                source_bus: self
-                    .buses
-                    .detached_source
-                    .expect("validated detached source bus"),
-                manifest_bus: self
-                    .buses
-                    .summary_manifest
-                    .expect("validated detached manifest bus"),
-                transcript_bus: self.buses.manifest_transcript,
-                compress_bus: self
-                    .buses
-                    .poseidon_compress
-                    .expect("validated detached Poseidon compression bus"),
-                summary_bus: self
-                    .buses
-                    .source_summary
-                    .expect("validated detached source-summary bus"),
-            }));
-        }
-        airs.push(Arc::new(ReducedSwirlVaccFooterAir {
-            profile: self.profile.clone(),
-            transcript_bus: self.buses.main_transcript,
-            chain_end_bus: self.buses.chain_end,
-            manifest_digest_bus: self.buses.manifest_digest,
-            footer_bus: self.buses.footer,
-            receipt_bus: self.buses.receipt,
-        }));
-        airs
-    }
-
-    pub fn generate_traces(
-        &self,
-        record: &ReducedSwirlVaccAggregateRecord,
-    ) -> Result<ReducedSwirlVaccAggregateTraceArtifacts, &'static str> {
-        self.validate()?;
-        let source_count = record.sources.len();
-        let header = generate_reduced_swirl_vacc_header_trace(&self.profile, source_count)?;
-        let schedule =
-            generate_reduced_swirl_vacc_schedule_trace(&self.profile, source_count, &record.calls)?;
-        let batch = generate_reduced_swirl_vacc_batch_trace(&self.profile, &record.calls);
-        let prefix = generate_reduced_swirl_vacc_prefix_trace(&self.profile, &record.calls);
-        let source = generate_reduced_swirl_source_digest_trace(
-            &self.profile,
-            self.root_tree_stride,
-            &record.calls,
-            &record.sources,
-        )?;
-        let (manifest, manifest_digest, manifest_transcript_log) =
-            generate_reduced_swirl_manifest_digest_trace(
-                self.profile.maximum_sources,
-                &source.entry_digests,
-            )?;
-        let source_summary = if self.source_mode == ReducedSwirlVaccSourceMode::Detached {
-            Some(generate_reduced_swirl_vacc_source_summary_trace(
-                &self.profile,
-                &record.sources,
-                &source.entry_digests,
-                manifest_digest,
-            )?)
-        } else {
-            None
-        };
-        let footer = generate_reduced_swirl_vacc_footer_trace(
-            &self.profile,
-            source_count,
-            &record.calls,
-            manifest_digest,
-        )?;
-        let last = record
-            .calls
-            .last()
-            .ok_or("reduced-SWIRL empty VACC record")?;
-        let receipt = ReducedSwirlVaccChainReceiptMessage {
-            protocol_digest: self.profile.protocol_digest,
-            relation_digest: self.profile.relation_digest,
-            warp_index_digest: self.profile.warp_index_digest,
-            schedule_digest: self.profile.schedule_digest,
-            manifest_digest,
-            source_count: F::from_usize(source_count),
-            call_count: F::from_usize(record.calls.len()),
-            final_accumulator_digest: last.output_digest,
-            final_accumulator_root: last.output_root,
-        };
-        let mut traces = vec![header, batch, prefix, schedule, source.trace, manifest];
-        if let Some(summary) = &source_summary {
-            traces.push(summary.trace.clone());
-        }
-        traces.push(footer);
-        let (summary, source_summary_manifest_logs, source_summary_compression_inputs) =
-            source_summary.map_or_else(
-                || (None, Vec::new(), Vec::new()),
-                |artifacts| {
-                    (
-                        Some(artifacts.summary),
-                        artifacts.manifest_transcript_logs,
-                        artifacts.compression_inputs,
-                    )
-                },
-            );
-        Ok(ReducedSwirlVaccAggregateTraceArtifacts {
-            traces,
-            digest_transcript_logs: source.transcript_logs,
-            manifest_transcript_log,
-            source_summary_manifest_logs,
-            source_summary_compression_inputs,
-            source_summary: summary,
-            entry_digests: source.entry_digests,
-            manifest_digest,
-            receipt,
-        })
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReducedSwirlVaccAggregateRecord {
-    /// Each record must come from the native verifier's authenticated phase
-    /// spans and standard-v19 root/digest outputs.
-    pub calls: Vec<ReducedSwirlVaccCallRecord>,
-    /// Each source authority must come from the retained SWIRL source AIR.
-    pub sources: Vec<ReducedSwirlSourceDigestRecord>,
 }
 
 /// Setup-fixed aggregate for one physical recursive leaf.  It proves one
@@ -5493,7 +4516,7 @@ pub struct ReducedSwirlVaccAggregateRecord {
 #[derive(Clone, Debug)]
 pub struct ReducedSwirlVaccTransitionAggregateComponent {
     pub profile: ReducedSwirlVaccProfile,
-    pub buses: ReducedSwirlVaccAggregateBuses,
+    pub buses: ReducedSwirlVaccTransitionBuses,
     pub root_tree_stride: usize,
     pub transition_end_bus: ReducedSwirlVaccTransitionEndBus,
     pub transition_receipt_bus: ReducedSwirlVaccTransitionReceiptBus,
@@ -5502,16 +4525,7 @@ pub struct ReducedSwirlVaccTransitionAggregateComponent {
 impl ReducedSwirlVaccTransitionAggregateComponent {
     pub fn validate(&self) -> Result<(), &'static str> {
         self.profile.validate()?;
-        if self.root_tree_stride == 0
-            || self.buses.source_claim.is_none()
-            || self.buses.source_root.is_none()
-            || self.buses.source_beta.is_none()
-            || self.buses.source_authority.is_none()
-            || self.buses.detached_source.is_some()
-            || self.buses.summary_manifest.is_some()
-            || self.buses.source_summary.is_some()
-            || self.buses.poseidon_compress.is_some()
-        {
+        if self.root_tree_stride == 0 {
             return Err("reduced-SWIRL transition aggregate wiring");
         }
         Ok(())
@@ -5561,7 +4575,6 @@ impl ReducedSwirlVaccTransitionAggregateComponent {
             }),
             Arc::new(ReducedSwirlSourceDigestAir {
                 profile: self.profile.clone(),
-                source_mode: ReducedSwirlVaccSourceMode::Inline,
                 root_tree_stride: self.root_tree_stride,
                 digest_transcript_bus: self.buses.digest_transcript,
                 main_transcript_bus: self.buses.main_transcript,
@@ -5570,7 +4583,6 @@ impl ReducedSwirlVaccTransitionAggregateComponent {
                 source_claim_bus: self.buses.source_claim,
                 source_root_bus: self.buses.source_root,
                 source_beta_bus: self.buses.source_beta,
-                detached_source_bus: None,
                 direct_source_bus: self.buses.direct_fresh_source,
                 direct_root_bus: self.buses.direct_fresh_root,
                 vacc_claim_bus: self.buses.vacc_claim,
@@ -5581,7 +4593,6 @@ impl ReducedSwirlVaccTransitionAggregateComponent {
                 transcript_bus: self.buses.manifest_transcript,
                 entry_digest_bus: self.buses.source_entry_digest,
                 manifest_digest_bus: self.buses.manifest_digest,
-                summary_manifest_bus: None,
             }),
             Arc::new(ReducedSwirlVaccTransitionReceiptAir {
                 profile: self.profile.clone(),
@@ -5672,34 +4683,12 @@ pub struct ReducedSwirlVaccTransitionAggregateTraceArtifacts {
     pub receipt: ReducedSwirlVaccTransitionReceiptMessage<F>,
 }
 
-pub struct ReducedSwirlVaccAggregateTraceArtifacts {
-    /// One matrix per [`ReducedSwirlVaccAggregateComponent::airs`] entry.
-    pub traces: Vec<RowMajorMatrix<F>>,
-    /// Claim/entry digest logs, ordered as `(claim_0, entry_0, ...)`.
-    pub digest_transcript_logs: Vec<TranscriptLog<F, [F; POSEIDON2_WIDTH]>>,
-    pub manifest_transcript_log: TranscriptLog<F, [F; POSEIDON2_WIDTH]>,
-    /// Detached-only locally indexed manifest transcripts, one per source
-    /// leaf using the fixed capacity and contiguous partition.
-    pub source_summary_manifest_logs: Vec<TranscriptLog<F, [F; POSEIDON2_WIDTH]>>,
-    /// Detached-only genesis/chunk/chain compression requests for the shared
-    /// Poseidon table.
-    pub source_summary_compression_inputs: Vec<[F; 2 * DIGEST_SIZE]>,
-    /// Detached-only authenticated tail-link statement. It remains an
-    /// unresolved lookup until a source-tree bridge receives it.
-    pub source_summary: Option<ReducedSwirlVaccSourceSummaryMessage<F>>,
-    pub entry_digests: Vec<Digest>,
-    pub manifest_digest: Digest,
-    /// Field-identical to continuations' `ReducedSwirlVaccReceiptMessage`.
-    pub receipt: ReducedSwirlVaccChainReceiptMessage<F>,
-}
-
 #[cfg(test)]
 mod tests {
     use std::panic::AssertUnwindSafe;
 
     use openvm_stark_backend::{
         air_builders::{debug::check_constraints, symbolic::get_symbolic_builder},
-        interaction::SymbolicInteraction,
         keygen::types::TraceWidth,
     };
 
@@ -5864,10 +4853,13 @@ mod tests {
         );
     }
 
-    fn aggregate_record(
+    fn call_and_source_records(
         profile: &ReducedSwirlVaccProfile,
         source_count: usize,
-    ) -> ReducedSwirlVaccAggregateRecord {
+    ) -> (
+        Vec<ReducedSwirlVaccCallRecord>,
+        Vec<ReducedSwirlSourceDigestRecord>,
+    ) {
         let schedule = reduced_swirl_vacc_schedule(source_count, profile.input_arity).unwrap();
         let mut calls = Vec::new();
         let mut batch_start = reduced_swirl_vacc_header_elements(profile, source_count)
@@ -5942,156 +4934,7 @@ mod tests {
                 first_tree_id: (source * 8) as u32,
             })
             .collect();
-        ReducedSwirlVaccAggregateRecord { calls, sources }
-    }
-
-    #[test]
-    fn aggregate_trace_emits_constant_receipt_and_final_partial_batch() {
-        let mut profile = profile(8);
-        profile.maximum_sources = 16;
-        profile.source.maximum_sources = 16;
-        let record = aggregate_record(&profile, 9);
-        assert_eq!(
-            record
-                .calls
-                .iter()
-                .map(|call| call.call.fresh_count)
-                .collect::<Vec<_>>(),
-            vec![8, 1]
-        );
-        let buses = ReducedSwirlVaccAggregateBuses {
-            main_transcript: TranscriptBus::new(1),
-            digest_transcript: TranscriptBus::new(2),
-            manifest_transcript: TranscriptBus::new(3),
-            phase_cursor: NativeVaccPhaseCursorBus::new(4),
-            certified_checkpoint: CertifiedTranscriptCheckpointBus::new(5),
-            resume_state: ResumeTranscriptStateBus::new(6),
-            transcript_end_index: crate::bus::TranscriptEndIndexBus::new(27),
-            standard_vacc_end: NativeStandardVaccEndBus::new(7),
-            standard_vacc_root: NativeStandardVaccRootBus::new(8),
-            standard_vacc_digest: NativeStandardVaccDigestBus::new(9),
-            direct_fresh_source: NativeDirectFreshSourceBus::new(10),
-            direct_fresh_root: NativeDirectFreshRootBus::new(11),
-            vacc_claim: NativeClaimValueBus::new(12),
-            input_slot_layout: NativeInputSlotLayoutBus::new(25),
-            fresh_count: NativeFreshCountBus::new(26),
-            source_claim: Some(ReducedSwirlSourceClaimBus::new(13)),
-            source_root: Some(ReducedSwirlSourceRootBus::new(14)),
-            source_beta: Some(ReducedSwirlSourceBetaBus::new(15)),
-            source_authority: Some(ReducedSwirlSourceAuthorityBus::new(16)),
-            detached_source: None,
-            summary_manifest: None,
-            source_summary: None,
-            poseidon_compress: None,
-            call: ReducedSwirlVaccCallBus::new(17),
-            source_slot: ReducedSwirlVaccSourceSlotBus::new(18),
-            source_entry_digest: ReducedSwirlSourceEntryDigestBus::new(19),
-            header_end: ReducedSwirlVaccHeaderEndBus::new(20),
-            manifest_digest: ReducedSwirlManifestDigestBus::new(21),
-            chain_end: ReducedSwirlVaccChainEndBus::new(22),
-            footer: ReducedSwirlVaccFooterBus::new(23),
-            receipt: ReducedSwirlVaccChainReceiptBus::new(24),
-        };
-        let component = ReducedSwirlVaccAggregateComponent {
-            profile: profile.clone(),
-            source_mode: ReducedSwirlVaccSourceMode::Inline,
-            buses,
-            root_tree_stride: 1,
-        };
-        let artifacts = component.generate_traces(&record).unwrap();
-        assert_eq!(
-            component.airs::<BabyBearPoseidon2Config>().len(),
-            artifacts.traces.len()
-        );
-        assert_eq!(artifacts.traces.len(), 7);
-        assert_eq!(artifacts.entry_digests.len(), 9);
-        assert_eq!(artifacts.digest_transcript_logs.len(), 18);
-        assert_eq!(artifacts.receipt.source_count, F::from_usize(9));
-        assert_eq!(artifacts.receipt.call_count, F::from_usize(2));
-        let continuation_row = artifacts.traces[3]
-            .row_slice(1)
-            .expect("partial continuation schedule row");
-        let continuation: &ReducedSwirlVaccScheduleCols<F> = (*continuation_row).borrow();
-        assert_eq!(continuation.fresh_count, F::ONE);
-        assert_eq!(continuation.prior_count, F::ONE);
-        assert_eq!(continuation.fresh_selector[1], F::ONE);
-        // The setup-fixed arity is eight: one fresh slot, one prior slot, and
-        // six constrained dummy slots. No runtime relation shape is created.
-        assert_eq!(profile.input_arity - 1 - 1, 6);
-        assert_eq!(
-            artifacts.receipt.final_accumulator_root,
-            record.calls.last().unwrap().output_root
-        );
-        assert_eq!(
-            &artifacts.manifest_transcript_log.values()
-                [artifacts.manifest_transcript_log.len() - DIGEST_SIZE..],
-            &artifacts.manifest_digest
-        );
-        for (source, entry_digest) in artifacts.entry_digests.iter().enumerate() {
-            let log = &artifacts.digest_transcript_logs[2 * source + 1];
-            assert_eq!(&log.values()[log.len() - DIGEST_SIZE..], entry_digest);
-        }
-
-        let schedule_air = ReducedSwirlVaccScheduleAir {
-            profile: profile.clone(),
-            call_bus: buses.call,
-            slot_bus: buses.source_slot,
-            input_slot_bus: buses.input_slot_layout,
-            fresh_count_bus: buses.fresh_count,
-            header_end_bus: buses.header_end,
-            vacc_end_bus: buses.standard_vacc_end,
-            vacc_root_bus: buses.standard_vacc_root,
-            vacc_digest_bus: buses.standard_vacc_digest,
-            checkpoint_bus: buses.certified_checkpoint,
-            resume_bus: buses.resume_state,
-            transcript_end_index_bus: buses.transcript_end_index,
-            chain_end_bus: buses.chain_end,
-            require_complete_chain: true,
-            leaf_physical_end: false,
-            transition_end_bus: None,
-        };
-        check_constraints::<_, BabyBearPoseidon2Config>(
-            &schedule_air,
-            "ReducedSwirlVaccScheduleAir",
-            &None,
-            &[artifacts.traces[3].as_view()],
-            &[],
-        );
-        let mut malformed_schedule = artifacts.traces[3].clone();
-        let first: &mut ReducedSwirlVaccScheduleCols<F> =
-            malformed_schedule.values[..ReducedSwirlVaccScheduleCols::<F>::width()].borrow_mut();
-        first.fresh_selector[8] = F::ZERO;
-        first.fresh_selector[7] = F::ONE;
-        assert!(std::panic::catch_unwind(AssertUnwindSafe(|| {
-            check_constraints::<_, BabyBearPoseidon2Config>(
-                &schedule_air,
-                "ReducedSwirlVaccScheduleAir",
-                &None,
-                &[malformed_schedule.as_view()],
-                &[],
-            );
-        }))
-        .is_err());
-
-        let mut wrong_prior = record.clone();
-        wrong_prior.calls[1].prior_root = Some(digest(99_000));
-        assert!(component.generate_traces(&wrong_prior).is_err());
-        let mut wrong_boundary = record.clone();
-        wrong_boundary.calls[1].vacc_start_tidx += D_EF;
-        assert!(component.generate_traces(&wrong_boundary).is_err());
-        let mut wrong_mode = record.clone();
-        wrong_mode.calls[1].call.prior_count = 0;
-        assert!(component.generate_traces(&wrong_mode).is_err());
-
-        let mut reordered = record.clone();
-        reordered.sources.swap(0, 1);
-        let reordered_artifacts = component.generate_traces(&reordered).unwrap();
-        assert_ne!(
-            artifacts.manifest_digest,
-            reordered_artifacts.manifest_digest
-        );
-
-        assert!(reduced_swirl_vacc_header_elements(&profile, 17).is_err());
+        (calls, sources)
     }
 
     #[test]
@@ -6099,16 +4942,15 @@ mod tests {
         let mut profile = profile(8);
         profile.maximum_sources = 16;
         profile.source.maximum_sources = 16;
-        let record = aggregate_record(&profile, 9);
+        let (calls, sources) = call_and_source_records(&profile, 9);
         let complete =
-            generate_reduced_swirl_source_digest_trace(&profile, 1, &record.calls, &record.sources)
-                .unwrap();
+            generate_reduced_swirl_source_digest_trace(&profile, 1, &calls, &sources).unwrap();
         let bounded = generate_reduced_swirl_source_digest_range_trace(
             &profile,
             1,
             8,
-            &record.calls[1..],
-            &record.sources[8..],
+            &calls[1..],
+            &sources[8..],
             8,
         )
         .unwrap();
@@ -6126,311 +4968,11 @@ mod tests {
             &profile,
             1,
             7,
-            &record.calls[1..],
-            &record.sources[8..],
+            &calls[1..],
+            &sources[8..],
             8,
         )
         .is_err());
-    }
-
-    fn symbolic_source_interactions(
-        air: &ReducedSwirlSourceDigestAir,
-    ) -> Vec<SymbolicInteraction<F>> {
-        get_symbolic_builder(
-            air,
-            &TraceWidth {
-                preprocessed: None,
-                cached_mains: air.cached_main_widths(),
-                common_main: air.common_main_width(),
-            },
-        )
-        .constraints()
-        .interactions
-    }
-
-    fn source_digest_air(
-        profile: &ReducedSwirlVaccProfile,
-        buses: ReducedSwirlVaccAggregateBuses,
-        source_mode: ReducedSwirlVaccSourceMode,
-    ) -> ReducedSwirlSourceDigestAir {
-        ReducedSwirlSourceDigestAir {
-            profile: profile.clone(),
-            source_mode,
-            root_tree_stride: 1,
-            digest_transcript_bus: buses.digest_transcript,
-            main_transcript_bus: buses.main_transcript,
-            slot_bus: buses.source_slot,
-            authority_bus: buses.source_authority,
-            source_claim_bus: buses.source_claim,
-            source_root_bus: buses.source_root,
-            source_beta_bus: buses.source_beta,
-            detached_source_bus: buses.detached_source,
-            direct_source_bus: buses.direct_fresh_source,
-            direct_root_bus: buses.direct_fresh_root,
-            vacc_claim_bus: buses.vacc_claim,
-            entry_digest_bus: buses.source_entry_digest,
-        }
-    }
-
-    #[test]
-    fn detached_mode_omits_only_source_receipt_interactions() {
-        let profile = profile(8);
-        let inline_buses = ReducedSwirlVaccAggregateBuses {
-            main_transcript: TranscriptBus::new(1),
-            digest_transcript: TranscriptBus::new(2),
-            manifest_transcript: TranscriptBus::new(3),
-            phase_cursor: NativeVaccPhaseCursorBus::new(4),
-            certified_checkpoint: CertifiedTranscriptCheckpointBus::new(5),
-            resume_state: ResumeTranscriptStateBus::new(6),
-            transcript_end_index: crate::bus::TranscriptEndIndexBus::new(27),
-            standard_vacc_end: NativeStandardVaccEndBus::new(7),
-            standard_vacc_root: NativeStandardVaccRootBus::new(8),
-            standard_vacc_digest: NativeStandardVaccDigestBus::new(9),
-            direct_fresh_source: NativeDirectFreshSourceBus::new(10),
-            direct_fresh_root: NativeDirectFreshRootBus::new(11),
-            vacc_claim: NativeClaimValueBus::new(12),
-            input_slot_layout: NativeInputSlotLayoutBus::new(25),
-            fresh_count: NativeFreshCountBus::new(26),
-            source_claim: Some(ReducedSwirlSourceClaimBus::new(13)),
-            source_root: Some(ReducedSwirlSourceRootBus::new(14)),
-            source_beta: Some(ReducedSwirlSourceBetaBus::new(15)),
-            source_authority: Some(ReducedSwirlSourceAuthorityBus::new(16)),
-            detached_source: None,
-            summary_manifest: None,
-            source_summary: None,
-            poseidon_compress: None,
-            call: ReducedSwirlVaccCallBus::new(17),
-            source_slot: ReducedSwirlVaccSourceSlotBus::new(18),
-            source_entry_digest: ReducedSwirlSourceEntryDigestBus::new(19),
-            header_end: ReducedSwirlVaccHeaderEndBus::new(20),
-            manifest_digest: ReducedSwirlManifestDigestBus::new(21),
-            chain_end: ReducedSwirlVaccChainEndBus::new(22),
-            footer: ReducedSwirlVaccFooterBus::new(23),
-            receipt: ReducedSwirlVaccChainReceiptBus::new(24),
-        };
-        let inline = source_digest_air(&profile, inline_buses, ReducedSwirlVaccSourceMode::Inline);
-        let mut detached_buses = inline_buses;
-        detached_buses.source_claim = None;
-        detached_buses.source_root = None;
-        detached_buses.source_beta = None;
-        detached_buses.source_authority = None;
-        detached_buses.detached_source = Some(ReducedSwirlVaccDetachedSourceBus::new(28));
-        detached_buses.summary_manifest = Some(ReducedSwirlVaccSummaryManifestBus::new(29));
-        detached_buses.source_summary = Some(ReducedSwirlVaccSourceSummaryBus::new(30));
-        detached_buses.poseidon_compress = Some(Poseidon2CompressBus::new(31));
-        let detached = source_digest_air(
-            &profile,
-            detached_buses,
-            ReducedSwirlVaccSourceMode::Detached,
-        );
-        let inline_interactions = symbolic_source_interactions(&inline);
-        let detached_interactions = symbolic_source_interactions(&detached);
-        let count = |interactions: &[SymbolicInteraction<F>], bus_index| {
-            interactions
-                .iter()
-                .filter(|interaction| interaction.bus_index == bus_index)
-                .count()
-        };
-
-        for bus_index in [13, 14, 15, 16] {
-            assert!(count(&inline_interactions, bus_index) > 0);
-            assert_eq!(count(&detached_interactions, bus_index), 0);
-        }
-        for bus_index in [10, 11, 12] {
-            let inline_count = count(&inline_interactions, bus_index);
-            assert!(inline_count > 0);
-            assert_eq!(count(&detached_interactions, bus_index), inline_count);
-        }
-    }
-
-    #[test]
-    fn detached_and_inline_modes_emit_identical_receipts_and_claim_sensitive_manifests() {
-        let mut profile = profile(8);
-        profile.maximum_sources = 16;
-        profile.source.maximum_sources = 16;
-        let record = aggregate_record(&profile, 9);
-        let inline_buses = ReducedSwirlVaccAggregateBuses {
-            main_transcript: TranscriptBus::new(1),
-            digest_transcript: TranscriptBus::new(2),
-            manifest_transcript: TranscriptBus::new(3),
-            phase_cursor: NativeVaccPhaseCursorBus::new(4),
-            certified_checkpoint: CertifiedTranscriptCheckpointBus::new(5),
-            resume_state: ResumeTranscriptStateBus::new(6),
-            transcript_end_index: crate::bus::TranscriptEndIndexBus::new(27),
-            standard_vacc_end: NativeStandardVaccEndBus::new(7),
-            standard_vacc_root: NativeStandardVaccRootBus::new(8),
-            standard_vacc_digest: NativeStandardVaccDigestBus::new(9),
-            direct_fresh_source: NativeDirectFreshSourceBus::new(10),
-            direct_fresh_root: NativeDirectFreshRootBus::new(11),
-            vacc_claim: NativeClaimValueBus::new(12),
-            input_slot_layout: NativeInputSlotLayoutBus::new(25),
-            fresh_count: NativeFreshCountBus::new(26),
-            source_claim: Some(ReducedSwirlSourceClaimBus::new(13)),
-            source_root: Some(ReducedSwirlSourceRootBus::new(14)),
-            source_beta: Some(ReducedSwirlSourceBetaBus::new(15)),
-            source_authority: Some(ReducedSwirlSourceAuthorityBus::new(16)),
-            detached_source: None,
-            summary_manifest: None,
-            source_summary: None,
-            poseidon_compress: None,
-            call: ReducedSwirlVaccCallBus::new(17),
-            source_slot: ReducedSwirlVaccSourceSlotBus::new(18),
-            source_entry_digest: ReducedSwirlSourceEntryDigestBus::new(19),
-            header_end: ReducedSwirlVaccHeaderEndBus::new(20),
-            manifest_digest: ReducedSwirlManifestDigestBus::new(21),
-            chain_end: ReducedSwirlVaccChainEndBus::new(22),
-            footer: ReducedSwirlVaccFooterBus::new(23),
-            receipt: ReducedSwirlVaccChainReceiptBus::new(24),
-        };
-        let inline = ReducedSwirlVaccAggregateComponent {
-            profile: profile.clone(),
-            source_mode: ReducedSwirlVaccSourceMode::Inline,
-            buses: inline_buses,
-            root_tree_stride: 1,
-        };
-        let mut detached_buses = inline_buses;
-        detached_buses.source_claim = None;
-        detached_buses.source_root = None;
-        detached_buses.source_beta = None;
-        detached_buses.source_authority = None;
-        detached_buses.detached_source = Some(ReducedSwirlVaccDetachedSourceBus::new(28));
-        detached_buses.summary_manifest = Some(ReducedSwirlVaccSummaryManifestBus::new(29));
-        detached_buses.source_summary = Some(ReducedSwirlVaccSourceSummaryBus::new(30));
-        detached_buses.poseidon_compress = Some(Poseidon2CompressBus::new(31));
-        let detached = ReducedSwirlVaccAggregateComponent {
-            profile,
-            source_mode: ReducedSwirlVaccSourceMode::Detached,
-            buses: detached_buses,
-            root_tree_stride: 1,
-        };
-        let inline_artifacts = inline.generate_traces(&record).unwrap();
-        let detached_artifacts = detached.generate_traces(&record).unwrap();
-        assert_eq!(inline_artifacts.traces.len(), 7);
-        assert_eq!(detached_artifacts.traces.len(), 8);
-        assert_eq!(inline_artifacts.receipt, detached_artifacts.receipt);
-        assert_eq!(
-            inline_artifacts.entry_digests,
-            detached_artifacts.entry_digests
-        );
-        assert_eq!(
-            inline_artifacts.manifest_digest,
-            detached_artifacts.manifest_digest
-        );
-        for (inline_trace, detached_trace) in inline_artifacts.traces[..6]
-            .iter()
-            .zip(&detached_artifacts.traces[..6])
-        {
-            assert_eq!(inline_trace.width(), detached_trace.width());
-            assert_eq!(inline_trace.values, detached_trace.values);
-        }
-        assert_eq!(
-            inline_artifacts.traces[6].width(),
-            detached_artifacts.traces[7].width()
-        );
-        assert_eq!(
-            inline_artifacts.traces[6].values,
-            detached_artifacts.traces[7].values
-        );
-        assert!(inline_artifacts.source_summary.is_none());
-        let summary = detached_artifacts
-            .source_summary
-            .as_ref()
-            .expect("detached source summary");
-        assert_eq!(summary.manifest_digest, detached_artifacts.manifest_digest);
-        assert_eq!(summary.source_count, F::from_usize(record.sources.len()));
-        assert_eq!(
-            summary.source_leaf_capacity,
-            F::from_usize(REDUCED_SWIRL_VACC_SOURCE_LEAF_CAPACITY)
-        );
-        assert_eq!(
-            summary.program_commitment,
-            record.sources[0].authority.program_commitment
-        );
-        assert_eq!(summary.initial_pc, record.sources[0].authority.initial_pc);
-        assert_eq!(
-            summary.initial_root,
-            record.sources[0].authority.initial_root
-        );
-        assert_eq!(
-            summary.final_pc,
-            record.sources.last().unwrap().authority.final_pc
-        );
-        assert_eq!(
-            summary.final_root,
-            record.sources.last().unwrap().authority.final_root
-        );
-        assert_eq!(detached_artifacts.source_summary_manifest_logs.len(), 2);
-        assert_eq!(
-            detached_artifacts.source_summary_compression_inputs.len(),
-            5
-        );
-
-        let mut mutated = record;
-        mutated.sources[0].claim.beta[0] += EF::ONE;
-        let mutated_artifacts = detached.generate_traces(&mutated).unwrap();
-        assert_ne!(
-            detached_artifacts.manifest_digest,
-            mutated_artifacts.manifest_digest
-        );
-        assert_ne!(
-            detached_artifacts
-                .source_summary
-                .unwrap()
-                .chunk_chain_endpoint,
-            mutated_artifacts
-                .source_summary
-                .unwrap()
-                .chunk_chain_endpoint
-        );
-    }
-
-    #[test]
-    fn detached_summary_uses_fixed_contiguous_source_leaf_partition() {
-        let mut profile = profile(8);
-        profile.maximum_sources = 128;
-        profile.source.maximum_sources = 128;
-        let record = aggregate_record(&profile, 65);
-        let source =
-            generate_reduced_swirl_source_digest_trace(&profile, 1, &record.calls, &record.sources)
-                .unwrap();
-        let global_manifest = reduced_swirl_manifest_digest(&source.entry_digests).unwrap();
-        let artifacts = generate_reduced_swirl_vacc_source_summary_trace(
-            &profile,
-            &record.sources,
-            &source.entry_digests,
-            global_manifest,
-        )
-        .unwrap();
-        assert_eq!(artifacts.manifest_transcript_logs.len(), 9);
-        assert_eq!(artifacts.compression_inputs.len(), 19);
-
-        let genesis_domain = core::array::from_fn(|index| match index {
-            0 => F::from_u32(REDUCED_SWIRL_VACC_SOURCE_CHAIN_METADATA_TAG),
-            1 => F::from_u32(REDUCED_SWIRL_VACC_SOURCE_LEAF_PROTOCOL_VERSION),
-            _ => F::ZERO,
-        });
-        let mut expected =
-            poseidon2_compress_with_capacity(profile.protocol_digest, genesis_domain).0;
-        for (chunk_index, chunk) in source
-            .entry_digests
-            .chunks(REDUCED_SWIRL_VACC_SOURCE_LEAF_CAPACITY)
-            .enumerate()
-        {
-            let metadata = core::array::from_fn(|index| match index {
-                0 => F::from_u32(REDUCED_SWIRL_VACC_SOURCE_CHAIN_METADATA_TAG),
-                1 => F::from_u32(REDUCED_SWIRL_VACC_SOURCE_LEAF_PROTOCOL_VERSION),
-                2 => F::from_usize(chunk_index * REDUCED_SWIRL_VACC_SOURCE_LEAF_CAPACITY),
-                3 => F::from_usize(chunk.len()),
-                _ => F::ZERO,
-            });
-            let chunk_commitment = poseidon2_compress_with_capacity(
-                metadata,
-                reduced_swirl_manifest_digest(chunk).unwrap(),
-            )
-            .0;
-            expected = poseidon2_compress_with_capacity(expected, chunk_commitment).0;
-        }
-        assert_eq!(artifacts.summary.chunk_chain_endpoint, expected);
     }
 
     fn reconciliation_air(

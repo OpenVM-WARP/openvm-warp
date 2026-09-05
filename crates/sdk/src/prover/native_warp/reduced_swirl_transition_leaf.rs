@@ -5,13 +5,6 @@
 use core::mem::size_of;
 use std::sync::Arc;
 
-use openvm_continuations::circuit::{
-    reduced_swirl_source_receipt::ReducedSwirlSourceReceiptMode,
-    reduced_swirl_transition_leaf::{
-        ReducedSwirlTransitionLeafComponents, REDUCED_SWIRL_TRANSITION_LEAF_CAPACITY,
-    },
-    reduced_swirl_warp::{ReducedSwirlExecutionBus, ReducedSwirlSourceReceiptBus},
-};
 #[cfg(feature = "cuda")]
 use openvm_continuations::circuit::{
     reduced_swirl_transition_leaf::{
@@ -22,13 +15,19 @@ use openvm_continuations::circuit::{
     reduced_swirl_warp::ReducedSwirlSourceReceiptMessage,
     Circuit,
 };
+use openvm_continuations::circuit::{
+    reduced_swirl_transition_leaf::{
+        ReducedSwirlTransitionLeafComponents, REDUCED_SWIRL_TRANSITION_LEAF_CAPACITY,
+    },
+    reduced_swirl_warp::{ReducedSwirlExecutionBus, ReducedSwirlSourceReceiptBus},
+};
 #[cfg(feature = "cuda")]
 use openvm_cuda_backend::{
     BabyBearPoseidon2GpuEngine, GpuBackend, GpuDevice, GpuPreprocessedCommitter,
 };
 use openvm_recursion_circuit::{
     bus::{Poseidon2CompressBus, TranscriptBus},
-    native_warp::{NativeWarpTranscriptModule, ReducedSwirlVaccSourceMode},
+    native_warp::NativeWarpTranscriptModule,
     system::AggregationSubCircuit,
 };
 #[cfg(feature = "cuda")]
@@ -53,12 +52,12 @@ use openvm_stark_sdk::config::baby_bear_poseidon2::{Digest, F};
 use openvm_verify_stark_host::pvs::{VerifierBasePvs, VmPvs};
 
 #[cfg(feature = "cuda")]
-use super::reduced_swirl_wrapper_system_cuda::transport_reduced_swirl_wrapper_contexts_to_cuda;
+use super::reduced_swirl_cuda_transport::transport_reduced_swirl_contexts_to_cuda;
 use super::{
+    reduced_swirl_error::ReducedSwirlWrapperSystemError,
     reduced_swirl_source_receipt::ProductionReducedSwirlSourceReceiptComponent,
     reduced_swirl_vacc_component::ProductionReducedSwirlVaccComponent,
     reduced_swirl_wrapper_components::ReducedSwirlVerifierComponent,
-    reduced_swirl_wrapper_system::ReducedSwirlWrapperSystemError,
 };
 #[cfg(feature = "cuda")]
 use super::{
@@ -95,8 +94,6 @@ impl<const CAPACITY: usize> ProductionReducedSwirlTransitionLeafComponents<CAPAC
             || source.inner().receipt_air().profile.source.maximum_sources != CAPACITY
             || source.inner().params() != &params
             || vacc.profile().input_arity != CAPACITY
-            || source.mode() != ReducedSwirlSourceReceiptMode::Inline
-            || vacc.source_mode() != ReducedSwirlVaccSourceMode::Inline
             || vacc.source_authority_bus().index()
                 != source.inner().receipt_air().authority_bus.index()
         {
@@ -397,8 +394,8 @@ impl<const CAPACITY: usize> ReducedSwirlTransitionLeafCudaProver<CAPACITY> {
 
     /// Prove one canonical transition and consume both witness packets.
     ///
-    /// `source_packet` must have been generated in bounded Inline mode on the
-    /// same device and be ordered before this prover's stream. The source and
+    /// `source_packet` must have been generated on the same device and be
+    /// ordered before this prover's stream. The source and
     /// VACC typed receipts are joined by the transition boundary AIR;
     /// `chain_before` is authenticated into both input and output state
     /// digests.
@@ -462,7 +459,7 @@ impl<const CAPACITY: usize> ReducedSwirlTransitionLeafCudaProver<CAPACITY> {
             .enumerate()
             .collect::<Vec<_>>();
         let device_vacc =
-            transport_reduced_swirl_wrapper_contexts_to_cuda(self.engine.device(), indexed_vacc)?;
+            transport_reduced_swirl_contexts_to_cuda(self.engine.device(), indexed_vacc)?;
         let expected = expected_public_values(
             core.verifier_public_values.clone(),
             core.vm_public_values.clone(),

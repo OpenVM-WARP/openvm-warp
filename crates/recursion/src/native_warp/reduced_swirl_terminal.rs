@@ -398,43 +398,6 @@ impl ReducedSwirlTerminalProductionSetup {
             self.system_params.clone(),
         )
     }
-
-    /// SDK integration seam for a verifier-recorded native terminal.
-    ///
-    /// The SDK converts `ReducedSwirlNativeVerification` plus its checked
-    /// proof descriptor/derived Eq statement into `record`; this crate cannot
-    /// name that SDK type without creating the forbidden SDK -> recursion ->
-    /// SDK dependency cycle. The returned packet contains the complete local
-    /// CPU AIR context inventory and typed receipt, while the returned
-    /// component supplies the corresponding setup-fixed AIRs.
-    #[allow(clippy::too_many_arguments)]
-    pub fn instantiate_and_generate_cpu_contexts<SC: StarkProtocolConfig<F = F>>(
-        &self,
-        verifier_component_digest: Digest,
-        shared: &BusInventory,
-        main_transcript_bus: TranscriptBus,
-        vacc_footer_bus: ReducedSwirlVaccFooterBus,
-        wrapper_terminal_receipt_bus_idx: BusIndex,
-        first_internal_bus_idx: BusIndex,
-        record: ReducedSwirlTerminalRecord<'_>,
-    ) -> Result<
-        (
-            ReducedSwirlTerminalComponent,
-            ReducedSwirlTerminalCpuPacket<SC>,
-        ),
-        ReducedSwirlTerminalError,
-    > {
-        let component = self.instantiate(
-            verifier_component_digest,
-            shared,
-            main_transcript_bus,
-            vacc_footer_bus,
-            wrapper_terminal_receipt_bus_idx,
-            first_internal_bus_idx,
-        )?;
-        let packet = component.generate_cpu_contexts::<SC>(record)?;
-        Ok((component, packet))
-    }
 }
 
 fn fixed_material_digest(tag: u64, material: &[F]) -> Digest {
@@ -694,21 +657,6 @@ impl ReducedSwirlTerminalSetupIdentity {
     #[must_use]
     pub fn round_count(&self) -> usize {
         self.num_queries_per_round.len()
-    }
-
-    #[must_use]
-    pub fn receipt_protocol_digest(&self) -> Digest {
-        self.protocol_digest
-    }
-
-    #[must_use]
-    pub fn receipt_relation_digest(&self) -> Digest {
-        self.relation_digest
-    }
-
-    #[must_use]
-    pub fn receipt_terminal_index_digest(&self) -> Digest {
-        self.terminal_index_digest
     }
 
     #[must_use]

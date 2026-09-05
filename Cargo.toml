@@ -1,10 +1,10 @@
 [patch."https://github.com/openvm-org/stark-backend.git"]
-openvm-stark-backend = { git = "https://github.com/OpenVM-WARP/stark-backend-warp.git", rev = "f1d9da7943a70793945c7acc7ecf17f41e501a82" }
-openvm-stark-sdk = { git = "https://github.com/OpenVM-WARP/stark-backend-warp.git", rev = "f1d9da7943a70793945c7acc7ecf17f41e501a82" }
-openvm-cpu-backend = { git = "https://github.com/OpenVM-WARP/stark-backend-warp.git", rev = "f1d9da7943a70793945c7acc7ecf17f41e501a82" }
-openvm-cuda-backend = { git = "https://github.com/OpenVM-WARP/stark-backend-warp.git", rev = "f1d9da7943a70793945c7acc7ecf17f41e501a82" }
-openvm-cuda-builder = { git = "https://github.com/OpenVM-WARP/stark-backend-warp.git", rev = "f1d9da7943a70793945c7acc7ecf17f41e501a82" }
-openvm-cuda-common = { git = "https://github.com/OpenVM-WARP/stark-backend-warp.git", rev = "f1d9da7943a70793945c7acc7ecf17f41e501a82" }
+openvm-stark-backend = { path = "../stark-backend-native-warp-rv64/crates/stark-backend" }
+openvm-stark-sdk = { path = "../stark-backend-native-warp-rv64/crates/stark-sdk" }
+openvm-cpu-backend = { path = "../stark-backend-native-warp-rv64/crates/cpu-backend" }
+openvm-cuda-backend = { path = "../stark-backend-native-warp-rv64/crates/cuda-backend" }
+openvm-cuda-builder = { path = "../stark-backend-native-warp-rv64/crates/cuda-builder" }
+openvm-cuda-common = { path = "../stark-backend-native-warp-rv64/crates/cuda-common" }
 
 
 

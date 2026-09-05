@@ -196,111 +196,6 @@ impl<AB: AirBuilder<F = F> + InteractionBuilder> Air<AB> for NativeOpeningPaddin
     }
 }
 
-#[repr(C)]
-#[derive(AlignedBorrow, StructReflection)]
-pub struct NativeOodPointCols<T> {
-    pub active: T,
-    pub ood: T,
-    pub coordinate: T,
-    pub proof_idx: T,
-    pub tidx: T,
-    pub value: [T; D_EF],
-}
-
-#[derive(ColumnsAir)]
-#[columns_via(NativeOodPointCols<u8>)]
-pub struct NativeOodPointAir {
-    pub transcript_bus: TranscriptBus,
-    pub opening_bus: NativeOpeningClaimBus,
-}
-
-impl BaseAirWithPublicValues<F> for NativeOodPointAir {}
-impl PartitionedBaseAir<F> for NativeOodPointAir {}
-impl<F> BaseAir<F> for NativeOodPointAir {
-    fn width(&self) -> usize {
-        NativeOodPointCols::<F>::width()
-    }
-}
-
-impl<AB: AirBuilder<F = F> + InteractionBuilder> Air<AB> for NativeOodPointAir {
-    fn eval(&self, builder: &mut AB) {
-        let main = builder.main();
-        let row = main.row_slice(0).expect("native OOD point row");
-        let local: &NativeOodPointCols<AB::Var> = (*row).borrow();
-        builder.assert_bool(local.active);
-        self.transcript_bus.sample_ext(
-            builder,
-            local.proof_idx,
-            local.tidx,
-            local.value,
-            local.active,
-        );
-        self.opening_bus.send(
-            builder,
-            NativeOpeningClaimMessage {
-                proof_idx: local.proof_idx.into(),
-                claim: local.ood + AB::F::ONE,
-                section: AB::Expr::from_usize(OPENING_SECTION_POINT),
-                coordinate: local.coordinate.into(),
-                value: local.value.map(Into::into),
-            },
-            local.active,
-        );
-    }
-}
-
-#[repr(C)]
-#[derive(AlignedBorrow, StructReflection)]
-pub struct NativeOodTargetCols<T> {
-    pub active: T,
-    pub ood: T,
-    pub proof_idx: T,
-    pub tidx: T,
-    pub value: [T; D_EF],
-}
-
-#[derive(ColumnsAir)]
-#[columns_via(NativeOodTargetCols<u8>)]
-pub struct NativeOodTargetAir {
-    pub transcript_bus: TranscriptBus,
-    pub opening_bus: NativeOpeningClaimBus,
-}
-
-impl BaseAirWithPublicValues<F> for NativeOodTargetAir {}
-impl PartitionedBaseAir<F> for NativeOodTargetAir {}
-impl<F> BaseAir<F> for NativeOodTargetAir {
-    fn width(&self) -> usize {
-        NativeOodTargetCols::<F>::width()
-    }
-}
-
-impl<AB: AirBuilder<F = F> + InteractionBuilder> Air<AB> for NativeOodTargetAir {
-    fn eval(&self, builder: &mut AB) {
-        let main = builder.main();
-        let row = main.row_slice(0).expect("native OOD target row");
-        let local: &NativeOodTargetCols<AB::Var> = (*row).borrow();
-        builder.assert_bool(local.active);
-        self.transcript_bus.observe_ext(
-            builder,
-            local.proof_idx,
-            local.tidx,
-            local.value,
-            local.active,
-        );
-        self.opening_bus.send(
-            builder,
-            NativeOpeningClaimMessage {
-                proof_idx: local.proof_idx.into(),
-                claim: local.ood + AB::F::ONE,
-                section: AB::Expr::from_usize(OPENING_SECTION_TARGET),
-                coordinate: AB::Expr::ZERO,
-                value: local.value.map(Into::into),
-            },
-            local.active,
-        );
-    }
-}
-
 pub fn generate_native_initial_opening_point_trace(
     proof_idx: usize,
     values: &[EF],
@@ -384,73 +279,6 @@ pub fn generate_native_opening_padding_trace(
     Some(RowMajorMatrix::new(trace, width))
 }
 
-pub fn generate_native_ood_point_trace(
-    proof_idx: usize,
-    points: &[Vec<EF>],
-    tidx: &[usize],
-) -> Option<RowMajorMatrix<F>> {
-    if points.is_empty() {
-        if !tidx.is_empty() {
-            return None;
-        }
-        let width = NativeOodPointCols::<F>::width();
-        return Some(RowMajorMatrix::new(vec![F::ZERO; width], width));
-    }
-    let dimension = points.first()?.len();
-    if points.len() != tidx.len() || points.iter().any(|point| point.len() != dimension) {
-        return None;
-    }
-    let valid_rows = points.len() * dimension;
-    let height = valid_rows.next_power_of_two();
-    let width = NativeOodPointCols::<F>::width();
-    let mut trace = vec![F::ZERO; height * width];
-    for (ood, point) in points.iter().enumerate() {
-        for (coordinate, value) in point.iter().enumerate() {
-            let row_index = ood * dimension + coordinate;
-            let cols: &mut NativeOodPointCols<F> =
-                trace[row_index * width..(row_index + 1) * width].borrow_mut();
-            cols.active = F::ONE;
-            cols.ood = F::from_usize(ood);
-            cols.coordinate = F::from_usize(coordinate);
-            cols.proof_idx = F::from_usize(proof_idx);
-            cols.tidx = F::from_usize(tidx[ood] + coordinate * D_EF);
-            cols.value
-                .copy_from_slice(value.as_basis_coefficients_slice());
-        }
-    }
-    Some(RowMajorMatrix::new(trace, width))
-}
-
-pub fn generate_native_ood_target_trace(
-    proof_idx: usize,
-    values: &[EF],
-    tidx: &[usize],
-) -> Option<RowMajorMatrix<F>> {
-    if values.is_empty() {
-        if !tidx.is_empty() {
-            return None;
-        }
-        let width = NativeOodTargetCols::<F>::width();
-        return Some(RowMajorMatrix::new(vec![F::ZERO; width], width));
-    }
-    if values.len() != tidx.len() {
-        return None;
-    }
-    let height = values.len().next_power_of_two();
-    let width = NativeOodTargetCols::<F>::width();
-    let mut trace = vec![F::ZERO; height * width];
-    for (ood, value) in values.iter().enumerate() {
-        let cols: &mut NativeOodTargetCols<F> = trace[ood * width..(ood + 1) * width].borrow_mut();
-        cols.active = F::ONE;
-        cols.ood = F::from_usize(ood);
-        cols.proof_idx = F::from_usize(proof_idx);
-        cols.tidx = F::from_usize(tidx[ood]);
-        cols.value
-            .copy_from_slice(value.as_basis_coefficients_slice());
-    }
-    Some(RowMajorMatrix::new(trace, width))
-}
-
 /// One out-of-domain claim row: either a sampled point coordinate or the
 /// observed answer at that point.
 ///
@@ -458,9 +286,8 @@ pub fn generate_native_ood_target_trace(
 /// perform and which opening section they name. Every AIR costs the prover a
 /// fixed amount regardless of how little it holds -- measured at ~1.58 ms
 /// against the recursive lane's own layers -- and these two hold nine and eight
-/// cells. Merging them is a straight saving, and it is what brings a bounded
-/// history span at arity four under the child-AIR cap it currently misses by
-/// one.
+/// cells. Merging them saves one AIR while preserving the transcript and
+/// opening-claim messages exactly.
 #[repr(C)]
 #[derive(AlignedBorrow, StructReflection)]
 pub struct NativeOodClaimCols<T> {

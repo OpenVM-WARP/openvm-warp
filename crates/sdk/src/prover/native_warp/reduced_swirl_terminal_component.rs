@@ -17,7 +17,7 @@ use openvm_stark_backend::{
     hasher::MerkleHasher,
     native_warp::native_accumulator_instance_digest_preimage,
     p3_field::{BasedVectorSpace, PrimeCharacteristicRing},
-    transcript::{TranscriptCheckpoint, TranscriptHistory, TranscriptLog},
+    transcript::{TranscriptCheckpoint, TranscriptLog},
     warp_accum::{derive_swirl_constrained_rs_terminal_statement, TerminalConstrainedRsStatement},
     AirRef, StarkProtocolConfig,
 };
@@ -41,18 +41,6 @@ pub enum ReducedSwirlTerminalAdapterError {
     Finalizer(&'static str),
     #[error(transparent)]
     Terminal(#[from] ReducedSwirlTerminalError),
-}
-
-/// Owned portion of the recursion terminal record.
-///
-/// The final accumulator, descriptor, and recorded WHIR verification remain
-/// borrowed from the independently verified native result when `as_record`
-/// is called.  Keeping them out of this carrier prevents accidental copies or
-/// caller-selected replacements.
-pub struct PreparedReducedSwirlTerminalRecord {
-    pub footer: ReducedSwirlTerminalFooterRecord,
-    pub statement: TerminalConstrainedRsStatement<EF>,
-    pub transcript: TranscriptLog<F, [F; POSEIDON2_WIDTH]>,
 }
 
 /// Transcript material retained by the streaming transition-tree finalizer.
@@ -143,80 +131,6 @@ impl PreparedReducedSwirlFinalizerTerminalRecord {
     pub const fn transcript(&self) -> &ReducedSwirlFinalizerTranscriptSuffix {
         &self.transcript
     }
-}
-
-impl PreparedReducedSwirlTerminalRecord {
-    pub fn as_record<'a>(
-        &'a self,
-        output: &'a ReducedSwirlNativeProverOutput,
-        verification: &'a ReducedSwirlNativeVerification,
-    ) -> Result<ReducedSwirlTerminalRecord<'a>, ReducedSwirlTerminalAdapterError> {
-        validate_native_terminal_inventory(output, verification)?;
-        Ok(ReducedSwirlTerminalRecord {
-            footer: &self.footer,
-            instance: &verification.final_instance,
-            descriptor: &output.proof.terminal.descriptor,
-            statement: &self.statement,
-            verification: &verification.terminal,
-            transcript: &self.transcript,
-        })
-    }
-}
-
-/// Derive the exact terminal AIR witness boundary from an independently
-/// recorded native verification.
-pub fn prepare_reduced_swirl_terminal_record(
-    setup: &ReducedSwirlNativeSetup,
-    output: &ReducedSwirlNativeProverOutput,
-    verification: &ReducedSwirlNativeVerification,
-) -> Result<PreparedReducedSwirlTerminalRecord, ReducedSwirlTerminalAdapterError> {
-    validate_native_terminal_inventory(output, verification)?;
-    let source_count = output.authoritative_claims.len();
-    let call_count = output.proof.vacc.steps.len();
-    let statement = derive_swirl_constrained_rs_terminal_statement(
-        setup.relation(),
-        setup.code(),
-        &verification.final_instance,
-    )
-    .map_err(|error| ReducedSwirlTerminalAdapterError::Statement(format!("{error:?}")))?;
-    let transcript = TranscriptHistory::into_log(verification.complete_transcript.clone());
-    let footer_element_count = reduced_swirl_vacc_footer_elements(
-        source_count,
-        output.proof.statement.block_manifest_digest,
-    )
-    .map_err(ReducedSwirlTerminalAdapterError::Inventory)?
-    .len();
-    let footer_width = footer_element_count.checked_mul(D_EF).ok_or(
-        ReducedSwirlTerminalAdapterError::Inventory("manifest-footer width overflow"),
-    )?;
-    let end_tidx = verification.terminal.transcript_start.operations;
-    let start_tidx =
-        end_tidx
-            .checked_sub(footer_width)
-            .ok_or(ReducedSwirlTerminalAdapterError::Inventory(
-                "manifest-footer transcript interval",
-            ))?;
-    if end_tidx > transcript.len()
-        || call_count == 0
-        || verification.terminal.transcript_end.operations != transcript.len()
-    {
-        return Err(ReducedSwirlTerminalAdapterError::Inventory(
-            "terminal transcript boundary",
-        ));
-    }
-    Ok(PreparedReducedSwirlTerminalRecord {
-        footer: ReducedSwirlTerminalFooterRecord {
-            source_count,
-            call_count,
-            proof_idx: call_count - 1,
-            local_proof_idx: call_count - 1,
-            start_tidx,
-            end_tidx,
-            manifest_digest: output.proof.statement.block_manifest_digest,
-        },
-        statement,
-        transcript,
-    })
 }
 
 /// Prepare the terminal `Decide` witness for the streaming transition-tree
@@ -326,16 +240,6 @@ pub fn prepare_reduced_swirl_finalizer_terminal_record(
             terminal_end: verification.terminal.transcript_end,
         },
     })
-}
-
-/// Generate the setup-fixed terminal contexts and typed wrapper receipt.
-pub fn generate_reduced_swirl_terminal_cpu_packet(
-    component: &ReducedSwirlTerminalComponent,
-    prepared: &PreparedReducedSwirlTerminalRecord,
-    output: &ReducedSwirlNativeProverOutput,
-    verification: &ReducedSwirlNativeVerification,
-) -> Result<ReducedSwirlTerminalCpuPacket<SC>, ReducedSwirlTerminalAdapterError> {
-    Ok(component.generate_cpu_contexts::<SC>(prepared.as_record(output, verification)?)?)
 }
 
 /// Generate the unchanged terminal `Decide`/WHIR contexts from a finalizer

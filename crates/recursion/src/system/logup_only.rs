@@ -36,7 +36,7 @@ use crate::{
     transcript::{Poseidon2BusOwner, Poseidon2MultibusInputs, TranscriptModule},
 };
 
-/// Buses that the enclosing protocol-v19 circuit must connect.
+/// Buses that the enclosing reduced-SWIRL circuit must connect.
 ///
 /// `rebased_start_bus` receives the certified manifest checkpoint,
 /// `column_claims_bus` receives current/rotated openings from the source
@@ -159,7 +159,7 @@ impl<const MAX_NUM_PROOFS: usize> LogUpOnlyPartialVerifier<MAX_NUM_PROOFS> {
     }
 
     /// Ask the resumed transcript AIR to certify two row-aligned checkpoints
-    /// per proof. Protocol v19 uses kind zero for the LogUp endpoint and kind
+    /// per proof. Reduced-SWIRL uses kind zero for the LogUp endpoint and kind
     /// one for the end of the SWIRL one-shot stream.
     pub fn set_checkpoint_state_bus(
         &mut self,
@@ -235,7 +235,7 @@ impl<const MAX_NUM_PROOFS: usize> LogUpOnlyPartialVerifier<MAX_NUM_PROOFS> {
     /// transcript and keep only the suffix beginning at `start`.
     ///
     /// The prefix must end at a transcript event boundary and at an absorb
-    /// boundary. Protocol v19 certifies the latter when it constructs the
+    /// boundary. The reduced-SWIRL source receipt certifies the latter when it constructs the
     /// source-manifest checkpoint. The state equality below prevents a host
     /// preflight from generating a suffix against a different checkpoint.
     pub fn run_preflight<TS>(
@@ -745,7 +745,7 @@ fn generate_extended_rebased_transcript_ctxs_without_poseidon<SC: StarkProtocolC
     }
 }
 
-/// Prefix transcript owner used by protocol-v19 before the recursive
+/// Prefix transcript owner used before the recursive
 /// LogUp-only suffix begins.  It deliberately exposes only its Transcript AIR;
 /// the enclosing partial verifier owns the single shared Poseidon table.
 pub struct LogUpOnlyPrefixTranscript {
@@ -924,6 +924,8 @@ mod tests {
     use p3_matrix::{dense::RowMajorMatrix, Matrix};
 
     use super::*;
+    #[cfg(feature = "cuda")]
+    use crate::batch_constraint::partial::PartialBatchConstraintEndpointCols;
     use crate::{
         batch_constraint::{
             bus::{
@@ -931,7 +933,6 @@ mod tests {
                 LogUpOnlyOpeningPointBus, LogUpOnlyOpeningPointMessage,
             },
             expression_claim::ExpressionClaimCols,
-            partial::PartialBatchConstraintEndpointCols,
             LOCAL_EXPRESSION_CLAIM_AIR_IDX,
         },
         bus::{ColumnClaimsBus, ColumnClaimsMessage},
@@ -1152,7 +1153,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        // One complete rate block gives protocol v19 its required absorb
+        // One complete rate block gives the reduced-SWIRL rebase its required absorb
         // boundary while making the rebase nontrivial.
         let mut prefix = default_duplex_sponge_recorder();
         FiatShamirTranscript::<SC>::observe_commit(

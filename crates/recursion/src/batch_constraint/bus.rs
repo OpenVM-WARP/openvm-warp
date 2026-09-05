@@ -65,7 +65,7 @@ define_typed_per_proof_permutation_bus!(BatchConstraintEndpointBus, BatchConstra
 /// Proof-indexed opening point exported by the interaction-only verifier.
 ///
 /// These are the exact `r_0, .., r_n` challenges sampled by the univariate
-/// and multilinear batch-constraint sumchecks.  Protocol-v19 SWIRL consumes
+/// and multilinear batch-constraint sumchecks. Reduced-SWIRL consumes
 /// them to reconstruct the mapped raw-source functional.  The sumcheck AIRs
 /// are the only senders; no host checkpoint can authorize this message.
 #[repr(C)]

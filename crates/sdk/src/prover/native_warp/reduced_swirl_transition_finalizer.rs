@@ -15,7 +15,6 @@ use std::{
 };
 
 use openvm_continuations::circuit::{
-    reduced_swirl_source_tree_bridge::ReducedSwirlSourceTreeTrustedVkCommits,
     reduced_swirl_transition_finalizer::{
         ReducedSwirlTransitionFinalizerBinding, ReducedSwirlTransitionFinalizerCircuit,
         ReducedSwirlTransitionFinalizerRecord, ReducedSwirlTransitionTerminalJoinAir,
@@ -23,9 +22,8 @@ use openvm_continuations::circuit::{
     },
     reduced_swirl_transition_leaf::ReducedSwirlTransitionState,
     reduced_swirl_warp::{
-        ReducedSwirlExecutionBus, ReducedSwirlWrapperBinding, ReducedSwirlWrapperReceiptBuses,
-        ReducedSwirlWrapperVerifierPvsAir, ReducedSwirlWrapperVmPvsAir,
-        REDUCED_SWIRL_WRAPPER_PROTOCOL_VERSION,
+        ReducedSwirlExecutionBus, ReducedSwirlWrapperBinding, ReducedSwirlWrapperVerifierPvsAir,
+        ReducedSwirlWrapperVmPvsAir, REDUCED_SWIRL_WRAPPER_PROTOCOL_VERSION,
     },
     Circuit,
 };
@@ -70,6 +68,8 @@ use openvm_stark_sdk::config::baby_bear_poseidon2::{
 use openvm_verify_stark_host::pvs::{VerifierBasePvs, VmPvs};
 
 use super::{
+    reduced_swirl_cuda_transport::transport_reduced_swirl_contexts_to_cuda,
+    reduced_swirl_error::ReducedSwirlWrapperSystemError,
     reduced_swirl_native::{
         ReducedSwirlNativeProverOutput, ReducedSwirlNativeSetup, ReducedSwirlNativeVerification,
     },
@@ -78,10 +78,8 @@ use super::{
         prepare_reduced_swirl_finalizer_terminal_record, ReducedSwirlTerminalAdapterError,
     },
     reduced_swirl_vacc_component::{
-        ProductionReducedSwirlVaccComponent, ReducedSwirlVaccComponentError,
+        derive_reduced_swirl_vacc_profile, ReducedSwirlVaccComponentError,
     },
-    reduced_swirl_wrapper_system::ReducedSwirlWrapperSystemError,
-    reduced_swirl_wrapper_system_cuda::transport_reduced_swirl_wrapper_contexts_to_cuda,
 };
 use crate::SC;
 
@@ -192,7 +190,7 @@ impl ReducedSwirlTransitionFinalizerComponents {
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn new(
         child_vk: Arc<MultiStarkVerifyingKey<SC>>,
-        trusted: ReducedSwirlSourceTreeTrustedVkCommits,
+        trusted: ReducedSwirlTransitionTreeTrustedVkCommits,
         native_setup: &ReducedSwirlNativeSetup,
         terminal_setup: &ReducedSwirlTerminalProductionSetup,
         native_params: SystemParams,
@@ -222,12 +220,7 @@ impl ReducedSwirlTransitionFinalizerComponents {
             relation_digest: vacc_profile.relation_digest,
             warp_index_digest: vacc_profile.warp_index_digest,
             schedule_digest: vacc_profile.schedule_digest,
-            trusted_vk_commits: ReducedSwirlTransitionTreeTrustedVkCommits {
-                app_vk_commit: trusted.app_vk_commit,
-                transition_leaf_vk_commit: trusted.leaf_vk_commit,
-                internal_for_leaf_vk_commit: trusted.internal_for_leaf_vk_commit,
-                recursive_vk_commit: trusted.recursive_vk_commit,
-            },
+            trusted_vk_commits: trusted,
         };
         let transition = Arc::new(
             ReducedSwirlTransitionFinalizerCircuit::new(
@@ -686,7 +679,7 @@ impl ReducedSwirlTransitionFinalizerCudaProver {
                 .map(|(index, context)| (terminal_air_start + index, context)),
         );
         let mut contexts =
-            transport_reduced_swirl_wrapper_contexts_to_cuda(self.engine.device(), cpu_contexts)?;
+            transport_reduced_swirl_contexts_to_cuda(self.engine.device(), cpu_contexts)?;
         contexts.extend(
             child_contexts
                 .into_iter()
@@ -719,16 +712,7 @@ fn derive_vacc_profile(
     native_setup: &ReducedSwirlNativeSetup,
     params: SystemParams,
 ) -> Result<ReducedSwirlVaccProfile, ReducedSwirlTransitionFinalizerSystemError> {
-    // Profile derivation is setup-only. The temporary component is discarded
-    // before key generation; no witness or proof-dependent bus is retained.
-    let receipt_buses = ReducedSwirlWrapperReceiptBuses::new(0);
-    let component = ProductionReducedSwirlVaccComponent::from_native_setup_detached(
-        native_setup,
-        params,
-        receipt_buses.vacc,
-        BusIndexManager::from_next_bus_idx(receipt_buses.next_bus_idx()),
-    )?;
-    Ok(component.profile().clone())
+    Ok(derive_reduced_swirl_vacc_profile(native_setup, &params)?)
 }
 
 #[allow(clippy::too_many_arguments)]

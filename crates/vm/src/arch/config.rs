@@ -310,7 +310,7 @@ pub struct SystemConfig {
     ///
     /// A value greater than one rounds each active AIR height up to one of a
     /// verifier-owned set of levels anchored at that AIR's observed maximum.
-    /// This bounds History verifier shape polymorphism without changing the
+    /// This bounds transition-leaf verifier shape polymorphism without changing the
     /// continuation boundaries or exceeding the scalar-code cell cap.
     #[serde(skip, default = "default_native_warp_height_bucket_stride")]
     #[getset(set = "pub")]

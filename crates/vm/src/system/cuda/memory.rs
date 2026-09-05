@@ -43,7 +43,7 @@ pub struct MemoryInventoryGPU {
     pub hasher_chip: Arc<Poseidon2PeripheryChipGPU>,
     pub initial_memory: Vec<Arc<DeviceBuffer<u8>>>,
     pub merkle_records: Option<DeviceBuffer<u32>>,
-    /// One-shot setup-owned Merkle trace height for protocol-v19 segments.
+    /// Setup-owned Merkle trace height for reduced-SWIRL segments.
     forced_merkle_height: Option<usize>,
     #[cfg(feature = "metrics")]
     pub(super) unpadded_merkle_height: usize,

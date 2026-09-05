@@ -1200,6 +1200,7 @@ pub(crate) mod cuda_tracegen {
             )
         }
 
+        #[cfg(test)]
         pub fn new_with_initial_commitments(
             child_vk: &VerifyingKeyGpu,
             proofs: &[ProofGpu],
