@@ -39,7 +39,7 @@ The relation and source shape are setup-bound. The relation degree depends on th
 
 ## Deterministic accumulation
 
-Production uses transition-leaf capacity eight. The first WARP call consumes up to eight fresh sources; every continuation call consumes the prior accumulator plus up to seven fresh sources. The final call may use a shorter active prefix. Slot activity, call index, source cursor, and total source count are constrained, so there is no block-specific ordering profile.
+The submitted benchmark configuration uses transition-leaf capacity eight. The first WARP call consumes up to eight fresh sources; every continuation call consumes the prior accumulator plus up to seven fresh sources. The final call may use a shorter active prefix. Slot activity, call index, source cursor, and total source count are constrained, so there is no block-specific ordering profile.
 
 Each completed WARP call is verified at the native boundary and certified by one recursive transition leaf. Leaves bind:
 

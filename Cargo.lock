@@ -5935,7 +5935,7 @@ dependencies = [
 [[package]]
 name = "openvm-codec-derive"
 version = "2.0.0"
-source = "git+https://github.com/OpenVM-WARP/stark-backend-warp.git?rev=640da235392a06e7b01cb12a32c12ce909ee97e1#640da235392a06e7b01cb12a32c12ce909ee97e1"
+source = "git+https://github.com/OpenVM-WARP/stark-backend-warp.git?rev=787a91703fd9f98686935fc05afdf094abb00b56#787a91703fd9f98686935fc05afdf094abb00b56"
 dependencies = [
  "proc-macro-crate 1.3.1",
  "proc-macro2",
@@ -5982,7 +5982,7 @@ dependencies = [
 [[package]]
 name = "openvm-cpu-backend"
 version = "2.0.0"
-source = "git+https://github.com/OpenVM-WARP/stark-backend-warp.git?rev=640da235392a06e7b01cb12a32c12ce909ee97e1#640da235392a06e7b01cb12a32c12ce909ee97e1"
+source = "git+https://github.com/OpenVM-WARP/stark-backend-warp.git?rev=787a91703fd9f98686935fc05afdf094abb00b56#787a91703fd9f98686935fc05afdf094abb00b56"
 dependencies = [
  "cfg-if 1.0.1",
  "derive-new 0.7.0",
@@ -6007,7 +6007,7 @@ dependencies = [
 [[package]]
 name = "openvm-cuda-backend"
 version = "2.0.0"
-source = "git+https://github.com/OpenVM-WARP/stark-backend-warp.git?rev=640da235392a06e7b01cb12a32c12ce909ee97e1#640da235392a06e7b01cb12a32c12ce909ee97e1"
+source = "git+https://github.com/OpenVM-WARP/stark-backend-warp.git?rev=787a91703fd9f98686935fc05afdf094abb00b56#787a91703fd9f98686935fc05afdf094abb00b56"
 dependencies = [
  "derive-new 0.7.0",
  "getset",
@@ -6034,7 +6034,7 @@ dependencies = [
 [[package]]
 name = "openvm-cuda-builder"
 version = "2.0.0"
-source = "git+https://github.com/OpenVM-WARP/stark-backend-warp.git?rev=640da235392a06e7b01cb12a32c12ce909ee97e1#640da235392a06e7b01cb12a32c12ce909ee97e1"
+source = "git+https://github.com/OpenVM-WARP/stark-backend-warp.git?rev=787a91703fd9f98686935fc05afdf094abb00b56#787a91703fd9f98686935fc05afdf094abb00b56"
 dependencies = [
  "cc",
  "glob",
@@ -6043,7 +6043,7 @@ dependencies = [
 [[package]]
 name = "openvm-cuda-common"
 version = "2.0.0"
-source = "git+https://github.com/OpenVM-WARP/stark-backend-warp.git?rev=640da235392a06e7b01cb12a32c12ce909ee97e1#640da235392a06e7b01cb12a32c12ce909ee97e1"
+source = "git+https://github.com/OpenVM-WARP/stark-backend-warp.git?rev=787a91703fd9f98686935fc05afdf094abb00b56#787a91703fd9f98686935fc05afdf094abb00b56"
 dependencies = [
  "bytesize",
  "ctor",
@@ -6841,7 +6841,7 @@ dependencies = [
 [[package]]
 name = "openvm-stark-backend"
 version = "2.0.0"
-source = "git+https://github.com/OpenVM-WARP/stark-backend-warp.git?rev=640da235392a06e7b01cb12a32c12ce909ee97e1#640da235392a06e7b01cb12a32c12ce909ee97e1"
+source = "git+https://github.com/OpenVM-WARP/stark-backend-warp.git?rev=787a91703fd9f98686935fc05afdf094abb00b56#787a91703fd9f98686935fc05afdf094abb00b56"
 dependencies = [
  "cfg-if 1.0.1",
  "derivative",
@@ -6880,7 +6880,7 @@ dependencies = [
 [[package]]
 name = "openvm-stark-sdk"
 version = "2.0.0"
-source = "git+https://github.com/OpenVM-WARP/stark-backend-warp.git?rev=640da235392a06e7b01cb12a32c12ce909ee97e1#640da235392a06e7b01cb12a32c12ce909ee97e1"
+source = "git+https://github.com/OpenVM-WARP/stark-backend-warp.git?rev=787a91703fd9f98686935fc05afdf094abb00b56#787a91703fd9f98686935fc05afdf094abb00b56"
 dependencies = [
  "dashmap",
  "derive-new 0.7.0",
